@@ -1,0 +1,6 @@
+{
+  "name": "Data Analyzer & Trend Visualizer",
+  "description": "An interactive data analysis application that visualizes trends, generates AI-powered reports, and allows exporting findings as PDF documents.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
