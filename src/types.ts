@@ -1,42 +1,31 @@
-export interface Dataset {
-  id: string;
+export type ColumnKind = 'time' | 'num' | 'cat' | 'id' | 'unknown';
+
+export interface ColumnProfile {
   name: string;
+  kind: ColumnKind;
+  null_count: number;
+  null_ratio: number;
+  distinct_count: number;
   description: string;
-  category: string;
-  columns: string[];
-  numericColumns: string[];
-  data: Record<string, any>[];
+}
+
+export interface DatasetProfile {
+  run_id: string;
+  file_name: string;
+  row_count: number;
+  column_count: number;
+  usable_column_count: number;
+  columns: ColumnProfile[];
+  warnings: string[];
+  preview: Record<string, string>[];
 }
 
 export interface ChartConfig {
   type: 'line' | 'bar' | 'area' | 'scatter';
   xAxisColumn: string;
   yAxisColumn: string;
-  colorPalette: string; // 'blue' | 'emerald' | 'violet' | 'amber' | 'rose'
+  colorPalette: string;
   showGrid: boolean;
   showLegend: boolean;
   showTrendline: boolean;
-}
-
-export interface MetricSummary {
-  name: string;
-  value: string | number;
-  description: string;
-  change?: string;
-  trend?: 'up' | 'down' | 'neutral';
-}
-
-export interface AIAnalysis {
-  overview: string;
-  keyMetrics: MetricSummary[];
-  trendsAnalysis: string;
-  recommendations: string[];
-  suggestedQuestions: string[];
-}
-
-export interface ChatMessage {
-  id: string;
-  sender: 'user' | 'assistant';
-  text: string;
-  timestamp: string;
 }
