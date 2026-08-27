@@ -24,9 +24,10 @@ export interface ChartRequest {
   dimension: string;
   metric: string;
   aggregation: 'sum' | 'avg' | 'count';
-  chart_type: 'bar' | 'line' | 'area' | 'scatter';
+  chart_type: 'bar' | 'line' | 'area' | 'scatter' | 'pareto' | 'stacked_bar' | 'heatmap';
+  secondary_dimension?: string;
   limit: number;
-  filters?: Array<{ column: string; operator: 'equals' | 'not_equals'; value: string }>;
+  filters?: Array<{ column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string }>;
 }
 
 export interface ChartResult {
@@ -35,7 +36,8 @@ export interface ChartResult {
   aggregation: string;
   chart_type: string;
   title: string;
-  filters: Array<{ column: string; operator: 'equals' | 'not_equals'; value: string }>;
-  rows: Array<{ label: string; value: number }>;
+  secondary_dimension?: string;
+  filters: Array<{ column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string }>;
+  rows: Array<{ label: string; secondary_label?: string; value: number; cumulative_pct?: number }>;
   warnings: string[];
 }

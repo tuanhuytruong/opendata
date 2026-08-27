@@ -12,7 +12,8 @@ from typing import Callable
 
 from fastapi import HTTPException
 
-from main import ChartRequest, DatasetProfile, build_chart, values
+from main import ChartRequest, DatasetProfile, FilterSpec, build_chart, values
+from planning import parse_filter, propose_charts
 from telegram_flow import (
     ReportRun,
     Step,
@@ -38,6 +39,8 @@ class Conversation:
     run: ReportRun = field(default_factory=ReportRun)
     profile: DatasetProfile | None = None
     chart_specs: list[ChartRequest] = field(default_factory=list)
+    filters: list[FilterSpec] = field(default_factory=list)
+    pending_filter: FilterSpec | None = None
 
 
 class TelegramReportService:
@@ -103,16 +106,31 @@ class TelegramReportService:
         if text == "/skip":
             skip_filter(conversation.run)
             return OutgoingMessage("How many charts should I plan? Default is 8; choose 1–12 or /skip.")
+        if text.lower() in {"yes", "confirm", "/confirm"} and conversation.pending_filter:
+            conversation.filters.append(conversation.pending_filter)
+            applied = conversation.pending_filter
+            conversation.pending_filter = None
+            return OutgoingMessage(f"Applied filter: {applied.column} {applied.operator.replace('_', ' ')} {applied.value}. Send another filter, `suggest`, or /skip.")
+        if text.lower() in {"no", "reject", "/reject"} and conversation.pending_filter:
+            conversation.pending_filter = None
+            return OutgoingMessage("Filter discarded. Send another explicit filter, `suggest`, or /skip.")
         if text == "columns":
             assert conversation.profile is not None
-            rendered = "\n".join(f"• {column.name} ({column.kind})" for column in conversation.profile.columns)
-            return OutgoingMessage(rendered)
+            return OutgoingMessage("\n".join(f"• {column.name} ({column.kind})" for column in conversation.profile.columns))
         if text.lower().startswith("values "):
             assert conversation.profile is not None
             column = text.split(maxsplit=1)[1].strip()
             found = values(conversation.profile.run_id, column)["values"]
             return OutgoingMessage(f"Values for {column}: " + ", ".join(found))
-        return OutgoingMessage("For this MVP, inspect with `columns` or `values <column>`, then use /skip to choose charts. Exact filters are available in the web workspace.")
+        if text.lower() == "suggest":
+            assert conversation.profile is not None
+            candidates = propose_charts(conversation.profile.columns, 8)
+            rendered = "\n".join(f"• {item['dimension']} by {item['metric']} ({item['chart_type']})" for item in candidates)
+            return OutgoingMessage("Deterministic candidates (review before adding):\n" + (rendered or "No compatible candidates."))
+        assert conversation.profile is not None
+        parsed = parse_filter(text, [column.name for column in conversation.profile.columns])
+        conversation.pending_filter = FilterSpec.model_validate({"column": parsed.column, "operator": parsed.operator, "value": parsed.value})
+        return OutgoingMessage(f"Apply filter `{parsed.column} {parsed.operator.replace('_', ' ')} {parsed.value}`? Reply yes or no.")
 
     def _choose_chart_count(self, run: ReportRun, text: str) -> OutgoingMessage:
         count = None if text == "/skip" else int(text)
@@ -126,16 +144,26 @@ class TelegramReportService:
             artifact = self._report_renderer(conversation.profile.run_id, conversation.chart_specs)
             conversation.run.step = Step.COMPLETE
             return OutgoingMessage("✅ Your approved report is ready.", report_html=artifact)
+        if text.lower().startswith("remove "):
+            index = int(text.split(maxsplit=1)[1]) - 1
+            if not 0 <= index < len(conversation.chart_specs):
+                raise ValueError("Choose an existing chart number to remove.")
+            removed = conversation.chart_specs.pop(index)
+            conversation.run.charts.pop(index)
+            return OutgoingMessage(f"Removed chart {index + 1}: {removed.dimension} by {removed.metric}.")
+        if text.lower() in {"status", "/status"}:
+            plan = "\n".join(f"{index + 1}. {item.dimension} by {item.metric}" for index, item in enumerate(conversation.chart_specs)) or "No charts yet."
+            return OutgoingMessage(f"Plan ({len(conversation.chart_specs)}/{conversation.run.chart_limit}):\n{plan}")
         if not text.lower().startswith("add ") or " by " not in text.lower():
-            return OutgoingMessage("Use `add <dimension> by <metric>` or /ok.")
+            return OutgoingMessage("Use `add <dimension> by <metric>`, `remove <number>`, `status`, or /ok.")
         _, expression = text.split(maxsplit=1)
         dimension, metric = expression.split(" by ", maxsplit=1)
         assert conversation.profile is not None
-        request = ChartRequest(dimension=dimension.strip(), metric=metric.strip())
+        request = ChartRequest(dimension=dimension.strip(), metric=metric.strip(), filters=list(conversation.filters))
         chart = build_chart(conversation.profile.run_id, request)
         add_chart(conversation.run, chart.title)
         conversation.chart_specs.append(request)
-        return OutgoingMessage(f"Added: {chart.title}. Plan now has {len(conversation.chart_specs)}/{conversation.run.chart_limit} charts.")
+        return OutgoingMessage(f"Added: {chart.title}. Plan now has {len(conversation.chart_specs)}/{conversation.run.chart_limit} charts." )
 
     def _require(self, chat_id: int) -> Conversation:
         if chat_id not in self._conversations:

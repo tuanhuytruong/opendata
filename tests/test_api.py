@@ -55,6 +55,34 @@ def test_values_and_validated_chart() -> None:
     assert filtered.json()["rows"] == [{"label": "Retail", "value": 40.0}]
     assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "filters": [{"column": "missing", "value": "bad"}]}).status_code == 422
     assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "missing", "metric": "net_sales"}).status_code == 422
+    numeric = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "filters": [{"column": "net_sales", "operator": "greater_than", "value": "50"}]})
+    assert numeric.status_code == 200, numeric.text
+    assert numeric.json()["rows"] == [{"label": "Online", "value": 100.0}]
+    assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "filters": [{"column": "net_sales", "operator": "greater_than", "value": "not-a-number"}]}).status_code == 422
+
+
+def test_parses_explicit_filters_and_proposes_charts() -> None:
+    data = upload_csv("sale_date,channel,net_sales\n2026-01-01,Online,100\n2026-01-02,Retail,40\n")
+    run_id = data["run_id"]
+    parsed = client.post(f"/api/runs/{run_id}/parse-filter", json={"text": "net_sales >= 50"})
+    assert parsed.status_code == 200, parsed.text
+    assert parsed.json()["filter"] == {"column": "net_sales", "operator": "greater_or_equal", "value": "50"}
+    assert client.post(f"/api/runs/{run_id}/parse-filter", json={"text": "missing = bad"}).status_code == 422
+    plan = client.get(f"/api/runs/{run_id}/plan?limit=2")
+    assert plan.status_code == 200, plan.text
+    assert 1 <= len(plan.json()["charts"]) <= 2
+
+
+def test_builds_pareto_and_two_dimension_chart_contracts() -> None:
+    data = upload_csv("channel,city,net_sales\nOnline,HCM,100\nOnline,Hanoi,20\nRetail,HCM,40\n")
+    run_id = data["run_id"]
+    pareto = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "chart_type": "pareto"})
+    assert pareto.status_code == 200, pareto.text
+    assert pareto.json()["rows"][0]["cumulative_pct"] > 0
+    heatmap = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "secondary_dimension": "city", "metric": "net_sales", "chart_type": "heatmap"})
+    assert heatmap.status_code == 200, heatmap.text
+    assert heatmap.json()["rows"][0]["secondary_label"] == "HCM"
+    assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "chart_type": "heatmap"}).status_code == 422
 
 
 def test_builds_self_contained_report() -> None:
@@ -65,6 +93,14 @@ def test_builds_self_contained_report() -> None:
     assert "Sales report" in response.text
     assert "Online" in response.text
     assert "100.0" in response.text
+    assert "Evidence-bound highlights" in response.text
+    assert "Online is the leading segment" in response.text
+    from main import DATA_DIR
+    manifest = (DATA_DIR / f"{data['run_id']}.manifest.json").read_text()
+    assert 'dataset_sha256' in manifest
+    fetched_manifest = client.get(f"/api/runs/{data['run_id']}/manifest")
+    assert fetched_manifest.status_code == 200
+    assert fetched_manifest.json()["chart_count"] == 1
 
 
 def test_rejects_unsupported_file() -> None:

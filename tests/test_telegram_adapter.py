@@ -30,8 +30,13 @@ def test_machine_conversation_reaches_report(monkeypatch) -> None:
     assert "Send a CSV" in service.handle_text(9, "This machine").text
     assert "3 rows" in service.attach_dataset(9, profile()).text
     assert "channel (cat)" in service.handle_text(9, "columns").text
+    assert "Apply filter" in service.handle_text(9, "net_sales >= 50").text
+    assert "Applied filter" in service.handle_text(9, "yes").text
     assert "How many charts" in service.handle_text(9, "/skip").text
     assert "up to 2 charts" in service.handle_text(9, "2").text
+    assert "Added" in service.handle_text(9, "add channel by net_sales").text
+    assert "Plan (1/2)" in service.handle_text(9, "status").text
+    assert "Removed chart" in service.handle_text(9, "remove 1").text
     assert "Added" in service.handle_text(9, "add channel by net_sales").text
     complete = service.handle_text(9, "/ok")
     assert complete.report_html == "<html>report</html>"

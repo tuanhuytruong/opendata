@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import html
 import io
+import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
@@ -16,6 +18,8 @@ from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
+
+from planning import evidence_for_chart, narrative_from_evidence, parse_filter, propose_charts
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROFILE_ROWS = 600_000
@@ -48,7 +52,7 @@ class DatasetProfile(BaseModel):
 
 class FilterSpec(BaseModel):
     column: str
-    operator: Literal["equals", "not_equals"] = "equals"
+    operator: Literal["equals", "not_equals", "greater_than", "greater_or_equal", "less_than", "less_or_equal"] = "equals"
     value: str = Field(min_length=1, max_length=500)
 
 
@@ -56,7 +60,8 @@ class ChartRequest(BaseModel):
     dimension: str
     metric: str
     aggregation: Literal["sum", "avg", "count"] = "sum"
-    chart_type: Literal["bar", "line", "area", "scatter"] = "bar"
+    chart_type: Literal["bar", "line", "area", "scatter", "pareto", "stacked_bar", "heatmap"] = "bar"
+    secondary_dimension: str | None = None
     limit: int = Field(default=12, ge=1, le=30)
     filters: list[FilterSpec] = Field(default_factory=list, max_length=10)
 
@@ -66,12 +71,17 @@ class ReportRequest(BaseModel):
     charts: list[ChartRequest] = Field(min_length=1, max_length=12)
 
 
+class TextFilterRequest(BaseModel):
+    text: str = Field(min_length=3, max_length=600)
+
+
 class ChartResult(BaseModel):
     dimension: str
     metric: str
     aggregation: str
     chart_type: str
     title: str
+    secondary_dimension: str | None = None
     filters: list[FilterSpec] = Field(default_factory=list)
     rows: list[dict[str, str | float | int]]
     warnings: list[str]
@@ -178,7 +188,7 @@ def load_run(run_id: str) -> tuple[list[str], list[dict[str, str]]]:
         return validate_headers(reader.fieldnames or []), list(reader)
 
 
-def profile(file_name: str, headers: list[str], rows: list[dict[str, str]]) -> DatasetProfile:
+def profile(file_name: str, headers: list[str], rows: list[dict[str, str]], persist_run: bool = True, run_id: str | None = None) -> DatasetProfile:
     if not rows:
         raise HTTPException(422, "Dataset does not contain data rows.")
     if len(rows) > MAX_PROFILE_ROWS:
@@ -196,9 +206,10 @@ def profile(file_name: str, headers: list[str], rows: list[dict[str, str]]) -> D
     quantity = next((item for item in profiles if item.name.lower() == "quantity"), None)
     if units and quantity and units.distinct_count > 1:
         warnings.append("Quantity has multiple units of measure; do not sum it until a compatible unit filter is applied.")
-    run_id = uuid4().hex
-    persist(run_id, headers, rows)
-    return DatasetProfile(run_id=run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, warnings=warnings, preview=rows[:20])
+    resolved_run_id = run_id or uuid4().hex
+    if persist_run:
+        persist(resolved_run_id, headers, rows)
+    return DatasetProfile(run_id=resolved_run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, warnings=warnings, preview=rows[:20])
 
 
 def quote_identifier(name: str, headers: list[str]) -> str:
@@ -227,6 +238,23 @@ async def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
     return ingest_dataset(file.filename or "upload", await file.read(MAX_UPLOAD_BYTES + 1))
 
 
+@app.get("/api/runs/{run_id}/plan")
+def suggested_plan(run_id: str, limit: int = 8) -> dict[str, object]:
+    headers, rows = load_run(run_id)
+    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    return {"charts": propose_charts(profile_data.columns, max(1, min(limit, 12))), "note": "Candidates are deterministic suggestions; review and approve before report generation."}
+
+
+@app.post("/api/runs/{run_id}/parse-filter")
+def parse_text_filter(run_id: str, request: TextFilterRequest) -> dict[str, object]:
+    headers, _ = load_run(run_id)
+    try:
+        parsed = parse_filter(request.text, headers)
+    except ValueError as error:
+        raise HTTPException(422, str(error)) from error
+    return {"filter": {"column": parsed.column, "operator": parsed.operator, "value": parsed.value}, "confirmation": f"Apply {parsed.column} {parsed.operator.replace('_', ' ')} {parsed.value}?"}
+
+
 @app.get("/api/runs/{run_id}/values/{column}")
 def values(run_id: str, column: str) -> dict[str, str | list[str]]:
     headers, rows = load_run(run_id)
@@ -240,27 +268,62 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
     headers, rows = load_run(run_id)
     dimension = quote_identifier(request.dimension, headers)
     metric = quote_identifier(request.metric, headers)
+    secondary = quote_identifier(request.secondary_dimension, headers) if request.secondary_dimension else None
+    if request.chart_type in {"stacked_bar", "heatmap"} and not secondary:
+        raise HTTPException(422, f"{request.chart_type} requires a secondary_dimension.")
     if request.aggregation == "count": expression = "COUNT(*)"
     else: expression = f"{request.aggregation.upper()}(TRY_CAST(REPLACE({metric}, ',', '') AS DOUBLE))"
     filter_clauses = [f"{dimension} IS NOT NULL", f"TRIM({dimension}) <> ''"]
-    parameters: list[str | int] = []
+    if secondary:
+        filter_clauses.extend([f"{secondary} IS NOT NULL", f"TRIM({secondary}) <> ''"])
+    parameters: list[str | int | float] = []
     for item in request.filters:
         field = quote_identifier(item.column, headers)
-        operator = "=" if item.operator == "equals" else "<>"
-        filter_clauses.append(f"{field} {operator} ?")
-        parameters.append(item.value)
+        operators = {"equals": "=", "not_equals": "<>", "greater_than": ">", "greater_or_equal": ">=", "less_than": "<", "less_or_equal": "<="}
+        operator = operators[item.operator]
+        if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
+            if not is_number(item.value):
+                raise HTTPException(422, f"Numeric comparison requires a numeric value for {item.column}.")
+            filter_clauses.append(f"TRY_CAST(REPLACE({field}, ',', '') AS DOUBLE) {operator} ?")
+            parameters.append(float(item.value.replace(",", "")))
+        else:
+            filter_clauses.append(f"{field} {operator} ?")
+            parameters.append(item.value)
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(DATA_DIR / f"{run_id}.csv")])
         where_clause = " AND ".join(filter_clauses)
-        query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
+        if secondary:
+            query = f"SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1, 2 ORDER BY value DESC NULLS LAST LIMIT ?"
+        else:
+            query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
         records = connection.execute(query, [*parameters, request.limit]).fetchall()
     finally:
         connection.close()
     warnings: list[str] = []
     if not records: warnings.append("This chart has no matching values.")
     if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Verify a compatible unit filter before interpreting summed quantity.")
-    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=f"{request.aggregation.upper()} {request.metric} by {request.dimension}", filters=request.filters, rows=[{"label": str(label), "value": 0 if value is None else float(value)} for label, value in records], warnings=warnings)
+    if secondary:
+        chart_rows = [{"label": str(label), "secondary_label": str(second), "value": 0 if value is None else float(value)} for label, second, value in records]
+    else:
+        chart_rows = [{"label": str(label), "value": 0 if value is None else float(value)} for label, value in records]
+    if request.chart_type == "pareto":
+        total = sum(float(row["value"]) for row in chart_rows)
+        running = 0.0
+        for row in chart_rows:
+            running += float(row["value"])
+            row["cumulative_pct"] = 0 if total == 0 else round(running / total * 100, 2)
+    title = f"{request.aggregation.upper()} {request.metric} by {request.dimension}" + (f" × {request.secondary_dimension}" if secondary else "")
+    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings)
+
+
+@app.get("/api/runs/{run_id}/manifest")
+def get_manifest(run_id: str) -> dict[str, object]:
+    load_run(run_id)
+    path = DATA_DIR / f"{run_id}.manifest.json"
+    if not path.exists():
+        raise HTTPException(404, "Report manifest is not available until a report is generated.")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @app.post("/api/runs/{run_id}/report", response_class=HTMLResponse)
@@ -268,7 +331,10 @@ def build_report(run_id: str, request: ReportRequest) -> HTMLResponse:
     """Render a portable HTML artifact from validated, server-calculated charts."""
     charts = [build_chart(run_id, item) for item in request.charts]
     payload = [chart.model_dump() for chart in charts]
+    evidence = [fact for chart in charts for fact in evidence_for_chart(chart)]
+    narratives = narrative_from_evidence(evidence)
+    manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256((DATA_DIR / f"{run_id}.csv").read_bytes()).hexdigest(), "chart_specs": [item.model_dump() for item in request.charts], "chart_count": len(charts), "evidence": evidence}
+    (DATA_DIR / f"{run_id}.manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     safe_title = html.escape(request.title)
-    import json
-    artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><div id="charts"></div></main><script>const charts={json.dumps(payload)};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th><th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td><td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
+    artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><section class="meta"><h2>Evidence-bound highlights</h2><ul>{''.join(f'<li>{html.escape(item)}</li>' for item in narratives) or '<li>No narrative evidence was available.</li>'}</ul></section><section class="meta"><h2>Provenance</h2><p>Dataset checksum: <code>{manifest['dataset_sha256']}</code>. Filter scope and chart specifications are retained in the run manifest.</p></section><div id="charts"></div></main><script>const charts={json.dumps(payload)};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th>${{c.secondary_dimension?`<th>${{e(c.secondary_dimension)}}</th>`:''}}<th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td>${{c.secondary_dimension?`<td>${{e(r.secondary_label ?? '')}}</td>`:''}}<td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-report.html"'})
