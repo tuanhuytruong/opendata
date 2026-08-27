@@ -211,15 +211,20 @@ def quote_identifier(name: str, headers: list[str]) -> str:
 def health() -> dict[str, str]: return {"status": "ok"}
 
 
-@app.post("/api/runs/upload", response_model=DatasetProfile, status_code=201)
-async def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
-    name = safe_name(file.filename or "upload")
+def ingest_dataset(file_name: str, raw: bytes) -> DatasetProfile:
+    """Validate and profile a file payload from either web or Telegram transport."""
+    name = safe_name(file_name or "upload")
     if not re.fullmatch(r"[\w .()\-]+\.(csv|xlsx)", name, flags=re.IGNORECASE):
         raise HTTPException(415, "Upload a CSV or XLSX file with a safe file name.")
-    raw = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(raw) > MAX_UPLOAD_BYTES: raise HTTPException(413, "File exceeds the 50 MB upload limit.")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_BYTES // 1024 // 1024} MB upload limit.")
     headers, rows = xlsx_rows(raw) if name.lower().endswith(".xlsx") else csv_rows(raw)
     return profile(name, headers, rows)
+
+
+@app.post("/api/runs/upload", response_model=DatasetProfile, status_code=201)
+async def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
+    return ingest_dataset(file.filename or "upload", await file.read(MAX_UPLOAD_BYTES + 1))
 
 
 @app.get("/api/runs/{run_id}/values/{column}")
