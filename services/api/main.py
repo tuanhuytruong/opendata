@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import io
 import re
 from datetime import datetime
@@ -11,12 +12,13 @@ from uuid import uuid4
 
 import duckdb
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
-MAX_PROFILE_ROWS = 200_000
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
+MAX_PROFILE_ROWS = 600_000
 DATA_DIR = Path(__file__).resolve().parents[2] / "var" / "uploads"
 VALID_CHARTS = {"bar", "line", "area", "scatter"}
 
@@ -44,12 +46,24 @@ class DatasetProfile(BaseModel):
     preview: list[dict[str, str]]
 
 
+class FilterSpec(BaseModel):
+    column: str
+    operator: Literal["equals", "not_equals"] = "equals"
+    value: str = Field(min_length=1, max_length=500)
+
+
 class ChartRequest(BaseModel):
     dimension: str
     metric: str
     aggregation: Literal["sum", "avg", "count"] = "sum"
     chart_type: Literal["bar", "line", "area", "scatter"] = "bar"
     limit: int = Field(default=12, ge=1, le=30)
+    filters: list[FilterSpec] = Field(default_factory=list, max_length=10)
+
+
+class ReportRequest(BaseModel):
+    title: str = Field(default="OpenData Analytics Report", min_length=1, max_length=120)
+    charts: list[ChartRequest] = Field(min_length=1, max_length=12)
 
 
 class ChartResult(BaseModel):
@@ -58,6 +72,7 @@ class ChartResult(BaseModel):
     aggregation: str
     chart_type: str
     title: str
+    filters: list[FilterSpec] = Field(default_factory=list)
     rows: list[dict[str, str | float | int]]
     warnings: list[str]
 
@@ -222,14 +237,33 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
     metric = quote_identifier(request.metric, headers)
     if request.aggregation == "count": expression = "COUNT(*)"
     else: expression = f"{request.aggregation.upper()}(TRY_CAST(REPLACE({metric}, ',', '') AS DOUBLE))"
+    filter_clauses = [f"{dimension} IS NOT NULL", f"TRIM({dimension}) <> ''"]
+    parameters: list[str | int] = []
+    for item in request.filters:
+        field = quote_identifier(item.column, headers)
+        operator = "=" if item.operator == "equals" else "<>"
+        filter_clauses.append(f"{field} {operator} ?")
+        parameters.append(item.value)
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(DATA_DIR / f"{run_id}.csv")])
-        query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {dimension} IS NOT NULL AND TRIM({dimension}) <> '' GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
-        records = connection.execute(query, [request.limit]).fetchall()
+        where_clause = " AND ".join(filter_clauses)
+        query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
+        records = connection.execute(query, [*parameters, request.limit]).fetchall()
     finally:
         connection.close()
     warnings: list[str] = []
     if not records: warnings.append("This chart has no matching values.")
     if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Verify a compatible unit filter before interpreting summed quantity.")
-    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=f"{request.aggregation.upper()} {request.metric} by {request.dimension}", rows=[{"label": str(label), "value": 0 if value is None else float(value)} for label, value in records], warnings=warnings)
+    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=f"{request.aggregation.upper()} {request.metric} by {request.dimension}", filters=request.filters, rows=[{"label": str(label), "value": 0 if value is None else float(value)} for label, value in records], warnings=warnings)
+
+
+@app.post("/api/runs/{run_id}/report", response_class=HTMLResponse)
+def build_report(run_id: str, request: ReportRequest) -> HTMLResponse:
+    """Render a portable HTML artifact from validated, server-calculated charts."""
+    charts = [build_chart(run_id, item) for item in request.charts]
+    payload = [chart.model_dump() for chart in charts]
+    safe_title = html.escape(request.title)
+    import json
+    artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><div id="charts"></div></main><script>const charts={json.dumps(payload)};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th><th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td><td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
+    return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-report.html"'})

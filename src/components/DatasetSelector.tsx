@@ -44,7 +44,7 @@ export default function DatasetSelector({ profile, onProfile }: DatasetSelectorP
       <input ref={inputRef} type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" className="hidden" onChange={(event) => { const file = event.target.files?.[0]; if (file) void upload(file); }} />
       {uploading ? <LoaderCircle className="w-8 h-8 text-indigo-600 mx-auto mb-2 animate-spin" /> : <Upload className="w-8 h-8 text-slate-400 mx-auto mb-2" />}
       <p className="text-sm font-medium text-slate-700">{uploading ? 'Profiling your dataset…' : <>Drag & drop a CSV, or <span className="text-indigo-600 underline">browse</span></>}</p>
-      <p className="text-xs text-slate-400 mt-1">Up to 50 MB / 200,000 rows for the first release</p>
+      <p className="text-xs text-slate-400 mt-1">Up to 100 MB / 600,000 rows for this release</p>
     </div>
     {error && <div className="flex gap-2 p-3 mt-4 bg-rose-50 border border-rose-100 text-rose-700 rounded-xl text-xs"><AlertCircle className="w-4 h-4 shrink-0" />{error}</div>}
     {profile && <div className="flex gap-2 p-3 mt-4 bg-emerald-50 border border-emerald-100 text-emerald-800 rounded-xl text-xs"><CheckCircle2 className="w-4 h-4 shrink-0" /><span><strong>{profile.file_name}</strong> · {profile.row_count.toLocaleString()} rows · {profile.column_count} columns</span></div>}

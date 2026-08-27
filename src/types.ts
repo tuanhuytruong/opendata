@@ -26,6 +26,7 @@ export interface ChartRequest {
   aggregation: 'sum' | 'avg' | 'count';
   chart_type: 'bar' | 'line' | 'area' | 'scatter';
   limit: number;
+  filters?: Array<{ column: string; operator: 'equals' | 'not_equals'; value: string }>;
 }
 
 export interface ChartResult {
@@ -34,6 +35,7 @@ export interface ChartResult {
   aggregation: string;
   chart_type: string;
   title: string;
+  filters: Array<{ column: string; operator: 'equals' | 'not_equals'; value: string }>;
   rows: Array<{ label: string; value: number }>;
   warnings: string[];
 }

@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services" / "api"))
-from main import app  # noqa: E402
+from main import MAX_PROFILE_ROWS, MAX_UPLOAD_BYTES, app  # noqa: E402
 
 client = TestClient(app)
 
@@ -19,6 +19,11 @@ def upload_csv(content: str, name: str = "sales.csv") -> dict:
 
 def test_health() -> None:
     assert client.get("/api/health").json() == {"status": "ok"}
+
+
+def test_configured_upload_limits_match_product_contract() -> None:
+    assert MAX_UPLOAD_BYTES == 100 * 1024 * 1024
+    assert MAX_PROFILE_ROWS == 600_000
 
 
 def test_profiles_csv_and_emits_quantity_warning() -> None:
@@ -45,7 +50,21 @@ def test_values_and_validated_chart() -> None:
     chart = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "aggregation": "sum"})
     assert chart.status_code == 200, chart.text
     assert chart.json()["rows"][0] == {"label": "Online", "value": 120.0}
+    filtered = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "filters": [{"column": "channel", "operator": "equals", "value": "Retail"}]})
+    assert filtered.status_code == 200, filtered.text
+    assert filtered.json()["rows"] == [{"label": "Retail", "value": 40.0}]
+    assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "filters": [{"column": "missing", "value": "bad"}]}).status_code == 422
     assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "missing", "metric": "net_sales"}).status_code == 422
+
+
+def test_builds_self_contained_report() -> None:
+    data = upload_csv("channel,net_sales\nOnline,100\nRetail,40\n")
+    response = client.post(f"/api/runs/{data['run_id']}/report", json={"title": "Sales report", "charts": [{"dimension": "channel", "metric": "net_sales"}]})
+    assert response.status_code == 200, response.text
+    assert "text/html" in response.headers["content-type"]
+    assert "Sales report" in response.text
+    assert "Online" in response.text
+    assert "100.0" in response.text
 
 
 def test_rejects_unsupported_file() -> None:
