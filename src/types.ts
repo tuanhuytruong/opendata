@@ -20,12 +20,20 @@ export interface DatasetProfile {
   preview: Record<string, string>[];
 }
 
-export interface ChartConfig {
-  type: 'line' | 'bar' | 'area' | 'scatter';
-  xAxisColumn: string;
-  yAxisColumn: string;
-  colorPalette: string;
-  showGrid: boolean;
-  showLegend: boolean;
-  showTrendline: boolean;
+export interface ChartRequest {
+  dimension: string;
+  metric: string;
+  aggregation: 'sum' | 'avg' | 'count';
+  chart_type: 'bar' | 'line' | 'area' | 'scatter';
+  limit: number;
+}
+
+export interface ChartResult {
+  dimension: string;
+  metric: string;
+  aggregation: string;
+  chart_type: string;
+  title: string;
+  rows: Array<{ label: string; value: number }>;
+  warnings: string[];
 }
