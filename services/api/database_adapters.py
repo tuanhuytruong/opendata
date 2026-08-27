@@ -13,7 +13,18 @@ from source_registry import RegisteredSource, source_connection_secret
 
 
 def quoted(source: RegisteredSource) -> str:
+    """Registry validation permits only simple identifiers, never request data."""
     return f'"{source.schema}"."{source.table}"'
+
+
+def _safe_rollback(connection: Any | None) -> None:
+    if connection is None:
+        return
+    try:
+        connection.rollback()
+    except Exception:
+        # The original driver error is intentionally hidden from clients.
+        return
 
 
 def postgres_rows(source: RegisteredSource, connect: Callable[..., Any] | None = None) -> tuple[list[str], list[dict[str, str]]]:
@@ -23,22 +34,23 @@ def postgres_rows(source: RegisteredSource, connect: Callable[..., Any] | None =
         except ImportError as error:
             raise HTTPException(503, "PostgreSQL adapter is not installed.") from error
         connect = psycopg.connect
-    connection = connect(source_connection_secret(source), connect_timeout=10)
+    connection = None
     try:
+        connection = connect(source_connection_secret(source), connect_timeout=10)
         with connection.cursor() as cursor:
             cursor.execute("BEGIN READ ONLY")
             cursor.execute("SET LOCAL statement_timeout = %s", (source.statement_timeout_ms,))
             cursor.execute(f"SELECT * FROM {quoted(source)} LIMIT %s", (source.max_rows,))
             headers = [str(column.name) for column in cursor.description]
             rows = [{header: "" if value is None else str(value) for header, value in zip(headers, record, strict=True)} for record in cursor.fetchall()]
-        connection.rollback()
+        _safe_rollback(connection)
         return headers, rows
     except Exception as error:
-        try: connection.rollback()
-        except Exception: pass
+        _safe_rollback(connection)
         raise HTTPException(502, f"Registered PostgreSQL source {source.source_id} could not be read.") from error
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
 
 def oracle_rows(source: RegisteredSource, connect: Callable[..., Any] | None = None) -> tuple[list[str], list[dict[str, str]]]:
@@ -48,8 +60,9 @@ def oracle_rows(source: RegisteredSource, connect: Callable[..., Any] | None = N
         except ImportError as error:
             raise HTTPException(503, "Oracle adapter is not installed.") from error
         connect = oracledb.connect
-    connection = connect(source_connection_secret(source))
+    connection = None
     try:
+        connection = connect(source_connection_secret(source))
         connection.call_timeout = source.statement_timeout_ms
         cursor = connection.cursor()
         try:
@@ -59,14 +72,14 @@ def oracle_rows(source: RegisteredSource, connect: Callable[..., Any] | None = N
             rows = [{header: "" if value is None else str(value) for header, value in zip(headers, record, strict=True)} for record in cursor.fetchall()]
         finally:
             cursor.close()
-        connection.rollback()
+        _safe_rollback(connection)
         return headers, rows
     except Exception as error:
-        try: connection.rollback()
-        except Exception: pass
+        _safe_rollback(connection)
         raise HTTPException(502, f"Registered Oracle source {source.source_id} could not be read.") from error
     finally:
-        connection.close()
+        if connection is not None:
+            connection.close()
 
 
 def read_registered_source(source: RegisteredSource) -> tuple[list[str], list[dict[str, str]]]:

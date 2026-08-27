@@ -6,30 +6,67 @@ import hashlib
 import html
 import io
 import json
+import os
 import re
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
 
 import duckdb
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
 from database_adapters import read_registered_source
 from planning import evidence_for_chart, narrative_from_evidence, parse_filter, propose_charts
 from source_registry import public_source, registered_sources
+from run_store import DurableJobQueue, RunStore
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROFILE_ROWS = 600_000
+MAX_REQUESTS_PER_MINUTE = 60
 DATA_DIR = Path(__file__).resolve().parents[2] / "var" / "uploads"
+JOB_DIR = Path(__file__).resolve().parents[2] / "var" / "jobs"
+RUN_STORE = RunStore(DATA_DIR)
+JOB_QUEUE = DurableJobQueue(JOB_DIR)
 VALID_CHARTS = {"bar", "line", "area", "scatter"}
 
-app = FastAPI(title="OpenData Report API", version="0.2.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://localhost:5174"], allow_credentials=False, allow_methods=["GET", "POST"], allow_headers=["*"])
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+class InMemoryRateLimitMiddleware(BaseHTTPMiddleware):
+    """Conservative pilot safeguard; replace with shared rate limiting before scale-out."""
+    buckets: dict[str, list[float]] = {}
+
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in {"/api/health", "/api/readiness"}:
+            return await call_next(request)
+        now = datetime.now(timezone.utc).timestamp()
+        client = request.client.host if request.client else "unknown"
+        active = [stamp for stamp in self.buckets.get(client, []) if stamp > now - 60]
+        if len(active) >= MAX_REQUESTS_PER_MINUTE:
+            return JSONResponse({"detail": "Request rate limit exceeded. Try again shortly."}, status_code=429)
+        self.buckets[client] = [*active, now]
+        return await call_next(request)
+
+
+app = FastAPI(title="OpenData Report API", version="0.3.0")
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(InMemoryRateLimitMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://localhost:5174"], allow_credentials=False, allow_methods=["GET", "POST", "DELETE"], allow_headers=["content-type"])
 
 
 class ColumnProfile(BaseModel):
@@ -75,6 +112,11 @@ class ReportRequest(BaseModel):
 
 class TextFilterRequest(BaseModel):
     text: str = Field(min_length=3, max_length=600)
+
+
+class JobRequest(BaseModel):
+    run_id: str
+    kind: Literal["profile", "report"]
 
 
 class ChartResult(BaseModel):
@@ -140,6 +182,14 @@ def validate_headers(headers: list[str]) -> list[str]:
     return clean
 
 
+SENSITIVE_COLUMN_TOKENS = {"email", "e-mail", "phone", "mobile", "address", "password", "token", "secret", "ssn", "passport", "national_id", "credit_card"}
+
+
+def is_sensitive_column(name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return any(token in normalized for token in SENSITIVE_COLUMN_TOKENS)
+
+
 def csv_rows(raw: bytes) -> tuple[list[str], list[dict[str, str]]]:
     try:
         text = raw.decode("utf-8-sig")
@@ -147,7 +197,11 @@ def csv_rows(raw: bytes) -> tuple[list[str], list[dict[str, str]]]:
         text = raw.decode("latin-1")
     reader = csv.DictReader(io.StringIO(text))
     headers = validate_headers(reader.fieldnames or [])
-    rows = [{header: (row.get(header) or "").strip() for header in headers} for row in reader]
+    rows: list[dict[str, str]] = []
+    for row_index, row in enumerate(reader, start=1):
+        if row_index > MAX_PROFILE_ROWS:
+            raise HTTPException(422, f"Dataset exceeds the {MAX_PROFILE_ROWS:,}-row first-release limit.")
+        rows.append({header: (row.get(header) or "").strip() for header in headers})
     return headers, rows
 
 
@@ -172,25 +226,16 @@ def xlsx_rows(raw: bytes) -> tuple[list[str], list[dict[str, str]]]:
     return headers, rows
 
 
-def persist(run_id: str, headers: list[str], rows: list[dict[str, str]]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with (DATA_DIR / f"{run_id}.csv").open("w", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=headers)
-        writer.writeheader(); writer.writerows(rows)
+def persist(run_id: str, headers: list[str], rows: list[dict[str, str]], *, file_name: str, source_type: str = "file", source_label: str | None = None) -> None:
+    RUN_STORE.save_dataset(run_id, headers, rows, file_name=file_name, source_type=source_type, source_label=source_label)
 
 
 def load_run(run_id: str) -> tuple[list[str], list[dict[str, str]]]:
-    if not re.fullmatch(r"[a-f0-9]{32}", run_id):
-        raise HTTPException(404, "Report run was not found.")
-    path = DATA_DIR / f"{run_id}.csv"
-    if not path.exists():
-        raise HTTPException(404, "Report run was not found or has expired.")
-    with path.open(encoding="utf-8", newline="") as input_file:
-        reader = csv.DictReader(input_file)
-        return validate_headers(reader.fieldnames or []), list(reader)
+    headers, rows = RUN_STORE.load_dataset(run_id)
+    return validate_headers(headers), rows
 
 
-def profile(file_name: str, headers: list[str], rows: list[dict[str, str]], persist_run: bool = True, run_id: str | None = None) -> DatasetProfile:
+def profile(file_name: str, headers: list[str], rows: list[dict[str, str]], persist_run: bool = True, run_id: str | None = None, source_type: str = "file", source_label: str | None = None) -> DatasetProfile:
     if not rows:
         raise HTTPException(422, "Dataset does not contain data rows.")
     if len(rows) > MAX_PROFILE_ROWS:
@@ -200,8 +245,9 @@ def profile(file_name: str, headers: list[str], rows: list[dict[str, str]], pers
     for header in headers:
         values = [(row.get(header) or "").strip() for row in rows]
         null_count = sum(not value for value in values)
-        kind = infer_kind(header, values)
-        profiles.append(ColumnProfile(name=header, kind=cast(Literal["time", "num", "cat", "id", "unknown"], kind), null_count=null_count, null_ratio=round(null_count / len(rows), 4), distinct_count=len({value for value in values if value}), description=column_description(header, kind)))
+        kind = "id" if is_sensitive_column(header) else infer_kind(header, values)
+        description = "Sensitive field; values are masked and cannot be used in analysis." if is_sensitive_column(header) else column_description(header, kind)
+        profiles.append(ColumnProfile(name=header, kind=cast(Literal["time", "num", "cat", "id", "unknown"], kind), null_count=null_count, null_ratio=round(null_count / len(rows), 4), distinct_count=len({value for value in values if value}), description=description))
         if null_count / len(rows) >= .95:
             warnings.append(f"{header} is {null_count / len(rows):.1%} empty and may not be useful for charts.")
     units = next((item for item in profiles if item.name.lower() in {"unit_of_measure", "uom"}), None)
@@ -210,18 +256,72 @@ def profile(file_name: str, headers: list[str], rows: list[dict[str, str]], pers
         warnings.append("Quantity has multiple units of measure; do not sum it until a compatible unit filter is applied.")
     resolved_run_id = run_id or uuid4().hex
     if persist_run:
-        persist(resolved_run_id, headers, rows)
-    return DatasetProfile(run_id=resolved_run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, warnings=warnings, preview=rows[:20])
+        persist(resolved_run_id, headers, rows, file_name=file_name, source_type=source_type, source_label=source_label)
+    return DatasetProfile(run_id=resolved_run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, warnings=warnings, preview=safe_preview(rows))
+
+
+def safe_preview(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [{column: "[masked]" if is_sensitive_column(column) and value else value for column, value in row.items()} for row in rows[:20]]
 
 
 def quote_identifier(name: str, headers: list[str]) -> str:
     if name not in headers:
         raise HTTPException(422, f"Unknown column: {name}")
+    if is_sensitive_column(name):
+        raise HTTPException(422, "Sensitive columns cannot be used in filters, previews, or charts.")
     return '"' + name.replace('"', '""') + '"'
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]: return {"status": "ok"}
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/api/readiness")
+def readiness() -> dict[str, object]:
+    """Readiness is intentionally dependency-light: sources are checked on use."""
+    try:
+        RUN_STORE.root.mkdir(parents=True, exist_ok=True)
+        JOB_QUEUE.root.mkdir(parents=True, exist_ok=True)
+        RUN_STORE.cleanup_expired()
+    except OSError as error:
+        raise HTTPException(503, "Artifact storage is not writable.") from error
+    return {"status": "ready", "registered_source_count": len(registered_sources())}
+
+
+@app.delete("/api/runs/{run_id}", status_code=204)
+def delete_run(run_id: str) -> None:
+    """Explicitly delete a run and every retained artifact; idempotency is not assumed."""
+    RUN_STORE.metadata(run_id)
+    import shutil
+    shutil.rmtree(RUN_STORE._dir(run_id), ignore_errors=True)
+
+
+@app.post("/api/maintenance/cleanup")
+def cleanup_expired_runs(request: Request) -> dict[str, int]:
+    """Internal scheduler hook; disabled unless an operator configures its key."""
+    key = os.getenv("OPENDATA_MAINTENANCE_KEY", "")
+    provided = request.headers.get("X-OpenData-Maintenance-Key", "")
+    if not key or not secrets.compare_digest(provided, key):
+        raise HTTPException(404, "Not found.")
+    return {"removed_runs": RUN_STORE.cleanup_expired()}
+
+
+@app.post("/api/jobs", status_code=202)
+def enqueue_job(request: JobRequest) -> dict[str, object]:
+    RUN_STORE.metadata(request.run_id)
+    job_id = uuid4().hex
+    return JOB_QUEUE.create(job_id, request.run_id, request.kind)
+
+
+@app.get("/api/jobs/{job_id}")
+def job_status(job_id: str) -> dict[str, object]:
+    return JOB_QUEUE.get(job_id)
+
+
+@app.delete("/api/jobs/{job_id}")
+def cancel_job(job_id: str) -> dict[str, object]:
+    return JOB_QUEUE.cancel(job_id)
 
 
 @app.get("/api/sources")
@@ -241,7 +341,7 @@ def stage_registered_source(source_id: str) -> DatasetProfile:
     normalized = [{header: (row.get(header) or "").strip() for header in headers} for row in rows]
     if len(normalized) >= source.max_rows:
         raise HTTPException(422, f"Registered source reached its {source.max_rows:,}-row scan cap; narrow its operator configuration.")
-    return profile(f"{source.display_name} ({source.locator})", headers, normalized)
+    return profile(f"{source.display_name} ({source.locator})", headers, normalized, source_type=source.engine, source_label=f"{source.display_name} ({source.locator})")
 
 
 def ingest_dataset(file_name: str, raw: bytes) -> DatasetProfile:
@@ -313,7 +413,7 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
             parameters.append(item.value)
     connection = duckdb.connect(":memory:")
     try:
-        connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(DATA_DIR / f"{run_id}.csv")])
+        connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
         where_clause = " AND ".join(filter_clauses)
         if secondary:
             query = f"SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1, 2 ORDER BY value DESC NULLS LAST LIMIT ?"
@@ -341,11 +441,7 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
 
 @app.get("/api/runs/{run_id}/manifest")
 def get_manifest(run_id: str) -> dict[str, object]:
-    load_run(run_id)
-    path = DATA_DIR / f"{run_id}.manifest.json"
-    if not path.exists():
-        raise HTTPException(404, "Report manifest is not available until a report is generated.")
-    return json.loads(path.read_text(encoding="utf-8"))
+    return RUN_STORE.artifact_json(run_id, "report.manifest.json")
 
 
 @app.post("/api/runs/{run_id}/report", response_class=HTMLResponse)
@@ -355,8 +451,10 @@ def build_report(run_id: str, request: ReportRequest) -> HTMLResponse:
     payload = [chart.model_dump() for chart in charts]
     evidence = [fact for chart in charts for fact in evidence_for_chart(chart)]
     narratives = narrative_from_evidence(evidence)
-    manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256((DATA_DIR / f"{run_id}.csv").read_bytes()).hexdigest(), "chart_specs": [item.model_dump() for item in request.charts], "chart_count": len(charts), "evidence": evidence}
-    (DATA_DIR / f"{run_id}.manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    metadata = RUN_STORE.metadata(run_id)
+    manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256(RUN_STORE.dataset_path(run_id).read_bytes()).hexdigest(), "source_type": metadata["source_type"], "source_label": metadata["source_label"], "chart_specs": [item.model_dump() for item in request.charts], "chart_count": len(charts), "evidence": evidence}
+    RUN_STORE.save_artifact_json(run_id, "report.manifest.json", manifest)
     safe_title = html.escape(request.title)
-    artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><section class="meta"><h2>Evidence-bound highlights</h2><ul>{''.join(f'<li>{html.escape(item)}</li>' for item in narratives) or '<li>No narrative evidence was available.</li>'}</ul></section><section class="meta"><h2>Provenance</h2><p>Dataset checksum: <code>{manifest['dataset_sha256']}</code>. Filter scope and chart specifications are retained in the run manifest.</p></section><div id="charts"></div></main><script>const charts={json.dumps(payload)};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th>${{c.secondary_dimension?`<th>${{e(c.secondary_dimension)}}</th>`:''}}<th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td>${{c.secondary_dimension?`<td>${{e(r.secondary_label ?? '')}}</td>`:''}}<td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
+    safe_chart_payload = json.dumps(payload).replace("</", "<\\/")
+    artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><section class="meta"><h2>Evidence-bound highlights</h2><ul>{''.join(f'<li>{html.escape(item)}</li>' for item in narratives) or '<li>No narrative evidence was available.</li>'}</ul></section><section class="meta"><h2>Provenance</h2><p>Dataset checksum: <code>{manifest['dataset_sha256']}</code>. Filter scope and chart specifications are retained in the run manifest.</p></section><div id="charts"></div></main><script>const charts={safe_chart_payload};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th>${{c.secondary_dimension?`<th>${{e(c.secondary_dimension)}}</th>`:''}}<th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td>${{c.secondary_dimension?`<td>${{e(r.secondary_label ?? '')}}</td>`:''}}<td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-report.html"'})

@@ -95,8 +95,8 @@ def test_builds_self_contained_report() -> None:
     assert "100.0" in response.text
     assert "Evidence-bound highlights" in response.text
     assert "Online is the leading segment" in response.text
-    from main import DATA_DIR
-    manifest = (DATA_DIR / f"{data['run_id']}.manifest.json").read_text()
+    from main import RUN_STORE
+    manifest = (RUN_STORE._dir(data["run_id"]) / "report.manifest.json").read_text()
     assert 'dataset_sha256' in manifest
     fetched_manifest = client.get(f"/api/runs/{data['run_id']}/manifest")
     assert fetched_manifest.status_code == 200

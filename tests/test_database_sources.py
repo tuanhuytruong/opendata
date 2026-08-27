@@ -99,3 +99,13 @@ def test_adapter_hides_database_error(monkeypatch) -> None:
         postgres_rows(source("postgres"), lambda *args, **kwargs: BrokenConnection())
     assert error.value.status_code == 502
     assert "internal host" not in error.value.detail
+
+
+def test_adapter_hides_connection_error(monkeypatch) -> None:
+    monkeypatch.setenv("SALES_DB_URL", "postgresql://secret")
+    def broken_connect(*args, **kwargs):
+        raise RuntimeError("private database host")
+    with pytest.raises(HTTPException) as error:
+        postgres_rows(source("postgres"), broken_connect)
+    assert error.value.status_code == 502
+    assert "private database host" not in error.value.detail

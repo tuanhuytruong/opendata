@@ -20,13 +20,16 @@ _FILTER = re.compile(r"^\s*([\w .-]+?)\s*(=|!=|>=|<=|>|<)\s*(.+?)\s*$")
 
 
 def parse_filter(text: str, allowed_columns: Iterable[str]) -> ParsedFilter:
-    """Parse only a single explicit comparison against an existing column."""
+    """Parse only a single explicit comparison against an existing non-sensitive column."""
     match = _FILTER.fullmatch(text)
     if not match:
         raise ValueError("Use an explicit filter such as `channel = Online` or `net_sales >= 1000`.")
     column, operator, value = (part.strip() for part in match.groups())
     if column not in set(allowed_columns):
         raise ValueError(f"Unknown column: {column}")
+    normalized = re.sub(r"[^a-z0-9]+", "_", column.lower()).strip("_")
+    if any(token in normalized for token in {"email", "phone", "mobile", "address", "password", "token", "secret", "ssn", "passport", "national_id", "credit_card"}):
+        raise ValueError("Sensitive columns cannot be used in filters.")
     if len(value) > 500 or not value:
         raise ValueError("Filter value must be between 1 and 500 characters.")
     mapping = {"=": "equals", "!=": "not_equals", ">": "greater_than", ">=": "greater_or_equal", "<": "less_than", "<=": "less_or_equal"}

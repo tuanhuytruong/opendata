@@ -113,6 +113,11 @@ class TelegramReportService:
         choose_location(run, location)
         return OutgoingMessage("Send a CSV or XLSX file (up to 100 MB and 600,000 rows).")
 
+    def _profile_for(self, conversation: Conversation) -> DatasetProfile:
+        if conversation.profile is None:
+            raise ValueError("Dataset profile is unavailable. Start a new /report run.")
+        return conversation.profile
+
     def _handle_filter(self, conversation: Conversation, text: str) -> OutgoingMessage:
         if text == "/skip":
             skip_filter(conversation.run)
@@ -125,21 +130,18 @@ class TelegramReportService:
         if text.lower() in {"no", "reject", "/reject"} and conversation.pending_filter:
             conversation.pending_filter = None
             return OutgoingMessage("Filter discarded. Send another explicit filter, `suggest`, or /skip.")
+        profile = self._profile_for(conversation)
         if text == "columns":
-            assert conversation.profile is not None
-            return OutgoingMessage("\n".join(f"• {column.name} ({column.kind})" for column in conversation.profile.columns))
+            return OutgoingMessage("\n".join(f"• {column.name} ({column.kind})" for column in profile.columns))
         if text.lower().startswith("values "):
-            assert conversation.profile is not None
             column = text.split(maxsplit=1)[1].strip()
-            found = values(conversation.profile.run_id, column)["values"]
+            found = values(profile.run_id, column)["values"]
             return OutgoingMessage(f"Values for {column}: " + ", ".join(found))
         if text.lower() == "suggest":
-            assert conversation.profile is not None
-            candidates = propose_charts(conversation.profile.columns, 8)
+            candidates = propose_charts(profile.columns, 8)
             rendered = "\n".join(f"• {item['dimension']} by {item['metric']} ({item['chart_type']})" for item in candidates)
             return OutgoingMessage("Deterministic candidates (review before adding):\n" + (rendered or "No compatible candidates."))
-        assert conversation.profile is not None
-        parsed = parse_filter(text, [column.name for column in conversation.profile.columns])
+        parsed = parse_filter(text, [column.name for column in profile.columns])
         conversation.pending_filter = FilterSpec.model_validate({"column": parsed.column, "operator": parsed.operator, "value": parsed.value})
         return OutgoingMessage(f"Apply filter `{parsed.column} {parsed.operator.replace('_', ' ')} {parsed.value}`? Reply yes or no.")
 
@@ -151,8 +153,8 @@ class TelegramReportService:
     def _handle_plan(self, conversation: Conversation, text: str) -> OutgoingMessage:
         if text == "/ok":
             approve_plan(conversation.run)
-            assert conversation.profile is not None
-            artifact = self._report_renderer(conversation.profile.run_id, conversation.chart_specs)
+            profile = self._profile_for(conversation)
+            artifact = self._report_renderer(profile.run_id, conversation.chart_specs)
             conversation.run.step = Step.COMPLETE
             return OutgoingMessage("✅ Your approved report is ready.", report_html=artifact)
         if text.lower().startswith("remove "):
@@ -169,9 +171,9 @@ class TelegramReportService:
             return OutgoingMessage("Use `add <dimension> by <metric>`, `remove <number>`, `status`, or /ok.")
         _, expression = text.split(maxsplit=1)
         dimension, metric = expression.split(" by ", maxsplit=1)
-        assert conversation.profile is not None
+        profile = self._profile_for(conversation)
         request = ChartRequest(dimension=dimension.strip(), metric=metric.strip(), filters=list(conversation.filters))
-        chart = build_chart(conversation.profile.run_id, request)
+        chart = build_chart(profile.run_id, request)
         add_chart(conversation.run, chart.title)
         conversation.chart_specs.append(request)
         return OutgoingMessage(f"Added: {chart.title}. Plan now has {len(conversation.chart_specs)}/{conversation.run.chart_limit} charts." )

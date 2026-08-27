@@ -12,6 +12,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from main import ChartRequest, ReportRequest, build_report, ingest_dataset
+from run_store import redacted_error
 from telegram_adapter import OutgoingMessage, TelegramReportService
 
 
@@ -57,8 +58,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         raw = bytes(await remote_file.download_as_bytearray())
         profile = ingest_dataset(document.file_name or "upload", raw)
         outgoing = service.attach_dataset(chat.id, profile)
-    except Exception as error:  # Transport boundary: never include raw file data.
-        outgoing = OutgoingMessage(f"I could not profile that document: {error}")
+    except Exception as error:  # Transport boundary: never include raw file data or driver details.
+        outgoing = OutgoingMessage(f"I could not profile that document: {redacted_error(error)}")
     await send_message(update, outgoing)
 
 

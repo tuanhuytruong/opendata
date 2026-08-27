@@ -55,11 +55,17 @@ cd services/api
 ../../.venv/bin/python -m telegram_runtime
 ```
 
-The current Telegram slice supports the file-backed flow:
+The Telegram flow supports both **This machine** uploads and an operator-registered database source. It never accepts a connection string, table name or SQL from a chat message.
 
-`/report` → **This machine** → upload CSV/XLSX → `columns` / `values <column>` → `/skip` → chart count → `add <dimension> by <metric>` → `/ok`.
+## Phase 7 pilot operations
 
-Database selection is intentionally blocked until the read-only registered-source phase; it does not accept credentials through Telegram.
+- Each run is stored in its own `var/uploads/<run_id>/` directory with durable metadata and a **24-hour default retention**. `DELETE /api/runs/{run_id}` immediately removes it and its artifacts.
+- `POST /api/jobs` creates a durable pilot job; `GET`/`DELETE /api/jobs/{job_id}` exposes status/cancellation. Run `python -m worker` as a separate internal process for bounded job validation/retry handling.
+- `GET /api/health` is liveness; `GET /api/readiness` verifies writable artifact/job storage and performs expiry cleanup.
+- `POST /api/maintenance/cleanup` is disabled unless `OPENDATA_MAINTENANCE_KEY` is configured, and requires the matching `X-OpenData-Maintenance-Key` header. Prefer an internal scheduler/network path.
+- API requests are rate-limited in-process to 60/min/IP for the pilot. Before multiple API replicas, replace it with a shared reverse-proxy or Redis limiter.
+- Common PII/secrets-like column names are masked in previews and rejected from values, filters, and charts. Configure database service accounts/views to exclude sensitive columns as a stronger upstream control.
+- The app emits no raw rows, credentials or database driver errors in public responses. Put API + worker behind HTTPS, keep database/worker ports private, and do not expose the maintenance hook publicly.
 
 ## Verification
 
@@ -71,4 +77,4 @@ npm run build
 
 ## Product scope
 
-The present MVP supports CSV/XLSX and local DuckDB only. Planned work includes confirmed filter parsing in Telegram, richer chart families/evidence, durable run storage, and registered read-only PostgreSQL sources. This project does not restore or depend on the hidden NomaData repository.
+The present pilot supports CSV/XLSX plus operator-registered PostgreSQL and Oracle sources, constrained filters/chart plans, durable local run artifacts, and evidence-bound offline HTML reports. It does not restore or depend on the hidden NomaData repository.
