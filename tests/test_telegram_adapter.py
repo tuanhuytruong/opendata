@@ -46,8 +46,9 @@ def test_rejects_database_and_stale_command() -> None:
     service = TelegramReportService(lambda run_id, charts: "report")
     assert "Start with /report" in service.handle_text(1, "columns").text
     service.start_report(1)
-    assert "not enabled" in service.handle_text(1, "Database").text
+    assert "No database source" in service.handle_text(1, "Database").text
     assert "Send a CSV" in service.handle_text(1, "This machine").text
+    assert "Please send a CSV" in service.handle_text(1, "connection-string=forbidden").text
 
 
 def test_renderer_is_not_called_without_approved_chart() -> None:

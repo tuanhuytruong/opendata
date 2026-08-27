@@ -12,7 +12,8 @@ from typing import Callable
 
 from fastapi import HTTPException
 
-from main import ChartRequest, DatasetProfile, FilterSpec, build_chart, values
+from main import ChartRequest, DatasetProfile, FilterSpec, build_chart, stage_registered_source, values
+from source_registry import public_source, registered_sources
 from planning import parse_filter, propose_charts
 from telegram_flow import (
     ReportRun,
@@ -78,7 +79,12 @@ class TelegramReportService:
             if run.step == Step.LOCATION:
                 return self._choose_location(run, normalized)
             if run.step == Step.FILE:
-                return OutgoingMessage("Please send a CSV or XLSX file. Database sources are not enabled in this file-MVP yet.")
+                if run.location == "database":
+                    sources = registered_sources()
+                    if normalized not in sources:
+                        return OutgoingMessage("Choose one of the displayed registered source ids. Connection strings and SQL are not accepted.")
+                    return self.attach_dataset(chat_id, stage_registered_source(normalized))
+                return OutgoingMessage("Please send a CSV or XLSX file.")
             if run.step == Step.FILTER:
                 return self._handle_filter(conversation, normalized)
             if run.step == Step.CHART_COUNT:
@@ -98,7 +104,12 @@ class TelegramReportService:
         if location is None:
             raise ValueError("Choose This machine or Database.")
         if location == "database":
-            return OutgoingMessage("Database sources are not enabled yet. Choose This machine and upload a CSV or XLSX.", ("💻 This machine",))
+            sources = [public_source(source) for source in registered_sources().values()]
+            if not sources:
+                return OutgoingMessage("No database source is registered for this bot. Choose This machine and upload a CSV or XLSX.", ("💻 This machine",))
+            choose_location(run, location)
+            visible = "\n".join(f"• {item['id']} — {item['display_name']} ({item['engine']})" for item in sources)
+            return OutgoingMessage("Choose an operator-registered source by sending its id:\n" + visible)
         choose_location(run, location)
         return OutgoingMessage("Send a CSV or XLSX file (up to 100 MB and 600,000 rows).")
 

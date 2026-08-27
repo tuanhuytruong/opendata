@@ -19,7 +19,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
+from database_adapters import read_registered_source
 from planning import evidence_for_chart, narrative_from_evidence, parse_filter, propose_charts
+from source_registry import public_source, registered_sources
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROFILE_ROWS = 600_000
@@ -220,6 +222,26 @@ def quote_identifier(name: str, headers: list[str]) -> str:
 
 @app.get("/api/health")
 def health() -> dict[str, str]: return {"status": "ok"}
+
+
+@app.get("/api/sources")
+def list_sources() -> dict[str, list[dict[str, object]]]:
+    """Expose only operator-registered source metadata; never connection material."""
+    return {"sources": [public_source(source) for source in registered_sources().values()]}
+
+
+@app.post("/api/sources/{source_id}/runs", response_model=DatasetProfile, status_code=201)
+def stage_registered_source(source_id: str) -> DatasetProfile:
+    sources = registered_sources()
+    source = sources.get(source_id)
+    if source is None:
+        raise HTTPException(404, "Registered source was not found.")
+    headers, rows = read_registered_source(source)
+    headers = validate_headers(headers)
+    normalized = [{header: (row.get(header) or "").strip() for header in headers} for row in rows]
+    if len(normalized) >= source.max_rows:
+        raise HTTPException(422, f"Registered source reached its {source.max_rows:,}-row scan cap; narrow its operator configuration.")
+    return profile(f"{source.display_name} ({source.locator})", headers, normalized)
 
 
 def ingest_dataset(file_name: str, raw: bytes) -> DatasetProfile:

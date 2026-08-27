@@ -29,6 +29,21 @@ npm run dev
 
 Open the Vite URL (normally `http://127.0.0.1:5173`).
 
+## Registered PostgreSQL & Oracle sources
+
+Database analysis is **operator-registered only**. The service has no endpoint or Telegram command that accepts a connection string, schema/table name, or SQL.
+
+In ignored `.env.local`, define `OPENDATA_SOURCES_JSON` and keep each connection value in the environment variable named by `connection_env` (see `.env.example`). Each entry is restricted to one pre-approved `schema.table`, with a maximum scan and statement-timeout value.
+
+Required operational controls before enabling a live source:
+
+- A dedicated database account with `SELECT` only on exactly the registered table/view; no DDL/DML permissions.
+- PostgreSQL: connection timeout, `BEGIN READ ONLY`, and transaction-local `statement_timeout` are enforced by the adapter.
+- Oracle: `SET TRANSACTION READ ONLY` and a configured `FETCH FIRST … ROWS ONLY` cap are enforced by the adapter.
+- Public metadata: `GET /api/sources`; staging a selected source: `POST /api/sources/{source_id}/runs`.
+
+The connector intentionally does not implement arbitrary SQL, cross-schema browsing, joins, or credential collection. Test doubles cover both adapters. A real connection smoke test remains pending until a non-production allow-listed source is configured.
+
 ## Telegram polling runtime (optional)
 
 1. Create a bot with BotFather and place its token only in ignored `.env.local` or the process environment.
