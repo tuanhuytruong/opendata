@@ -55,7 +55,8 @@ def analyst_proposals(columns: Iterable[object], max_charts: int = 5) -> list[di
     safe_columns = [item for item in columns if getattr(item, "kind", "") != "id"]
     dimensions = [item for item in safe_columns if getattr(item, "kind", "") == "cat" and getattr(item, "null_ratio", 1) < .95]
     time_fields = [item for item in safe_columns if getattr(item, "kind", "") == "time" and getattr(item, "null_ratio", 1) < .95]
-    metrics = [item for item in safe_columns if getattr(item, "kind", "") == "num" and getattr(item, "null_ratio", 1) < .95]
+    # Numeric identifiers can be summed syntactically but have no analytical meaning.
+    metrics = [item for item in safe_columns if getattr(item, "kind", "") == "num" and getattr(item, "null_ratio", 1) < .95 and not any(token in getattr(item, "name", "").lower() for token in {"_id", " id", "code", "key"})]
     proposals: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
 
