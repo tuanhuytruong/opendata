@@ -687,7 +687,7 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
     try:
         http_request = urllib.request.Request(f"{base_url}/chat/completions", data=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
         decoder = json.JSONDecoder()
-        with urllib.request.urlopen(http_request, timeout=15) as response:
+        with urllib.request.urlopen(http_request, timeout=8) as response:
             # A compatible gateway may concatenate JSON response objects. Read only
             # the first complete response object; the intent itself is independently validated below.
             outer, _ = decoder.raw_decode(response.read().decode().lstrip())
