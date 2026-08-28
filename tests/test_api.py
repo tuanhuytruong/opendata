@@ -70,6 +70,11 @@ def test_parses_explicit_filters_and_proposes_charts() -> None:
     assert proposal["request"]["dimension"] in {"sale_date", "channel"}
     assert proposal["request"]["metric"] == "net_sales"
     assert "raw rows" not in str(analyst.json()).lower()
+    chat = client.post(f"/api/runs/{run_id}/chat", json={"message": "Doanh thu theo tháng thế nào?"})
+    assert chat.status_code == 200, chat.text
+    assert chat.json()["chart"]["metric"] == "net_sales"
+    assert chat.json()["chart"]["chart_type"] == "line"
+    assert "server" in chat.json()["insight"].lower()
     parsed = client.post(f"/api/runs/{run_id}/parse-filter", json={"text": "net_sales >= 50"})
     assert parsed.status_code == 200, parsed.text
     assert parsed.json()["filter"] == {"column": "net_sales", "operator": "greater_or_equal", "value": "50"}

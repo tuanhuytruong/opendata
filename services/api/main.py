@@ -10,6 +10,8 @@ import html
 import io
 import json
 import os
+import urllib.error
+import urllib.request
 import re
 import secrets
 from datetime import datetime, timezone
@@ -151,6 +153,21 @@ class TextFilterRequest(BaseModel):
 class JobRequest(BaseModel):
     run_id: str
     kind: Literal["profile", "report"]
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=2, max_length=1000)
+    context: str = Field(default="", max_length=1000)
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    insight: str
+    scope: str
+    chart: "ChartResult | None" = None
+    table: list[dict[str, str | float | int]] = Field(default_factory=list)
+    caveats: list[str] = Field(default_factory=list)
+    mode: Literal["analysis", "clarification"]
 
 
 class ChartResult(BaseModel):
@@ -504,6 +521,62 @@ def build_report(run_id: str, request: ReportRequest) -> HTMLResponse:
     safe_chart_payload = json.dumps(payload).replace("</", "<\\/")
     artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><section class="meta"><h2>Evidence-bound highlights</h2><ul>{''.join(f'<li>{html.escape(item)}</li>' for item in narratives) or '<li>No narrative evidence was available.</li>'}</ul></section><section class="meta"><h2>Provenance</h2><p>Dataset checksum: <code>{manifest['dataset_sha256']}</code>. Filter scope and chart specifications are retained in the run manifest.</p></section><div id="charts"></div></main><script>const charts={safe_chart_payload};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th>${{c.secondary_dimension?`<th>${{e(c.secondary_dimension)}}</th>`:''}}<th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td>${{c.secondary_dimension?`<td>${{e(r.secondary_label ?? '')}}</td>`:''}}<td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-report.html"'})
+
+
+def _chat_metric(columns: list[ColumnProfile], message: str) -> ColumnProfile | None:
+    normalized = message.lower()
+    metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
+    priorities = (("doanh thu", "revenue", "sales"), ("lợi nhuận", "profit", "margin"), ("số lượng", "quantity", "volume"), ("chi phí", "cost"))
+    for words in priorities:
+        if any(word in normalized for word in words):
+            found = next((item for item in metrics if any(word in item.name.lower().replace("_", " ") for word in words)), None)
+            if found:
+                return found
+    return metrics[0] if metrics else None
+
+
+def _chat_dimension(columns: list[ColumnProfile], message: str) -> ColumnProfile | None:
+    normalized = message.lower()
+    fields = [item for item in columns if item.kind in {"time", "cat"}]
+    if any(word in normalized for word in {"tháng", "month", "ngày", "day", "trend", "xu hướng", "6 tháng", "năm"}):
+        timed = next((item for item in fields if item.kind == "time"), None)
+        if timed:
+            return timed
+    for item in fields:
+        words = item.name.lower().replace("_", " ").split()
+        if any(word in normalized for word in words if len(word) > 2):
+            return item
+    return next((item for item in fields if item.kind == "time"), fields[0] if fields else None)
+
+
+def compact_number(value: float | int) -> str:
+    number = float(value)
+    for threshold, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if abs(number) >= threshold:
+            return f"{number / threshold:.1f}{suffix}"
+    return f"{number:.1f}"
+
+
+@app.post("/api/runs/{run_id}/chat", response_model=ChatResponse)
+def chat_about_run(run_id: str, request: ChatRequest) -> ChatResponse:
+    """Constrained data conversation: natural language maps only to a validated aggregate."""
+    headers, rows = load_run(run_id)
+    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    metric = _chat_metric(profile_data.columns, request.message)
+    dimension = _chat_dimension(profile_data.columns, request.message)
+    if metric is None or dimension is None:
+        return ChatResponse(answer="Em cần một metric số và một trường thời gian hoặc dimension để phân tích. Anh có thể hỏi theo dạng: ‘Doanh thu theo tháng’ hoặc ‘Doanh thu theo kênh’.", insight="Chưa tìm được cặp metric/dimension an toàn trong dataset này.", scope="Chưa chạy phân tích", caveats=[], mode="clarification")
+    chart_type = "line" if dimension.kind == "time" else "bar"
+    chart = build_chart(run_id, ChartRequest(dimension=dimension.name, metric=metric.name, aggregation="sum", chart_type=chart_type, limit=12))
+    top = chart.rows[0] if chart.rows else None
+    scope = f"SUM {metric.name} by {dimension.name}; top {len(chart.rows)} values"
+    insight = "Không có dữ liệu phù hợp với câu hỏi này."
+    if top:
+        insight = f"{top['label']} đang dẫn đầu với {compact_number(float(top['value']))}; đây là kết quả aggregate đã được xác thực trên server."
+    caveats = list(chart.warnings)
+    if any(word in request.message.lower() for word in {"cùng kỳ", "year over year", "yoy", "năm ngoái"}):
+        caveats.append("So sánh cùng kỳ cần một trường thời gian được chuẩn hoá theo tháng/năm; bản chat hiện trả xu hướng tổng hợp trước để anh review phạm vi.")
+    return ChatResponse(answer=f"Em đã phân tích {metric.name} theo {dimension.name}.", insight=insight, scope=scope, chart=chart, table=chart.rows, caveats=caveats, mode="analysis")
 
 
 if STATIC_DIR.is_dir():
