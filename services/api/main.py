@@ -537,12 +537,17 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
     payload = json.dumps({"model": model, "temperature": 0, "response_format": {"type": "json_object"}, "messages": [prompt, user]}).encode()
     try:
         http_request = urllib.request.Request(f"{base_url}/chat/completions", data=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
+        decoder = json.JSONDecoder()
         with urllib.request.urlopen(http_request, timeout=15) as response:
-            content = json.loads(response.read().decode())["choices"][0]["message"]["content"]
+            # A compatible gateway may concatenate JSON response objects. Read only
+            # the first complete response object; the intent itself is independently validated below.
+            outer, _ = decoder.raw_decode(response.read().decode().lstrip())
+            if not isinstance(outer, dict):
+                return None, None
+            content = outer["choices"][0]["message"]["content"]
         # Some compatible gateways append a second JSON fragment despite JSON mode.
         # Accept only the first complete object; validation below still rejects unsafe intent.
         parsed: object | None = None
-        decoder = json.JSONDecoder()
         for offset, character in enumerate(content):
             if character != "{":
                 continue
