@@ -38,9 +38,12 @@ from run_store import DurableJobQueue, RunStore
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROFILE_ROWS = 600_000
-MAX_REQUESTS_PER_MINUTE = 60
+MAX_REQUESTS_PER_MINUTE = 240
 MAX_EDA_COLUMNS = 100
 MAX_EDA_TOP_CATEGORIES = 10
+# Attach profiles inspect a bounded, deterministic sample. Full profiles are computed
+# only when a caller explicitly asks for one of the richer analysis endpoints.
+ATTACH_PROFILE_SAMPLE_ROWS = 1_000
 DATA_DIR = Path(__file__).resolve().parents[2] / "var" / "uploads"
 JOB_DIR = Path(__file__).resolve().parents[2] / "var" / "jobs"
 STATIC_DIR = Path(os.getenv("OPENDATA_STATIC_DIR", str(Path(__file__).resolve().parents[2] / "dist")))
@@ -129,6 +132,10 @@ class DatasetProfile(BaseModel):
     columns: list[ColumnProfile]
     warnings: list[str]
     preview: list[dict[str, str]]
+    # "sampled" is safe to render immediately after attach; "complete" means the
+    # retained dataset has received the full, cached profile.
+    profile_status: Literal["sampled", "complete"] = "complete"
+    profiled_row_count: int = 0
 
 
 class FilterSpec(BaseModel):
@@ -164,12 +171,26 @@ class JobRequest(BaseModel):
 class ChatRequest(BaseModel):
     message: str = Field(min_length=2, max_length=1000)
     context: str = Field(default="", max_length=1000)
+    language: Literal["en", "vi"] = "en"
 
 
 class ClarificationOption(BaseModel):
     column: str
     label: str
     reason: str
+    role: Literal["metric", "dimension"]
+
+
+class SemanticSelectionRequest(BaseModel):
+    """A user-confirmed schema choice, retained only with its report run."""
+    column: str = Field(min_length=1, max_length=160)
+    role: Literal["metric", "dimension"]
+    language: str = Field(default="en", min_length=2, max_length=12)
+
+
+class SemanticSelection(BaseModel):
+    column: str
+    role: Literal["metric", "dimension"]
 
 
 class ChatResponse(BaseModel):
@@ -305,39 +326,63 @@ def load_run(run_id: str) -> tuple[list[str], list[dict[str, str]]]:
     return validate_headers(headers), rows
 
 
+def build_profile(file_name: str, headers: list[str], rows: list[dict[str, str]], *, run_id: str, sample_limit: int | None = None) -> DatasetProfile:
+    """Build a safe profile from all rows or a deterministic bounded prefix."""
+    if not rows:
+        raise HTTPException(422, "Dataset does not contain data rows.")
+    if len(rows) > MAX_PROFILE_ROWS:
+        raise HTTPException(422, f"Dataset exceeds the {MAX_PROFILE_ROWS:,}-row first-release limit.")
+    profiled_rows = rows if sample_limit is None else rows[:sample_limit]
+    profiles: list[ColumnProfile] = []
+    warnings: list[str] = []
+    for header in headers:
+        values = [(row.get(header) or "").strip() for row in profiled_rows]
+        null_count = sum(not value for value in values)
+        kind = "id" if is_sensitive_column(header) else infer_kind(header, values)
+        description = "Sensitive field; values are masked and cannot be used in analysis." if is_sensitive_column(header) else column_description(header, kind)
+        profiles.append(ColumnProfile(name=header, kind=cast(Literal["time", "num", "cat", "id", "unknown"], kind), null_count=null_count, null_ratio=round(null_count / len(profiled_rows), 4), distinct_count=len({value for value in values if value}), description=description))
+        if null_count / len(profiled_rows) >= .95:
+            warnings.append(f"{header} is {null_count / len(profiled_rows):.1%} empty and may not be useful for charts.")
+    units = next((item for item in profiles if item.name.lower() in {"unit_of_measure", "uom"}), None)
+    quantity = next((item for item in profiles if item.name.lower() == "quantity"), None)
+    if units and quantity and units.distinct_count > 1:
+        warnings.append("Quantity has multiple units of measure; do not sum it until a compatible unit filter is applied.")
+    sampled = len(profiled_rows) < len(rows)
+    if sampled:
+        warnings.append(f"Column metadata is sampled from the first {len(profiled_rows):,} rows; request full analysis for complete statistics.")
+    return DatasetProfile(run_id=run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, warnings=warnings, preview=safe_preview(rows), profile_status="sampled" if sampled else "complete", profiled_row_count=len(profiled_rows))
+
+
 def profile_for_run(run_id: str, headers: list[str], rows: list[dict[str, str]]) -> DatasetProfile:
-    """Avoid repeated full-column profiling for the same retained run in one API process."""
+    """Compute the full profile only on demand, then retain it per API process."""
     cached = PROFILE_CACHE.get(run_id)
     if cached is not None:
         return cached
-    result = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    metadata = RUN_STORE.metadata(run_id)
+    result = build_profile(str(metadata["file_name"]), headers, rows, run_id=run_id)
     PROFILE_CACHE[run_id] = result
     return result
 
 
 def profile(file_name: str, headers: list[str], rows: list[dict[str, str]], persist_run: bool = True, run_id: str | None = None, source_type: str = "file", source_label: str | None = None) -> DatasetProfile:
+    """Create a complete profile for callers that already require rich metadata."""
+    resolved_run_id = run_id or uuid4().hex
+    if persist_run:
+        persist(resolved_run_id, headers, rows, file_name=file_name, source_type=source_type, source_label=source_label)
+    result = build_profile(file_name, headers, rows, run_id=resolved_run_id)
+    PROFILE_CACHE[resolved_run_id] = result
+    return result
+
+
+def attach_profile(file_name: str, headers: list[str], rows: list[dict[str, str]], *, source_type: str = "file", source_label: str | None = None) -> DatasetProfile:
+    """Persist a validated run first, then return only its bounded attach profile."""
     if not rows:
         raise HTTPException(422, "Dataset does not contain data rows.")
     if len(rows) > MAX_PROFILE_ROWS:
         raise HTTPException(422, f"Dataset exceeds the {MAX_PROFILE_ROWS:,}-row first-release limit.")
-    profiles: list[ColumnProfile] = []
-    warnings: list[str] = []
-    for header in headers:
-        values = [(row.get(header) or "").strip() for row in rows]
-        null_count = sum(not value for value in values)
-        kind = "id" if is_sensitive_column(header) else infer_kind(header, values)
-        description = "Sensitive field; values are masked and cannot be used in analysis." if is_sensitive_column(header) else column_description(header, kind)
-        profiles.append(ColumnProfile(name=header, kind=cast(Literal["time", "num", "cat", "id", "unknown"], kind), null_count=null_count, null_ratio=round(null_count / len(rows), 4), distinct_count=len({value for value in values if value}), description=description))
-        if null_count / len(rows) >= .95:
-            warnings.append(f"{header} is {null_count / len(rows):.1%} empty and may not be useful for charts.")
-    units = next((item for item in profiles if item.name.lower() in {"unit_of_measure", "uom"}), None)
-    quantity = next((item for item in profiles if item.name.lower() == "quantity"), None)
-    if units and quantity and units.distinct_count > 1:
-        warnings.append("Quantity has multiple units of measure; do not sum it until a compatible unit filter is applied.")
-    resolved_run_id = run_id or uuid4().hex
-    if persist_run:
-        persist(resolved_run_id, headers, rows, file_name=file_name, source_type=source_type, source_label=source_label)
-    return DatasetProfile(run_id=resolved_run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, warnings=warnings, preview=safe_preview(rows))
+    run_id = uuid4().hex
+    persist(run_id, headers, rows, file_name=file_name, source_type=source_type, source_label=source_label)
+    return build_profile(file_name, headers, rows, run_id=run_id, sample_limit=ATTACH_PROFILE_SAMPLE_ROWS)
 
 
 def safe_preview(rows: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -478,6 +523,7 @@ def delete_run(run_id: str) -> None:
     RUN_STORE.metadata(run_id)
     import shutil
     shutil.rmtree(RUN_STORE._dir(run_id), ignore_errors=True)
+    PROFILE_CACHE.pop(run_id, None)
 
 
 @app.post("/api/maintenance/cleanup")
@@ -528,19 +574,29 @@ def stage_registered_source(source_id: str) -> DatasetProfile:
 
 
 def ingest_dataset(file_name: str, raw: bytes) -> DatasetProfile:
-    """Validate and profile a file payload from either web or Telegram transport."""
+    """Validate and persist a file, returning a bounded profile for immediate attach."""
     name = safe_name(file_name or "upload")
     if not re.fullmatch(r"[\w .()\-]+\.(csv|xlsx)", name, flags=re.IGNORECASE):
         raise HTTPException(415, "Upload a CSV or XLSX file with a safe file name.")
     if len(raw) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, f"File exceeds the {MAX_UPLOAD_BYTES // 1024 // 1024} MB upload limit.")
     headers, rows = xlsx_rows(raw) if name.lower().endswith(".xlsx") else csv_rows(raw)
-    return profile(name, headers, rows)
+    return attach_profile(name, headers, rows)
 
 
 @app.post("/api/runs/upload", response_model=DatasetProfile, status_code=201)
 async def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
     return ingest_dataset(file.filename or "upload", await file.read(MAX_UPLOAD_BYTES + 1))
+
+
+@app.get("/api/runs/{run_id}/profile/status", response_model=DatasetProfile)
+def profile_status(run_id: str) -> DatasetProfile:
+    """Lazily materialize the complete profile; later requests use the process cache."""
+    cached = PROFILE_CACHE.get(run_id)
+    if cached is not None:
+        return cached
+    headers, rows = load_run(run_id)
+    return profile_for_run(run_id, headers, rows)
 
 
 @app.get("/api/runs/{run_id}/plan")
@@ -739,23 +795,53 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
         return None, None
 
 
-def _semantic_clarification(columns: list[ColumnProfile], message: str) -> list[ClarificationOption]:
-    """Ask rather than guess when a vague request has several plausible business fields."""
+def _selection_artifact(run_id: str) -> dict[str, object]:
+    """Return schema-only user selections for this run; no selections are global."""
+    path = RUN_STORE._dir(run_id) / "semantic-selection.json"
+    if not path.exists():
+        return {"selections": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data.get("selections"), list) else {"selections": []}
+    except (OSError, json.JSONDecodeError):
+        return {"selections": []}
+
+
+def _named_columns(columns: list[ColumnProfile], message: str) -> set[str]:
+    """Find explicit schema names, treating underscore/hyphen/space as equivalent."""
+    normalized = re.sub(r"[^a-z0-9]+", " ", message.casefold()).strip()
+    return {
+        item.name for item in columns
+        if re.search(rf"(?<![a-z0-9]){re.escape(re.sub(r'[^a-z0-9]+', ' ', item.name.casefold()).strip())}(?![a-z0-9])", normalized)
+    }
+
+
+def _semantic_clarification(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> list[ClarificationOption]:
+    """Ask only for roles not explicitly named in the schema or confirmed by this run's user."""
     normalized = message.lower()
     requested_measure = any(word in normalized for word in {"doanh thu", "revenue", "sales", "lợi nhuận", "profit", "margin", "chi phí", "cost", "số lượng", "quantity"})
     requested_dimension = any(word in normalized for word in {"theo", "by", "trend", "xu hướng", "tháng", "month", "ngày", "day"})
+    named = _named_columns(columns, message)
+    selected = {str(item.get("column")): str(item.get("role")) for item in selections}
+    metric_named = any(item.kind == "num" and (item.name in named or selected.get(item.name) == "metric") for item in columns)
+    dimension_named = any(item.kind in {"time", "cat"} and (item.name in named or selected.get(item.name) == "dimension") for item in columns)
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
     dimensions = [item for item in columns if item.kind in {"time", "cat"}]
-    if not requested_measure and len(metrics) > 1:
-        return [ClarificationOption(column=item.name, label=item.name, reason="Numeric measure candidate — please confirm its business meaning.") for item in metrics[:4]]
-    if requested_measure and not requested_dimension and len(dimensions) > 1:
-        return [ClarificationOption(column=item.name, label=item.name, reason="Possible time or breakdown dimension — please confirm.") for item in dimensions[:4]]
+    if not requested_measure and not metric_named and len(metrics) > 1:
+        return [ClarificationOption(column=item.name, label=item.name, reason="Numeric measure candidate — please confirm its business meaning.", role="metric") for item in metrics[:4]]
+    if requested_measure and not requested_dimension and not dimension_named and len(dimensions) > 1:
+        return [ClarificationOption(column=item.name, label=item.name, reason="Possible time or breakdown dimension — please confirm.", role="dimension") for item in dimensions[:4]]
     return []
 
 
-def _chat_metric(columns: list[ColumnProfile], message: str) -> ColumnProfile | None:
+def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
     normalized = message.lower()
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
+    selected = {str(item.get("column")) for item in selections if item.get("role") == "metric"}
+    named = _named_columns(columns, message)
+    direct = next((item for item in metrics if item.name in named or item.name in selected), None)
+    if direct:
+        return direct
     priorities = (("doanh thu", "revenue", "sales"), ("lợi nhuận", "profit", "margin"), ("số lượng", "quantity", "volume"), ("chi phí", "cost"))
     for words in priorities:
         if any(word in normalized for word in words):
@@ -765,9 +851,14 @@ def _chat_metric(columns: list[ColumnProfile], message: str) -> ColumnProfile | 
     return metrics[0] if metrics else None
 
 
-def _chat_dimension(columns: list[ColumnProfile], message: str) -> ColumnProfile | None:
+def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
     normalized = message.lower()
     fields = [item for item in columns if item.kind in {"time", "cat"}]
+    selected = {str(item.get("column")) for item in selections if item.get("role") == "dimension"}
+    named = _named_columns(columns, message)
+    direct = next((item for item in fields if item.name in named or item.name in selected), None)
+    if direct:
+        return direct
     if any(word in normalized for word in {"tháng", "month", "ngày", "day", "trend", "xu hướng", "6 tháng", "năm"}):
         timed = next((item for item in fields if item.kind == "time"), None)
         if timed:
@@ -779,12 +870,10 @@ def _chat_dimension(columns: list[ColumnProfile], message: str) -> ColumnProfile
     return next((item for item in fields if item.kind == "time"), fields[0] if fields else None)
 
 
-def _starter_analysis_response(columns: list[ColumnProfile], message: str) -> ChatResponse:
+def _starter_analysis_response(columns: list[ColumnProfile], message: str, language: Literal["en", "vi"] = "en") -> ChatResponse:
     """Return selectable, profile-only views without running a chart or calling an LLM."""
     proposals = analyst_proposals(columns, max_charts=5)
-    english = any(word in message.casefold() for word in {"suggest", "analysis", "assess", "evaluate", "perspective", "data"}) and not any(
-        character in message.casefold() for character in "ăâđêôơư"
-    )
+    english = language == "en"
     if english:
         answer = "Here are safe starter analysis views based on this dataset profile. Select a card to run its validated aggregate."
         insight = f"Prepared {len(proposals)} deterministic view{'s' if len(proposals) != 1 else ''}; no raw rows or chart query were sent to an LLM."
@@ -825,15 +914,40 @@ def chart_insight(rows: list[dict[str, str | float | int]], chronological: bool)
     return f"{top['display_label']} đang dẫn đầu với {compact_number(float(top['value']))}.", bullets
 
 
+@app.post("/api/runs/{run_id}/semantic-selection", response_model=ChatResponse)
+def select_semantic_column(run_id: str, request: SemanticSelectionRequest) -> ChatResponse:
+    """Persist a user choice inside one run, then resume only that run's pending question."""
+    headers, rows = load_run(run_id)
+    profile_data = profile_for_run(run_id, headers, rows)
+    column = next((item for item in profile_data.columns if item.name == request.column), None)
+    if column is None or is_sensitive_column(request.column):
+        raise HTTPException(422, "Selected column is not available for semantic analysis.")
+    if request.role == "metric" and column.kind != "num":
+        raise HTTPException(422, "Selected metric must be a numeric schema column.")
+    if request.role == "dimension" and column.kind not in {"time", "cat"}:
+        raise HTTPException(422, "Selected dimension must be a time or categorical schema column.")
+    state = _selection_artifact(run_id)
+    selections = [item for item in cast(list[dict[str, object]], state["selections"]) if item.get("role") != request.role]
+    selections.append({"column": column.name, "role": request.role, "provenance": "User"})
+    pending_message = state.get("pending_message")
+    RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections})
+    if not isinstance(pending_message, str) or not pending_message:
+        raise HTTPException(409, "No pending question is available to resume.")
+    return chat_about_run(run_id, ChatRequest(message=pending_message, language=cast(Literal["en", "vi"], request.language)), allow_llm=False)
+
+
 @app.post("/api/runs/{run_id}/chat", response_model=ChatResponse)
 def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True) -> ChatResponse:
     """Constrained data conversation: natural language maps only to a validated aggregate."""
     headers, rows = load_run(run_id)
     profile_data = profile_for_run(run_id, headers, rows)
     if is_starter_analysis_request(request.message):
-        return _starter_analysis_response(profile_data.columns, request.message)
-    clarification_options = _semantic_clarification(profile_data.columns, request.message)
+        return _starter_analysis_response(profile_data.columns, request.message, request.language)
+    state = _selection_artifact(run_id)
+    selections = cast(list[dict[str, object]], state["selections"])
+    clarification_options = _semantic_clarification(profile_data.columns, request.message, selections)
     if clarification_options:
+        RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})
         return ChatResponse(answer="Em thấy có hơn một cột phù hợp nhưng chưa đủ chắc về business meaning hoặc phạm vi. Anh xác nhận giúp em cột muốn dùng nhé.", insight="Chưa chạy aggregate để tránh tự suy diễn chỉ tiêu/phạm vi.", scope="Chờ xác nhận semantic", caveats=["Lựa chọn của anh sẽ chỉ áp dụng cho dataset/run hiện tại và được gắn provenance User."], clarification_options=clarification_options, mode="clarification")
     llm_request, clarification = _llm_chart_request(profile_data.columns, request) if allow_llm else (None, None)
     if clarification:
@@ -842,8 +956,8 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     if llm_request:
         chart_request = llm_request
     else:
-        metric = _chat_metric(profile_data.columns, request.message)
-        dimension = _chat_dimension(profile_data.columns, request.message)
+        metric = _chat_metric(profile_data.columns, request.message, selections)
+        dimension = _chat_dimension(profile_data.columns, request.message, selections)
         if metric is None or dimension is None:
             return ChatResponse(answer="Em cần một metric số và một trường thời gian hoặc dimension để phân tích. Anh có thể hỏi theo dạng: ‘Doanh thu theo tháng’ hoặc ‘Doanh thu theo kênh’.", insight="Chưa tìm được cặp metric/dimension an toàn trong dataset này.", scope="Chưa chạy phân tích", caveats=[], mode="clarification")
         chart_request = ChartRequest(dimension=dimension.name, metric=metric.name, aggregation="sum", chart_type="line" if dimension.kind == "time" else "bar", limit=12)
@@ -861,24 +975,28 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
 @app.post("/api/runs/{run_id}/chat/stream")
 def stream_chat_about_run(run_id: str, request: ChatRequest) -> StreamingResponse:
     """Stream safe, user-meaningful progress states—not private model reasoning."""
+    labels = {
+        "en": {"received": "Question received", "planning": "Understanding the question against the dataset schema", "validating": "Checking safe columns and scope", "fallback": "Using the safe analysis planner for a fast response", "clarification": "A confirmation is needed before analysis", "aggregating": "Aggregating data on the server", "insights": "Forming insight from verified aggregates", "completed": "Analysis complete"},
+        "vi": {"received": "Đã nhận câu hỏi", "planning": "Đang hiểu câu hỏi theo schema dataset", "validating": "Đang kiểm tra cột và phạm vi an toàn", "fallback": "Đang dùng bộ phân tích an toàn để phản hồi nhanh", "clarification": "Cần xác nhận thêm trước khi chạy phân tích", "aggregating": "Đã tổng hợp dữ liệu trên server", "insights": "Đang tạo insight từ aggregate đã xác thực", "completed": "Hoàn tất phân tích"},
+    }[request.language]
     def event(name: str, payload: dict[str, object]) -> str:
         return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     def generate():
-        yield event("received", {"label": "Đã nhận câu hỏi"})
-        yield event("planning", {"label": "Đang hiểu câu hỏi theo schema dataset"})
-        yield event("validating", {"label": "Đang kiểm tra cột và phạm vi an toàn"})
+        yield event("received", {"label": labels["received"]})
+        yield event("planning", {"label": labels["planning"]})
+        yield event("validating", {"label": labels["validating"]})
         try:
             # The synchronous LLM client cannot yield while waiting. Stream stays responsive
             # by using the deterministic, schema-validated planner for this transport.
-            yield event("fallback_planning", {"label": "Đang dùng bộ phân tích an toàn để phản hồi nhanh"})
+            yield event("fallback_planning", {"label": labels["fallback"]})
             response = chat_about_run(run_id, request, allow_llm=False)
             if response.mode == "clarification":
-                yield event("clarification", {"label": "Cần xác nhận thêm trước khi chạy phân tích", "response": response.model_dump()})
+                yield event("clarification", {"label": labels["clarification"], "response": response.model_dump()})
             else:
-                yield event("aggregating", {"label": "Đã tổng hợp dữ liệu trên server"})
-                yield event("insights", {"label": "Đang tạo insight từ aggregate đã xác thực"})
-                yield event("completed", {"label": "Hoàn tất phân tích", "response": response.model_dump()})
+                yield event("aggregating", {"label": labels["aggregating"]})
+                yield event("insights", {"label": labels["insights"]})
+                yield event("completed", {"label": labels["completed"], "response": response.model_dump()})
         except HTTPException as error:
             yield event("error", {"label": str(error.detail) if error.status_code < 500 else "Không thể hoàn tất phân tích lúc này."})
         except Exception:

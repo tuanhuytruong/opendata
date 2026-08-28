@@ -1,6 +1,7 @@
 from io import BytesIO
 from pathlib import Path
 import sys
+import time
 
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
@@ -41,6 +42,40 @@ def test_profiles_xlsx() -> None:
     response = client.post("/api/runs/upload", files={"file": ("sales.xlsx", content.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
     assert response.status_code == 201, response.text
     assert response.json()["file_name"] == "sales.xlsx"
+
+
+def test_large_upload_returns_sampled_profile_then_lazily_completes_and_caches() -> None:
+    headers = ["event_date", "amount", "channel", "region", "segment", "product", "quantity", "uom", "customer_id", "note"]
+    row = "2026-01-01,100,Online,North,Consumer,Widget,2,EA,1,ok"
+    content = ",".join(headers) + "\n" + (row + "\n") * 63_000
+
+    started = time.perf_counter()
+    response = client.post("/api/runs/upload", files={"file": ("large.csv", content, "text/csv")})
+    attach_elapsed = time.perf_counter() - started
+    assert response.status_code == 201, response.text
+    attached = response.json()
+    assert attached["row_count"] == 63_000
+    assert attached["column_count"] == 10
+    assert attached["profile_status"] == "sampled"
+    assert attached["profiled_row_count"] == 1_000
+    # Avoid a machine-specific latency threshold: prove upload avoided full profile
+    # work by requiring the later full profile to inspect all retained rows.
+    started = time.perf_counter()
+    full_response = client.get(f"/api/runs/{attached['run_id']}/profile/status")
+    full_elapsed = time.perf_counter() - started
+    assert full_response.status_code == 200, full_response.text
+    complete = full_response.json()
+    assert complete["profile_status"] == "complete"
+    assert complete["profiled_row_count"] == 63_000
+    assert full_elapsed > 0
+    assert attach_elapsed > 0
+
+    cached_started = time.perf_counter()
+    cached_response = client.get(f"/api/runs/{attached['run_id']}/profile/status")
+    cached_elapsed = time.perf_counter() - cached_started
+    assert cached_response.status_code == 200, cached_response.text
+    assert cached_response.json() == complete
+    assert cached_elapsed <= full_elapsed
 
 
 def test_run_scoped_eda_is_deterministic_bounded_and_excludes_sensitive_values() -> None:
@@ -182,6 +217,37 @@ def test_starter_views_stream_progress_and_semantic_clarification() -> None:
     assert "event: planning" in stream.text
     assert "event: completed" in stream.text
     assert "event: aggregated" not in stream.text
+
+
+def test_direct_schema_references_resolve_metric_and_dimension_without_clarification() -> None:
+    data = upload_csv("region,gross_profit,net_sales\nNorth,30,100\nSouth,10,40\n")
+    response = client.post(f"/api/runs/{data['run_id']}/chat", json={"message": "Show gross profit by region"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["mode"] == "analysis"
+    assert body["chart"]["metric"] == "gross_profit"
+    assert body["chart"]["dimension"] == "region"
+
+
+def test_semantic_selection_is_run_scoped_user_provenance_and_resumes_pending_question() -> None:
+    first = upload_csv("sale_date,net_sales,cogs\n2026-01-01,100,70\n2026-01-02,40,30\n")
+    second = upload_csv("sale_date,net_sales,cogs\n2026-01-01,20,10\n")
+    pending = client.post(f"/api/runs/{first['run_id']}/chat", json={"message": "Please analyze this"})
+    assert pending.status_code == 200, pending.text
+    option = pending.json()["clarification_options"][0]
+    assert option["role"] == "metric"
+    resumed = client.post(
+        f"/api/runs/{first['run_id']}/semantic-selection",
+        json={"column": option["column"], "role": option["role"]},
+    )
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["mode"] == "analysis"
+    from main import RUN_STORE
+    state = RUN_STORE.artifact_json(first["run_id"], "semantic-selection.json")
+    assert state["selections"] == [{"column": option["column"], "role": "metric", "provenance": "User"}]
+    assert not (RUN_STORE._dir(second["run_id"]) / "semantic-selection.json").exists()
+    assert client.post(f"/api/runs/{second['run_id']}/semantic-selection", json={"column": "net_sales", "role": "metric"}).status_code == 409
+    assert client.post(f"/api/runs/{first['run_id']}/semantic-selection", json={"column": "missing", "role": "metric"}).status_code == 422
 
 
 def test_time_charts_are_chronological_and_format_dates() -> None:

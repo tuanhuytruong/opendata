@@ -82,7 +82,7 @@ def propose_charts(columns: Iterable[object], max_charts: int = 8) -> list[dict[
     return proposals
 
 
-def analyst_proposals(columns: Iterable[object], max_charts: int = 5) -> list[dict[str, object]]:
+def analyst_proposals(columns: Iterable[object], max_charts: int = 5, language: str = "en") -> list[dict[str, object]]:
     """Return stable, selectable views from safe profile metadata only.
 
     Ordering follows the profile column order, so equivalent profiles always produce
@@ -110,15 +110,18 @@ def analyst_proposals(columns: Iterable[object], max_charts: int = 5) -> list[di
             "request": {"dimension": key[0], "metric": key[1], "aggregation": "sum", "chart_type": chart_type, "limit": 12, "filters": []},
         })
 
+    vietnamese = language == "vi"
     for metric in metrics:
         for field in time_fields:
-            add("trend", field, metric, "line", f"Xu hướng {getattr(metric, 'name')} theo {getattr(field, 'name')}", f"{getattr(field, 'name')} là trường thời gian và {getattr(metric, 'name')} là chỉ tiêu số; biểu đồ xu hướng giúp nhận diện biến động và điểm đột biến.")
+            title = f"Xu hướng {getattr(metric, 'name')} theo {getattr(field, 'name')}" if vietnamese else f"{getattr(metric, 'name')} trend by {getattr(field, 'name')}"
+            rationale = (f"{getattr(field, 'name')} là trường thời gian và {getattr(metric, 'name')} là chỉ tiêu số; biểu đồ xu hướng giúp nhận diện biến động và điểm đột biến." if vietnamese else f"{getattr(field, 'name')} is a time field and {getattr(metric, 'name')} is numeric; this trend view surfaces movement and potential outliers.")
+            add("trend", field, metric, "line", title, rationale)
         for field in dimensions:
             name = getattr(field, "name")
             lower = _normalized_text(name)
             kind = "mix" if any(token in lower for token in {"channel", "type", "segment", "group", "b2b", "b2c"}) else "ranking"
-            title = f"{getattr(metric, 'name')} theo {name}"
-            rationale = f"{name} là dimension phân loại với {getattr(field, 'distinct_count')} giá trị quan sát; góc nhìn này xếp hạng đóng góp vào {getattr(metric, 'name')}."
+            title = f"{getattr(metric, 'name')} theo {name}" if vietnamese else f"{getattr(metric, 'name')} by {name}"
+            rationale = (f"{name} là dimension phân loại với {getattr(field, 'distinct_count')} giá trị quan sát; góc nhìn này xếp hạng đóng góp vào {getattr(metric, 'name')}." if vietnamese else f"{name} is a categorical dimension with {getattr(field, 'distinct_count')} observed values; this view ranks contribution to {getattr(metric, 'name')}.")
             add(kind, field, metric, "bar", title, rationale)
     return proposals
 

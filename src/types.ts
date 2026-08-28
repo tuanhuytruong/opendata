@@ -18,6 +18,7 @@ export interface DatasetProfile {
   columns: ColumnProfile[];
   warnings: string[];
   preview: Record<string, string>[];
+  profile_status?: 'sampled' | 'complete';
 }
 
 export interface ChartRequest {
@@ -63,7 +64,7 @@ export interface ChartResult {
   evidence?: string[];
 }
 
-export interface ClarificationOption { column: string; label: string; reason: string; }
+export interface ClarificationOption { column: string; label: string; reason: string; role: 'metric' | 'dimension'; }
 export interface ChatResult { answer: string; insight: string; scope: string; chart?: ChartResult; table: ChartRow[]; caveats: string[]; clarification_options?: ClarificationOption[]; proposals?: StarterView[]; mode: 'analysis' | 'clarification'; planner: 'llm' | 'deterministic'; }
 
 export interface EDAColumn {
