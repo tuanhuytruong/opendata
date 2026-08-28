@@ -45,6 +45,24 @@ def test_durable_job_retries_and_cancellation(tmp_path) -> None:
     assert queue.cancel(second)["status"] == "cancelled"
 
 
+def test_optional_basic_auth_protects_the_entire_api(monkeypatch) -> None:
+    monkeypatch.setenv("OPENDATA_BASIC_AUTH_USER", "pilot")
+    monkeypatch.setenv("OPENDATA_BASIC_AUTH_PASSWORD", "correct-horse")
+    challenge = client.get("/api/health")
+    assert challenge.status_code == 401
+    assert challenge.headers["www-authenticate"] == 'Basic realm="OpenData pilot", charset="UTF-8"'
+    assert client.get("/api/health", auth=("pilot", "wrong")).status_code == 401
+    assert client.get("/", auth=("pilot", "wrong")).status_code == 401
+    assert client.get("/api/health", auth=("pilot", "correct-horse")).json() == {"status": "ok"}
+    assert "text/html" in client.get("/", auth=("pilot", "correct-horse")).headers["content-type"]
+
+
+def test_invalid_partial_basic_auth_configuration_fails_closed(monkeypatch) -> None:
+    monkeypatch.setenv("OPENDATA_BASIC_AUTH_USER", "pilot")
+    monkeypatch.delenv("OPENDATA_BASIC_AUTH_PASSWORD", raising=False)
+    assert client.get("/api/health").status_code == 503
+
+
 def test_api_security_headers_and_sensitive_masking() -> None:
     data = upload_csv("email,channel,net_sales\nalice@example.com,Online,100\n")
     assert data["preview"][0]["email"] == "[masked]"

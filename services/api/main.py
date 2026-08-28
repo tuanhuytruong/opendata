@@ -1,8 +1,11 @@
 """Read-only dataset profiling and chart API for OpenData report runs."""
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import hashlib
+import hmac
 import html
 import io
 import json
@@ -18,6 +21,7 @@ import duckdb
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
@@ -32,6 +36,7 @@ MAX_PROFILE_ROWS = 600_000
 MAX_REQUESTS_PER_MINUTE = 60
 DATA_DIR = Path(__file__).resolve().parents[2] / "var" / "uploads"
 JOB_DIR = Path(__file__).resolve().parents[2] / "var" / "jobs"
+STATIC_DIR = Path(os.getenv("OPENDATA_STATIC_DIR", str(Path(__file__).resolve().parents[2] / "dist")))
 RUN_STORE = RunStore(DATA_DIR)
 JOB_QUEUE = DurableJobQueue(JOB_DIR)
 VALID_CHARTS = {"bar", "line", "area", "scatter"}
@@ -45,6 +50,34 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
         return response
+
+
+class BasicAuthMiddleware(BaseHTTPMiddleware):
+    """Optional pilot-only HTTP Basic Auth, configured exclusively by environment."""
+
+    async def dispatch(self, request: Request, call_next):
+        username = os.getenv("OPENDATA_BASIC_AUTH_USER", "").strip()
+        password = os.getenv("OPENDATA_BASIC_AUTH_PASSWORD", "")
+        if not username and not password:
+            return await call_next(request)
+        if not username or not password:
+            return JSONResponse({"detail": "Basic Auth configuration is invalid."}, status_code=503)
+        authorization = request.headers.get("authorization", "")
+        valid = False
+        if authorization.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+                supplied_user, supplied_password = decoded.split(":", 1)
+                valid = hmac.compare_digest(supplied_user, username) and hmac.compare_digest(supplied_password, password)
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                valid = False
+        if not valid:
+            return JSONResponse(
+                {"detail": "Authentication required."},
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="OpenData pilot", charset="UTF-8"'},
+            )
+        return await call_next(request)
 
 
 class InMemoryRateLimitMiddleware(BaseHTTPMiddleware):
@@ -66,6 +99,7 @@ class InMemoryRateLimitMiddleware(BaseHTTPMiddleware):
 app = FastAPI(title="OpenData Report API", version="0.3.0")
 app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(InMemoryRateLimitMiddleware)
+app.add_middleware(BasicAuthMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://localhost:5174"], allow_credentials=False, allow_methods=["GET", "POST", "DELETE"], allow_headers=["content-type"])
 
 
@@ -458,3 +492,7 @@ def build_report(run_id: str, request: ReportRequest) -> HTMLResponse:
     safe_chart_payload = json.dumps(payload).replace("</", "<\\/")
     artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><section class="meta"><h2>Evidence-bound highlights</h2><ul>{''.join(f'<li>{html.escape(item)}</li>' for item in narratives) or '<li>No narrative evidence was available.</li>'}</ul></section><section class="meta"><h2>Provenance</h2><p>Dataset checksum: <code>{manifest['dataset_sha256']}</code>. Filter scope and chart specifications are retained in the run manifest.</p></section><div id="charts"></div></main><script>const charts={safe_chart_payload};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th>${{c.secondary_dimension?`<th>${{e(c.secondary_dimension)}}</th>`:''}}<th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td>${{c.secondary_dimension?`<td>${{e(r.secondary_label ?? '')}}</td>`:''}}<td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-report.html"'})
+
+
+if STATIC_DIR.is_dir():
+    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="web")

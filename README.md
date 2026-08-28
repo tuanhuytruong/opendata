@@ -64,6 +64,7 @@ The Telegram flow supports both **This machine** uploads and an operator-registe
 - `GET /api/health` is liveness; `GET /api/readiness` verifies writable artifact/job storage and performs expiry cleanup.
 - `POST /api/maintenance/cleanup` is disabled unless `OPENDATA_MAINTENANCE_KEY` is configured, and requires the matching `X-OpenData-Maintenance-Key` header. Prefer an internal scheduler/network path.
 - API requests are rate-limited in-process to 60/min/IP for the pilot. Before multiple API replicas, replace it with a shared reverse-proxy or Redis limiter.
+- Set `OPENDATA_BASIC_AUTH_USER` and `OPENDATA_BASIC_AUTH_PASSWORD` together in ignored `.env.local` to gate every API route with HTTP Basic Auth. The API fails closed if only one is present; keep the credentials only in the process environment and serve the pilot over HTTPS.
 - Common PII/secrets-like column names are masked in previews and rejected from values, filters, and charts. Configure database service accounts/views to exclude sensitive columns as a stronger upstream control.
 - The app emits no raw rows, credentials or database driver errors in public responses. Put API + worker behind HTTPS, keep database/worker ports private, and do not expose the maintenance hook publicly.
 
