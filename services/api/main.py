@@ -46,6 +46,7 @@ JOB_DIR = Path(__file__).resolve().parents[2] / "var" / "jobs"
 STATIC_DIR = Path(os.getenv("OPENDATA_STATIC_DIR", str(Path(__file__).resolve().parents[2] / "dist")))
 RUN_STORE = RunStore(DATA_DIR)
 JOB_QUEUE = DurableJobQueue(JOB_DIR)
+PROFILE_CACHE: dict[str, DatasetProfile] = {}
 VALID_CHARTS = {"bar", "line", "area", "scatter"}
 
 
@@ -304,6 +305,16 @@ def load_run(run_id: str) -> tuple[list[str], list[dict[str, str]]]:
     return validate_headers(headers), rows
 
 
+def profile_for_run(run_id: str, headers: list[str], rows: list[dict[str, str]]) -> DatasetProfile:
+    """Avoid repeated full-column profiling for the same retained run in one API process."""
+    cached = PROFILE_CACHE.get(run_id)
+    if cached is not None:
+        return cached
+    result = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    PROFILE_CACHE[run_id] = result
+    return result
+
+
 def profile(file_name: str, headers: list[str], rows: list[dict[str, str]], persist_run: bool = True, run_id: str | None = None, source_type: str = "file", source_label: str | None = None) -> DatasetProfile:
     if not rows:
         raise HTTPException(422, "Dataset does not contain data rows.")
@@ -387,7 +398,7 @@ def exploratory_data_analysis(run_id: str, headers: list[str], rows: list[dict[s
     whose names pass the existing sensitive-column guard.
     """
     metadata = RUN_STORE.metadata(run_id)
-    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    profile_data = profile_for_run(run_id, headers, rows)
     profiles = {item.name: item for item in profile_data.columns}
     visible_headers = [header for header in headers if not is_sensitive_column(header)][:MAX_EDA_COLUMNS]
     columns: list[dict[str, object]] = []
@@ -535,14 +546,14 @@ async def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
 @app.get("/api/runs/{run_id}/plan")
 def suggested_plan(run_id: str, limit: int = 8) -> dict[str, object]:
     headers, rows = load_run(run_id)
-    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    profile_data = profile_for_run(run_id, headers, rows)
     return {"charts": propose_charts(profile_data.columns, max(1, min(limit, 12))), "note": "Candidates are deterministic suggestions; review and approve before report generation."}
 
 
 def starter_views_payload(run_id: str) -> dict[str, object]:
     """Return safe, selectable views from profile metadata only; never execute a chart."""
     headers, rows = load_run(run_id)
-    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    profile_data = profile_for_run(run_id, headers, rows)
     proposals = analyst_proposals(profile_data.columns)
     for proposal in proposals:
         request = cast(dict[str, object], proposal["request"])
@@ -615,7 +626,7 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
         else:
             filter_clauses.append(f"{field} {operator} ?")
             parameters.append(item.value)
-    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    profile_data = profile_for_run(run_id, headers, rows)
     dimension_profile = next(item for item in profile_data.columns if item.name == request.dimension)
     chronological = request.chart_type in {"line", "area"} and dimension_profile.kind == "time" and not secondary
     connection = duckdb.connect(":memory:")
@@ -818,7 +829,7 @@ def chart_insight(rows: list[dict[str, str | float | int]], chronological: bool)
 def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True) -> ChatResponse:
     """Constrained data conversation: natural language maps only to a validated aggregate."""
     headers, rows = load_run(run_id)
-    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    profile_data = profile_for_run(run_id, headers, rows)
     if is_starter_analysis_request(request.message):
         return _starter_analysis_response(profile_data.columns, request.message)
     clarification_options = _semantic_clarification(profile_data.columns, request.message)
