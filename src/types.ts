@@ -30,6 +30,20 @@ export interface ChartRequest {
   filters?: Array<{ column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string }>;
 }
 
+export interface AnalystProposal {
+  id: string;
+  title: string;
+  rationale: string;
+  confidence: 'profile-based';
+  request: ChartRequest;
+}
+
+export interface AnalystPlan {
+  summary: string;
+  proposals: AnalystProposal[];
+  guardrail: string;
+}
+
 export interface ChartResult {
   dimension: string;
   metric: string;

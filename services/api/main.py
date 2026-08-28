@@ -27,7 +27,7 @@ from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
 from database_adapters import read_registered_source
-from planning import evidence_for_chart, narrative_from_evidence, parse_filter, propose_charts
+from planning import analyst_proposals, evidence_for_chart, narrative_from_evidence, parse_filter, propose_charts
 from source_registry import public_source, registered_sources
 from run_store import DurableJobQueue, RunStore
 
@@ -399,6 +399,18 @@ def suggested_plan(run_id: str, limit: int = 8) -> dict[str, object]:
     headers, rows = load_run(run_id)
     profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
     return {"charts": propose_charts(profile_data.columns, max(1, min(limit, 12))), "note": "Candidates are deterministic suggestions; review and approve before report generation."}
+
+
+@app.get("/api/runs/{run_id}/analyst-proposals")
+def analyst_plan(run_id: str) -> dict[str, object]:
+    """Explainable proposal cards based only on retained profile metadata, never raw rows."""
+    headers, rows = load_run(run_id)
+    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    return {
+        "summary": f"This run has {profile_data.row_count:,} rows, {profile_data.usable_column_count} usable columns, {sum(item.kind == 'num' for item in profile_data.columns)} metrics and {sum(item.kind in {'cat', 'time'} for item in profile_data.columns)} dimensions/time fields.",
+        "proposals": analyst_proposals(profile_data.columns),
+        "guardrail": "Suggestions use inferred column roles and profile counts only. Charts run only after your approval and always use validated server-side aggregates.",
+    }
 
 
 @app.post("/api/runs/{run_id}/parse-filter")

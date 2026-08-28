@@ -64,6 +64,12 @@ def test_values_and_validated_chart() -> None:
 def test_parses_explicit_filters_and_proposes_charts() -> None:
     data = upload_csv("sale_date,channel,net_sales\n2026-01-01,Online,100\n2026-01-02,Retail,40\n")
     run_id = data["run_id"]
+    analyst = client.get(f"/api/runs/{run_id}/analyst-proposals")
+    assert analyst.status_code == 200, analyst.text
+    proposal = analyst.json()["proposals"][0]
+    assert proposal["request"]["dimension"] in {"sale_date", "channel"}
+    assert proposal["request"]["metric"] == "net_sales"
+    assert "raw rows" not in str(analyst.json()).lower()
     parsed = client.post(f"/api/runs/{run_id}/parse-filter", json={"text": "net_sales >= 50"})
     assert parsed.status_code == 200, parsed.text
     assert parsed.json()["filter"] == {"column": "net_sales", "operator": "greater_or_equal", "value": "50"}
