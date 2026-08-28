@@ -541,7 +541,18 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
             content = json.loads(response.read().decode())["choices"][0]["message"]["content"]
         # Some compatible gateways append a second JSON fragment despite JSON mode.
         # Accept only the first complete object; validation below still rejects unsafe intent.
-        parsed, _ = json.JSONDecoder().raw_decode(content.lstrip())
+        parsed: object | None = None
+        decoder = json.JSONDecoder()
+        for offset, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                candidate, _ = decoder.raw_decode(content[offset:])
+                if isinstance(candidate, dict):
+                    parsed = candidate
+                    break
+            except json.JSONDecodeError:
+                continue
         if not isinstance(parsed, dict):
             return None, None
         if parsed.get("clarification"):
