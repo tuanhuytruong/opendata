@@ -539,7 +539,11 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
         http_request = urllib.request.Request(f"{base_url}/chat/completions", data=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
         with urllib.request.urlopen(http_request, timeout=15) as response:
             content = json.loads(response.read().decode())["choices"][0]["message"]["content"]
-        parsed = json.loads(content)
+        # Some compatible gateways append a second JSON fragment despite JSON mode.
+        # Accept only the first complete object; validation below still rejects unsafe intent.
+        parsed, _ = json.JSONDecoder().raw_decode(content.lstrip())
+        if not isinstance(parsed, dict):
+            return None, None
         if parsed.get("clarification"):
             return None, str(parsed["clarification"])[:400]
         aggregation = str(parsed.get("aggregation", "sum"))
