@@ -9,7 +9,9 @@ import hmac
 import html
 import io
 import json
+import math
 import os
+from collections import Counter
 import urllib.error
 import urllib.request
 import re
@@ -21,7 +23,7 @@ from uuid import uuid4
 
 import duckdb
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -29,13 +31,16 @@ from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
 from database_adapters import read_registered_source
-from planning import analyst_proposals, evidence_for_chart, narrative_from_evidence, parse_filter, propose_charts
+from formatting import compact_number, format_display_date, parse_date_value, percent
+from planning import analyst_proposals, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, propose_charts
 from source_registry import public_source, registered_sources
 from run_store import DurableJobQueue, RunStore
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROFILE_ROWS = 600_000
 MAX_REQUESTS_PER_MINUTE = 60
+MAX_EDA_COLUMNS = 100
+MAX_EDA_TOP_CATEGORIES = 10
 DATA_DIR = Path(__file__).resolve().parents[2] / "var" / "uploads"
 JOB_DIR = Path(__file__).resolve().parents[2] / "var" / "jobs"
 STATIC_DIR = Path(os.getenv("OPENDATA_STATIC_DIR", str(Path(__file__).resolve().parents[2] / "dist")))
@@ -160,6 +165,12 @@ class ChatRequest(BaseModel):
     context: str = Field(default="", max_length=1000)
 
 
+class ClarificationOption(BaseModel):
+    column: str
+    label: str
+    reason: str
+
+
 class ChatResponse(BaseModel):
     answer: str
     insight: str
@@ -167,6 +178,8 @@ class ChatResponse(BaseModel):
     chart: "ChartResult | None" = None
     table: list[dict[str, str | float | int]] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
+    clarification_options: list[ClarificationOption] = Field(default_factory=list)
+    proposals: list[dict[str, object]] = Field(default_factory=list)
     mode: Literal["analysis", "clarification"]
     planner: Literal["llm", "deterministic"] = "deterministic"
 
@@ -181,6 +194,10 @@ class ChartResult(BaseModel):
     filters: list[FilterSpec] = Field(default_factory=list)
     rows: list[dict[str, str | float | int]]
     warnings: list[str]
+    sort_mode: Literal["chronological", "ranking"] = "ranking"
+    result_count: int = 0
+    insight_headline: str = ""
+    evidence: list[str] = Field(default_factory=list)
 
 
 def safe_name(name: str) -> str:
@@ -316,6 +333,109 @@ def safe_preview(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     return [{column: "[masked]" if is_sensitive_column(column) and value else value for column, value in row.items()} for row in rows[:20]]
 
 
+def _finite_number(value: str) -> float | None:
+    """Return a JSON-safe numeric value, without accepting NaN or infinity."""
+    try:
+        number = float(value.replace(",", ""))
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _numeric_summary(values: list[str]) -> dict[str, float | int]:
+    numbers = sorted(number for value in values if (number := _finite_number(value)) is not None)
+    count = len(numbers)
+    if not count:
+        return {"valid_count": 0, "invalid_count": len(values)}
+    midpoint = count // 2
+    median = numbers[midpoint] if count % 2 else (numbers[midpoint - 1] + numbers[midpoint]) / 2
+    return {
+        "valid_count": count,
+        "invalid_count": len(values) - count,
+        "min": numbers[0],
+        "max": numbers[-1],
+        "mean": round(sum(numbers) / count, 6),
+        "median": round(median, 6),
+    }
+
+
+def _time_coverage(values: list[str]) -> dict[str, str | int]:
+    parsed = sorted(value for value in (parse_date_value(item) for item in values) if value is not None)
+    if not parsed:
+        return {"valid_count": 0, "invalid_count": len(values)}
+    return {
+        "valid_count": len(parsed),
+        "invalid_count": len(values) - len(parsed),
+        "start": parsed[0].isoformat(),
+        "end": parsed[-1].isoformat(),
+    }
+
+
+def _top_categories(values: list[str]) -> list[dict[str, str | int]]:
+    counts = Counter(values)
+    return [
+        {"value": value, "count": count}
+        for value, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:MAX_EDA_TOP_CATEGORIES]
+    ]
+
+
+def exploratory_data_analysis(run_id: str, headers: list[str], rows: list[dict[str, str]]) -> dict[str, object]:
+    """Produce a bounded, deterministic run-scoped EDA summary.
+
+    This deliberately avoids database query input and skips all value-level output
+    for sensitive columns. Category values are capped and only returned for fields
+    whose names pass the existing sensitive-column guard.
+    """
+    metadata = RUN_STORE.metadata(run_id)
+    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    profiles = {item.name: item for item in profile_data.columns}
+    visible_headers = [header for header in headers if not is_sensitive_column(header)][:MAX_EDA_COLUMNS]
+    columns: list[dict[str, object]] = []
+    for header in visible_headers:
+        values = [(row.get(header) or "").strip() for row in rows]
+        observed = [value for value in values if value]
+        column = profiles[header]
+        quality: dict[str, object] = {
+            "non_null_count": len(observed),
+            "null_count": column.null_count,
+            "null_ratio": column.null_ratio,
+            "distinct_count": column.distinct_count,
+            "distinct_ratio": round(column.distinct_count / len(observed), 4) if observed else 0.0,
+        }
+        detail: dict[str, object] = {}
+        if column.kind == "num":
+            detail["numeric_summary"] = _numeric_summary(observed)
+        elif column.kind == "time":
+            detail["time_coverage"] = _time_coverage(observed)
+        elif column.kind == "cat":
+            detail["top_categories"] = _top_categories(observed)
+        columns.append({"name": header, "kind": column.kind, "quality": quality, **detail})
+    sensitive_column_count = sum(is_sensitive_column(header) for header in headers)
+    return {
+        "run_id": run_id,
+        "coverage": {
+            "row_count": len(rows),
+            "column_count": len(headers),
+            "analyzed_column_count": len(columns),
+            "suppressed_sensitive_column_count": sensitive_column_count,
+            "suppressed_column_count": len(headers) - len(columns) - sensitive_column_count,
+        },
+        "columns": columns,
+        "provenance": {
+            "dataset_sha256": hashlib.sha256(RUN_STORE.dataset_path(run_id).read_bytes()).hexdigest(),
+            "source_type": metadata["source_type"],
+            "source_label": metadata["source_label"],
+            "analysis": "deterministic, bounded run-scoped summary",
+            "top_category_limit": MAX_EDA_TOP_CATEGORIES,
+        },
+        "guardrails": [
+            "Sensitive columns are excluded from value-level EDA.",
+            f"Top categories are limited to {MAX_EDA_TOP_CATEGORIES} per non-sensitive categorical column.",
+            f"At most {MAX_EDA_COLUMNS} non-sensitive columns are analyzed.",
+        ],
+    }
+
+
 def quote_identifier(name: str, headers: list[str]) -> str:
     if name not in headers:
         raise HTTPException(422, f"Unknown column: {name}")
@@ -419,16 +539,36 @@ def suggested_plan(run_id: str, limit: int = 8) -> dict[str, object]:
     return {"charts": propose_charts(profile_data.columns, max(1, min(limit, 12))), "note": "Candidates are deterministic suggestions; review and approve before report generation."}
 
 
-@app.get("/api/runs/{run_id}/analyst-proposals")
-def analyst_plan(run_id: str) -> dict[str, object]:
-    """Explainable proposal cards based only on retained profile metadata, never raw rows."""
+def starter_views_payload(run_id: str) -> dict[str, object]:
+    """Return safe, selectable views from profile metadata only; never execute a chart."""
     headers, rows = load_run(run_id)
     profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    proposals = analyst_proposals(profile_data.columns)
+    for proposal in proposals:
+        request = cast(dict[str, object], proposal["request"])
+        proposal["question"] = f"Phân tích {request['metric']} theo {request['dimension']}"
     return {
         "summary": f"This run has {profile_data.row_count:,} rows, {profile_data.usable_column_count} usable columns, {sum(item.kind == 'num' for item in profile_data.columns)} metrics and {sum(item.kind in {'cat', 'time'} for item in profile_data.columns)} dimensions/time fields.",
-        "proposals": analyst_proposals(profile_data.columns),
+        "proposals": proposals,
         "guardrail": "Suggestions use inferred column roles and profile counts only. Charts run only after your approval and always use validated server-side aggregates.",
     }
+
+
+@app.get("/api/runs/{run_id}/analyst-proposals")
+def analyst_plan(run_id: str) -> dict[str, object]:
+    return starter_views_payload(run_id)
+
+
+@app.get("/api/runs/{run_id}/starter-views")
+def starter_views(run_id: str) -> dict[str, object]:
+    return starter_views_payload(run_id)
+
+
+@app.get("/api/runs/{run_id}/eda")
+def eda_for_run(run_id: str) -> dict[str, object]:
+    """Return deterministic, bounded EDA for one retained report run."""
+    headers, rows = load_run(run_id)
+    return exploratory_data_analysis(run_id, headers, rows)
 
 
 @app.post("/api/runs/{run_id}/parse-filter")
@@ -475,32 +615,41 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
         else:
             filter_clauses.append(f"{field} {operator} ?")
             parameters.append(item.value)
+    profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    dimension_profile = next(item for item in profile_data.columns if item.name == request.dimension)
+    chronological = request.chart_type in {"line", "area"} and dimension_profile.kind == "time" and not secondary
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
         where_clause = " AND ".join(filter_clauses)
         if secondary:
             query = f"SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1, 2 ORDER BY value DESC NULLS LAST LIMIT ?"
+        elif chronological:
+            query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY TRY_CAST({dimension} AS TIMESTAMP) ASC NULLS LAST LIMIT ?"
         else:
             query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
         records = connection.execute(query, [*parameters, request.limit]).fetchall()
     finally:
         connection.close()
     warnings: list[str] = []
-    if not records: warnings.append("This chart has no matching values.")
-    if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Verify a compatible unit filter before interpreting summed quantity.")
+    if not records: warnings.append("Không có giá trị phù hợp với phạm vi hiện tại.")
+    if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Cần lọc theo đơn vị tương thích trước khi diễn giải tổng quantity.")
+    if request.chart_type in {"line", "area"} and not chronological:
+        warnings.append("Trục đang không phải trường thời gian đã xác nhận; kết quả được xếp hạng theo giá trị thay vì diễn giải như xu hướng.")
     if secondary:
-        chart_rows = [{"label": str(label), "secondary_label": str(second), "value": 0 if value is None else float(value)} for label, second, value in records]
+        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "secondary_label": str(second), "value": 0 if value is None else float(value), "formatted_value": compact_number(0 if value is None else float(value))} for label, second, value in records]
     else:
-        chart_rows = [{"label": str(label), "value": 0 if value is None else float(value)} for label, value in records]
+        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "value": 0 if value is None else float(value), "formatted_value": compact_number(0 if value is None else float(value))} for label, value in records]
     if request.chart_type == "pareto":
         total = sum(float(row["value"]) for row in chart_rows)
         running = 0.0
         for row in chart_rows:
             running += float(row["value"])
             row["cumulative_pct"] = 0 if total == 0 else round(running / total * 100, 2)
-    title = f"{request.aggregation.upper()} {request.metric} by {request.dimension}" + (f" × {request.secondary_dimension}" if secondary else "")
-    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings)
+    insight_headline, evidence = chart_insight(chart_rows, chronological)
+    label = "Xu hướng" if chronological else f"Top {len(chart_rows)}"
+    title = f"{label} {request.metric} theo {request.dimension}" + (f" × {request.secondary_dimension}" if secondary else "")
+    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
 
 
 @app.get("/api/runs/{run_id}/manifest")
@@ -579,6 +728,20 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
         return None, None
 
 
+def _semantic_clarification(columns: list[ColumnProfile], message: str) -> list[ClarificationOption]:
+    """Ask rather than guess when a vague request has several plausible business fields."""
+    normalized = message.lower()
+    requested_measure = any(word in normalized for word in {"doanh thu", "revenue", "sales", "lợi nhuận", "profit", "margin", "chi phí", "cost", "số lượng", "quantity"})
+    requested_dimension = any(word in normalized for word in {"theo", "by", "trend", "xu hướng", "tháng", "month", "ngày", "day"})
+    metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
+    dimensions = [item for item in columns if item.kind in {"time", "cat"}]
+    if not requested_measure and len(metrics) > 1:
+        return [ClarificationOption(column=item.name, label=item.name, reason="Numeric measure candidate — please confirm its business meaning.") for item in metrics[:4]]
+    if requested_measure and not requested_dimension and len(dimensions) > 1:
+        return [ClarificationOption(column=item.name, label=item.name, reason="Possible time or breakdown dimension — please confirm.") for item in dimensions[:4]]
+    return []
+
+
 def _chat_metric(columns: list[ColumnProfile], message: str) -> ColumnProfile | None:
     normalized = message.lower()
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
@@ -605,12 +768,50 @@ def _chat_dimension(columns: list[ColumnProfile], message: str) -> ColumnProfile
     return next((item for item in fields if item.kind == "time"), fields[0] if fields else None)
 
 
-def compact_number(value: float | int) -> str:
-    number = float(value)
-    for threshold, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
-        if abs(number) >= threshold:
-            return f"{number / threshold:.1f}{suffix}"
-    return f"{number:.1f}"
+def _starter_analysis_response(columns: list[ColumnProfile], message: str) -> ChatResponse:
+    """Return selectable, profile-only views without running a chart or calling an LLM."""
+    proposals = analyst_proposals(columns, max_charts=5)
+    english = any(word in message.casefold() for word in {"suggest", "analysis", "assess", "evaluate", "perspective", "data"}) and not any(
+        character in message.casefold() for character in "ăâđêôơư"
+    )
+    if english:
+        answer = "Here are safe starter analysis views based on this dataset profile. Select a card to run its validated aggregate."
+        insight = f"Prepared {len(proposals)} deterministic view{'s' if len(proposals) != 1 else ''}; no raw rows or chart query were sent to an LLM."
+        scope = "Profile metadata only; no aggregate has run"
+        caveat = "Cards exclude identifier and sensitive fields and require explicit approval before a chart runs."
+    else:
+        answer = "Đây là các góc nhìn phân tích khởi đầu an toàn từ profile dataset. Hãy chọn một thẻ để chạy aggregate đã được xác thực."
+        insight = f"Đã chuẩn bị {len(proposals)} góc nhìn xác định; không gửi raw rows hoặc chart query tới LLM."
+        scope = "Chỉ dùng metadata của profile; chưa chạy aggregate"
+        caveat = "Các thẻ loại trừ trường định danh và nhạy cảm; chỉ chạy chart sau khi anh/chị phê duyệt."
+    return ChatResponse(answer=answer, insight=insight, scope=scope, proposals=proposals, caveats=[caveat], mode="analysis", planner="deterministic")
+
+
+def chart_insight(rows: list[dict[str, str | float | int]], chronological: bool) -> tuple[str, list[str]]:
+    if not rows:
+        return "Không có dữ liệu trong phạm vi đã chọn.", ["Không có aggregate nào phù hợp với filter và cột đã chọn."]
+    values = [float(row["value"]) for row in rows]
+    if chronological and len(rows) >= 2:
+        first, last = values[0], values[-1]
+        delta = last - first
+        change = 0 if first == 0 else delta / abs(first) * 100
+        peak_index, trough_index = values.index(max(values)), values.index(min(values))
+        direction = "tăng" if delta >= 0 else "giảm"
+        return (
+            f"Giá trị cuối kỳ {direction} {percent(abs(change))} so với đầu kỳ.",
+            [
+                f"Từ {rows[0]['display_label']}: {compact_number(first)} đến {rows[-1]['display_label']}: {compact_number(last)} ({direction} {compact_number(abs(delta))}).",
+                f"Đỉnh: {rows[peak_index]['display_label']} với {compact_number(values[peak_index])}; thấp nhất: {rows[trough_index]['display_label']} với {compact_number(values[trough_index])}.",
+            ],
+        )
+    total = sum(values)
+    top = rows[0]
+    share = 0 if total == 0 else float(top["value"]) / total * 100
+    second = values[1] if len(values) > 1 else None
+    bullets = [f"Dẫn đầu: {top['display_label']} với {compact_number(float(top['value']))}, chiếm {percent(share)} trong phần kết quả hiển thị."]
+    if second is not None:
+        bullets.append(f"Chênh lệch với hạng hai: {compact_number(float(top['value']) - second)}.")
+    return f"{top['display_label']} đang dẫn đầu với {compact_number(float(top['value']))}.", bullets
 
 
 @app.post("/api/runs/{run_id}/chat", response_model=ChatResponse)
@@ -618,6 +819,11 @@ def chat_about_run(run_id: str, request: ChatRequest) -> ChatResponse:
     """Constrained data conversation: natural language maps only to a validated aggregate."""
     headers, rows = load_run(run_id)
     profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
+    if is_starter_analysis_request(request.message):
+        return _starter_analysis_response(profile_data.columns, request.message)
+    clarification_options = _semantic_clarification(profile_data.columns, request.message)
+    if clarification_options:
+        return ChatResponse(answer="Em thấy có hơn một cột phù hợp nhưng chưa đủ chắc về business meaning hoặc phạm vi. Anh xác nhận giúp em cột muốn dùng nhé.", insight="Chưa chạy aggregate để tránh tự suy diễn chỉ tiêu/phạm vi.", scope="Chờ xác nhận semantic", caveats=["Lựa chọn của anh sẽ chỉ áp dụng cho dataset/run hiện tại và được gắn provenance User."], clarification_options=clarification_options, mode="clarification")
     llm_request, clarification = _llm_chart_request(profile_data.columns, request)
     if clarification:
         return ChatResponse(answer=clarification, insight="AI cần xác nhận phạm vi trước khi chạy aggregate.", scope="Chưa chạy phân tích", caveats=[], mode="clarification", planner="llm")
@@ -633,15 +839,37 @@ def chat_about_run(run_id: str, request: ChatRequest) -> ChatResponse:
     chart = build_chart(run_id, chart_request)
     metric = next(item for item in profile_data.columns if item.name == chart_request.metric)
     dimension = next(item for item in profile_data.columns if item.name == chart_request.dimension)
-    top = chart.rows[0] if chart.rows else None
-    scope = f"SUM {metric.name} by {dimension.name}; top {len(chart.rows)} values"
-    insight = "Không có dữ liệu phù hợp với câu hỏi này."
-    if top:
-        insight = f"{top['label']} đang dẫn đầu với {compact_number(float(top['value']))}; đây là kết quả aggregate đã được xác thực trên server."
+    scope = f"{chart.aggregation.upper()} {metric.name} theo {dimension.name}; {chart.result_count} kết quả, xếp {chart.sort_mode}"
+    insight = chart.insight_headline
     caveats = list(chart.warnings)
     if any(word in request.message.lower() for word in {"cùng kỳ", "year over year", "yoy", "năm ngoái"}):
         caveats.append("So sánh cùng kỳ cần một trường thời gian được chuẩn hoá theo tháng/năm; bản chat hiện trả xu hướng tổng hợp trước để anh review phạm vi.")
     return ChatResponse(answer=f"Em đã phân tích {metric.name} theo {dimension.name}.", insight=insight, scope=scope, chart=chart, table=chart.rows, caveats=caveats, mode="analysis", planner=cast(Literal["llm", "deterministic"], planner))
+
+
+@app.post("/api/runs/{run_id}/chat/stream")
+def stream_chat_about_run(run_id: str, request: ChatRequest) -> StreamingResponse:
+    """Stream safe, user-meaningful progress states—not private model reasoning."""
+    def event(name: str, payload: dict[str, object]) -> str:
+        return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def generate():
+        yield event("received", {"label": "Đã nhận câu hỏi"})
+        yield event("planning", {"label": "Đang hiểu câu hỏi theo schema dataset"})
+        yield event("validating", {"label": "Đang kiểm tra cột và phạm vi an toàn"})
+        try:
+            response = chat_about_run(run_id, request)
+            if response.mode == "clarification":
+                yield event("clarification", {"label": "Cần xác nhận thêm trước khi chạy phân tích", "response": response.model_dump()})
+            else:
+                yield event("aggregating", {"label": "Đã tổng hợp dữ liệu trên server"})
+                yield event("insights", {"label": "Đang tạo insight từ aggregate đã xác thực"})
+                yield event("completed", {"label": "Hoàn tất phân tích", "response": response.model_dump()})
+        except HTTPException as error:
+            yield event("error", {"label": str(error.detail) if error.status_code < 500 else "Không thể hoàn tất phân tích lúc này."})
+        except Exception:
+            yield event("error", {"label": "Không thể hoàn tất phân tích lúc này."})
+    return StreamingResponse(generate(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 if STATIC_DIR.is_dir():

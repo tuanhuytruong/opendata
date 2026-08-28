@@ -5,8 +5,40 @@ No function accepts raw SQL; every returned field is later checked against a run
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
+
+
+_SENSITIVE_FIELD_TOKENS = {
+    "email", "phone", "mobile", "address", "password", "token", "secret",
+    "ssn", "passport", "national_id", "credit_card",
+}
+_STARTER_ANALYSIS_PATTERNS = (
+    "5 goc nhin", "nam goc nhin", "goc nhin du lieu", "goi y phan tich",
+    "danh gia du lieu", "phan tich du lieu", "analysis suggestions",
+    "analysis suggestion", "suggest analyses", "suggest analysis", "data assessment",
+    "assess the data", "evaluate the data", "evaluate data", "data evaluation",
+    "5 perspectives", "five perspectives", "starter analysis", "starter analyses",
+)
+
+
+def _normalized_text(value: str) -> str:
+    """Case- and accent-insensitive matching without changing any returned labels."""
+    decomposed = unicodedata.normalize("NFD", value.casefold())
+    return "".join(character for character in decomposed if unicodedata.category(character) != "Mn").replace("đ", "d")
+
+
+def is_starter_analysis_request(message: str) -> bool:
+    """Identify requests for suggested views, rather than a single aggregate chart."""
+    normalized = _normalized_text(message)
+    return any(pattern in normalized for pattern in _STARTER_ANALYSIS_PATTERNS)
+
+
+def _is_safe_analytic_field(item: object) -> bool:
+    name = getattr(item, "name", "")
+    normalized = re.sub(r"[^a-z0-9]+", "_", _normalized_text(name)).strip("_")
+    return getattr(item, "kind", "") != "id" and not any(token in normalized for token in _SENSITIVE_FIELD_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -51,12 +83,17 @@ def propose_charts(columns: Iterable[object], max_charts: int = 8) -> list[dict[
 
 
 def analyst_proposals(columns: Iterable[object], max_charts: int = 5) -> list[dict[str, object]]:
-    """Return explainable, deterministic analyst proposals from profile metadata only."""
-    safe_columns = [item for item in columns if getattr(item, "kind", "") != "id"]
+    """Return stable, selectable views from safe profile metadata only.
+
+    Ordering follows the profile column order, so equivalent profiles always produce
+    the same cards.  The cards intentionally contain no values or row samples.
+    """
+    max_charts = max(0, min(max_charts, 5))
+    safe_columns = [item for item in columns if _is_safe_analytic_field(item)]
     dimensions = [item for item in safe_columns if getattr(item, "kind", "") == "cat" and getattr(item, "null_ratio", 1) < .95]
     time_fields = [item for item in safe_columns if getattr(item, "kind", "") == "time" and getattr(item, "null_ratio", 1) < .95]
     # Numeric identifiers can be summed syntactically but have no analytical meaning.
-    metrics = [item for item in safe_columns if getattr(item, "kind", "") == "num" and getattr(item, "null_ratio", 1) < .95 and not any(token in getattr(item, "name", "").lower() for token in {"_id", " id", "code", "key"})]
+    metrics = [item for item in safe_columns if getattr(item, "kind", "") == "num" and getattr(item, "null_ratio", 1) < .95 and not any(token in _normalized_text(getattr(item, "name", "")) for token in {"_id", " id", "code", "key"})]
     proposals: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -75,13 +112,13 @@ def analyst_proposals(columns: Iterable[object], max_charts: int = 5) -> list[di
 
     for metric in metrics:
         for field in time_fields:
-            add("trend", field, metric, "line", f"Trend of {getattr(metric, 'name')} over {getattr(field, 'name')}", f"{getattr(field, 'name')} is a time field and {getattr(metric, 'name')} is numeric, so a time trend can reveal changes and spikes.")
+            add("trend", field, metric, "line", f"Xu hướng {getattr(metric, 'name')} theo {getattr(field, 'name')}", f"{getattr(field, 'name')} là trường thời gian và {getattr(metric, 'name')} là chỉ tiêu số; biểu đồ xu hướng giúp nhận diện biến động và điểm đột biến.")
         for field in dimensions:
             name = getattr(field, "name")
-            lower = name.lower()
+            lower = _normalized_text(name)
             kind = "mix" if any(token in lower for token in {"channel", "type", "segment", "group", "b2b", "b2c"}) else "ranking"
-            title = f"{getattr(metric, 'name')} by {name}"
-            rationale = f"{name} is a categorical dimension with {getattr(field, 'distinct_count')} observed values; this ranks its contribution to {getattr(metric, 'name')}."
+            title = f"{getattr(metric, 'name')} theo {name}"
+            rationale = f"{name} là dimension phân loại với {getattr(field, 'distinct_count')} giá trị quan sát; góc nhìn này xếp hạng đóng góp vào {getattr(metric, 'name')}."
             add(kind, field, metric, "bar", title, rationale)
     return proposals
 

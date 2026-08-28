@@ -50,3 +50,29 @@ body {
 .animate-fade-in {
   animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
+
+.workspace-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 420px);
+  gap: 16px;
+  align-items: start;
+}
+
+.chat-panel {
+  height: calc(100vh - 104px);
+  min-height: 640px;
+  position: sticky;
+  top: 80px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  background: #f8fafc;
+  box-shadow: 0 1px 3px rgb(15 23 42 / 0.08);
+}
+
+@media (max-width: 1023px) {
+  .workspace-grid { grid-template-columns: 1fr; }
+  .chat-panel { height: min(72vh, 700px); min-height: 520px; position: static; }
+}
