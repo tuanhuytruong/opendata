@@ -815,7 +815,7 @@ def chart_insight(rows: list[dict[str, str | float | int]], chronological: bool)
 
 
 @app.post("/api/runs/{run_id}/chat", response_model=ChatResponse)
-def chat_about_run(run_id: str, request: ChatRequest) -> ChatResponse:
+def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True) -> ChatResponse:
     """Constrained data conversation: natural language maps only to a validated aggregate."""
     headers, rows = load_run(run_id)
     profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
@@ -824,7 +824,7 @@ def chat_about_run(run_id: str, request: ChatRequest) -> ChatResponse:
     clarification_options = _semantic_clarification(profile_data.columns, request.message)
     if clarification_options:
         return ChatResponse(answer="Em thấy có hơn một cột phù hợp nhưng chưa đủ chắc về business meaning hoặc phạm vi. Anh xác nhận giúp em cột muốn dùng nhé.", insight="Chưa chạy aggregate để tránh tự suy diễn chỉ tiêu/phạm vi.", scope="Chờ xác nhận semantic", caveats=["Lựa chọn của anh sẽ chỉ áp dụng cho dataset/run hiện tại và được gắn provenance User."], clarification_options=clarification_options, mode="clarification")
-    llm_request, clarification = _llm_chart_request(profile_data.columns, request)
+    llm_request, clarification = _llm_chart_request(profile_data.columns, request) if allow_llm else (None, None)
     if clarification:
         return ChatResponse(answer=clarification, insight="AI cần xác nhận phạm vi trước khi chạy aggregate.", scope="Chưa chạy phân tích", caveats=[], mode="clarification", planner="llm")
     planner = "llm" if llm_request else "deterministic"
@@ -858,7 +858,10 @@ def stream_chat_about_run(run_id: str, request: ChatRequest) -> StreamingRespons
         yield event("planning", {"label": "Đang hiểu câu hỏi theo schema dataset"})
         yield event("validating", {"label": "Đang kiểm tra cột và phạm vi an toàn"})
         try:
-            response = chat_about_run(run_id, request)
+            # The synchronous LLM client cannot yield while waiting. Stream stays responsive
+            # by using the deterministic, schema-validated planner for this transport.
+            yield event("fallback_planning", {"label": "Đang dùng bộ phân tích an toàn để phản hồi nhanh"})
+            response = chat_about_run(run_id, request, allow_llm=False)
             if response.mode == "clarification":
                 yield event("clarification", {"label": "Cần xác nhận thêm trước khi chạy phân tích", "response": response.model_dump()})
             else:
