@@ -69,7 +69,7 @@ def test_postgres_adapter_enforces_read_only_timeout_and_bound(monkeypatch) -> N
     assert rows == [{"CHANNEL": "Online", "NET_SALES": "100"}]
     calls = connection.cursor_instance.calls
     assert calls[0] == ("BEGIN READ ONLY", None)
-    assert calls[1] == ("SET LOCAL statement_timeout = %s", (15000,))
+    assert calls[1] == ("SET LOCAL statement_timeout = 15000", None)
     assert calls[2][0] == 'SELECT * FROM "REPORTING"."SALES" LIMIT %s'
     assert calls[2][1] == (100,)
     assert connection.rolled_back and connection.closed

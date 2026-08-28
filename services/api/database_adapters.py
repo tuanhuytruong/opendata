@@ -39,7 +39,9 @@ def postgres_rows(source: RegisteredSource, connect: Callable[..., Any] | None =
         connection = connect(source_connection_secret(source), connect_timeout=10)
         with connection.cursor() as cursor:
             cursor.execute("BEGIN READ ONLY")
-            cursor.execute("SET LOCAL statement_timeout = %s", (source.statement_timeout_ms,))
+            # PostgreSQL does not accept a bind parameter for SET; registry validation
+            # already bounds this integer, so interpolate only that controlled value.
+            cursor.execute(f"SET LOCAL statement_timeout = {source.statement_timeout_ms}")
             cursor.execute(f"SELECT * FROM {quoted(source)} LIMIT %s", (source.max_rows,))
             headers = [str(column.name) for column in cursor.description]
             rows = [{header: "" if value is None else str(value) for header, value in zip(headers, record, strict=True)} for record in cursor.fetchall()]
