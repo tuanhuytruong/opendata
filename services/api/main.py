@@ -168,6 +168,7 @@ class ChatResponse(BaseModel):
     table: list[dict[str, str | float | int]] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
     mode: Literal["analysis", "clarification"]
+    planner: Literal["llm", "deterministic"] = "deterministic"
 
 
 class ChartResult(BaseModel):
@@ -523,6 +524,41 @@ def build_report(run_id: str, request: ReportRequest) -> HTMLResponse:
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-report.html"'})
 
 
+def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tuple[ChartRequest | None, str | None]:
+    """Ask the configured LLM for JSON intent only; never disclose rows or execute its SQL."""
+    base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
+    api_key = os.getenv("LLM_API_KEY", "")
+    model = os.getenv("LLM_MODEL", "")
+    safe_columns = [{"name": item.name, "kind": item.kind, "description": item.description, "distinct_count": item.distinct_count} for item in columns if item.kind != "id"]
+    if not base_url or not api_key or not model or not safe_columns:
+        return None, None
+    prompt = {"role": "system", "content": "You are a read-only data intent parser. Return ONLY JSON: {dimension,metric,aggregation,chart_type,limit,clarification}. Select dimension and metric only from schema. Never return SQL. chart_type must be bar or line; aggregation must be sum, avg, or count. If ambiguous, set clarification."}
+    user = {"role": "user", "content": json.dumps({"question": request.message, "prior_context": request.context[-1000:], "schema": safe_columns}, ensure_ascii=False)}
+    payload = json.dumps({"model": model, "temperature": 0, "response_format": {"type": "json_object"}, "messages": [prompt, user]}).encode()
+    try:
+        http_request = urllib.request.Request(f"{base_url}/chat/completions", data=payload, headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, method="POST")
+        with urllib.request.urlopen(http_request, timeout=15) as response:
+            content = json.loads(response.read().decode())["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+        if parsed.get("clarification"):
+            return None, str(parsed["clarification"])[:400]
+        aggregation = str(parsed.get("aggregation", "sum"))
+        chart_type = str(parsed.get("chart_type", "bar"))
+        if aggregation not in {"sum", "avg", "count"} or chart_type not in {"bar", "line"}:
+            return None, None
+        chart = ChartRequest(dimension=str(parsed["dimension"]), metric=str(parsed["metric"]), aggregation=cast(Literal["sum", "avg", "count"], aggregation), chart_type=cast(Literal["bar", "line"], chart_type), limit=min(30, max(1, int(parsed.get("limit", 12)))), filters=[])
+        known = {item.name: item for item in columns}
+        if chart.dimension not in known or chart.metric not in known or known[chart.dimension].kind not in {"time", "cat"} or known[chart.metric].kind != "num":
+            return None, None
+        if any(token in chart.metric.lower() for token in {"_id", "code", "key"}):
+            return None, None
+        if chart.chart_type == "line" and known[chart.dimension].kind != "time":
+            chart.chart_type = "bar"
+        return chart, None
+    except (KeyError, ValueError, TypeError, urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+        return None, None
+
+
 def _chat_metric(columns: list[ColumnProfile], message: str) -> ColumnProfile | None:
     normalized = message.lower()
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
@@ -562,12 +598,21 @@ def chat_about_run(run_id: str, request: ChatRequest) -> ChatResponse:
     """Constrained data conversation: natural language maps only to a validated aggregate."""
     headers, rows = load_run(run_id)
     profile_data = profile("existing-run", headers, rows, persist_run=False, run_id=run_id)
-    metric = _chat_metric(profile_data.columns, request.message)
-    dimension = _chat_dimension(profile_data.columns, request.message)
-    if metric is None or dimension is None:
-        return ChatResponse(answer="Em cần một metric số và một trường thời gian hoặc dimension để phân tích. Anh có thể hỏi theo dạng: ‘Doanh thu theo tháng’ hoặc ‘Doanh thu theo kênh’.", insight="Chưa tìm được cặp metric/dimension an toàn trong dataset này.", scope="Chưa chạy phân tích", caveats=[], mode="clarification")
-    chart_type = "line" if dimension.kind == "time" else "bar"
-    chart = build_chart(run_id, ChartRequest(dimension=dimension.name, metric=metric.name, aggregation="sum", chart_type=chart_type, limit=12))
+    llm_request, clarification = _llm_chart_request(profile_data.columns, request)
+    if clarification:
+        return ChatResponse(answer=clarification, insight="AI cần xác nhận phạm vi trước khi chạy aggregate.", scope="Chưa chạy phân tích", caveats=[], mode="clarification", planner="llm")
+    planner = "llm" if llm_request else "deterministic"
+    if llm_request:
+        chart_request = llm_request
+    else:
+        metric = _chat_metric(profile_data.columns, request.message)
+        dimension = _chat_dimension(profile_data.columns, request.message)
+        if metric is None or dimension is None:
+            return ChatResponse(answer="Em cần một metric số và một trường thời gian hoặc dimension để phân tích. Anh có thể hỏi theo dạng: ‘Doanh thu theo tháng’ hoặc ‘Doanh thu theo kênh’.", insight="Chưa tìm được cặp metric/dimension an toàn trong dataset này.", scope="Chưa chạy phân tích", caveats=[], mode="clarification")
+        chart_request = ChartRequest(dimension=dimension.name, metric=metric.name, aggregation="sum", chart_type="line" if dimension.kind == "time" else "bar", limit=12)
+    chart = build_chart(run_id, chart_request)
+    metric = next(item for item in profile_data.columns if item.name == chart_request.metric)
+    dimension = next(item for item in profile_data.columns if item.name == chart_request.dimension)
     top = chart.rows[0] if chart.rows else None
     scope = f"SUM {metric.name} by {dimension.name}; top {len(chart.rows)} values"
     insight = "Không có dữ liệu phù hợp với câu hỏi này."
@@ -576,7 +621,7 @@ def chat_about_run(run_id: str, request: ChatRequest) -> ChatResponse:
     caveats = list(chart.warnings)
     if any(word in request.message.lower() for word in {"cùng kỳ", "year over year", "yoy", "năm ngoái"}):
         caveats.append("So sánh cùng kỳ cần một trường thời gian được chuẩn hoá theo tháng/năm; bản chat hiện trả xu hướng tổng hợp trước để anh review phạm vi.")
-    return ChatResponse(answer=f"Em đã phân tích {metric.name} theo {dimension.name}.", insight=insight, scope=scope, chart=chart, table=chart.rows, caveats=caveats, mode="analysis")
+    return ChatResponse(answer=f"Em đã phân tích {metric.name} theo {dimension.name}.", insight=insight, scope=scope, chart=chart, table=chart.rows, caveats=caveats, mode="analysis", planner=cast(Literal["llm", "deterministic"], planner))
 
 
 if STATIC_DIR.is_dir():
