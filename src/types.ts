@@ -65,7 +65,7 @@ export interface ChartResult {
 }
 
 export interface ClarificationOption { column: string; label: string; reason: string; role: 'metric' | 'dimension'; }
-export interface ChatResult { answer: string; insight: string; scope: string; chart?: ChartResult; table: ChartRow[]; caveats: string[]; clarification_options?: ClarificationOption[]; proposals?: StarterView[]; mode: 'analysis' | 'clarification'; planner: 'llm' | 'deterministic'; }
+export interface ChatResult { answer: string; insight: string; scope: string; title?: string; chart?: ChartResult; table: ChartRow[]; caveats: string[]; clarification_options?: ClarificationOption[]; proposals?: StarterView[]; mode: 'analysis' | 'clarification'; planner: 'llm' | 'deterministic'; }
 
 export interface EDAColumn {
   name: string;

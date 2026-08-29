@@ -197,6 +197,7 @@ class ChatResponse(BaseModel):
     answer: str
     insight: str
     scope: str
+    title: str = ""
     chart: "ChartResult | None" = None
     table: list[dict[str, str | float | int]] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
@@ -606,29 +607,30 @@ def suggested_plan(run_id: str, limit: int = 8) -> dict[str, object]:
     return {"charts": propose_charts(profile_data.columns, max(1, min(limit, 12))), "note": "Candidates are deterministic suggestions; review and approve before report generation."}
 
 
-def starter_views_payload(run_id: str) -> dict[str, object]:
+def starter_views_payload(run_id: str, language: Literal["en", "vi"] = "en") -> dict[str, object]:
     """Return safe, selectable views from profile metadata only; never execute a chart."""
     headers, rows = load_run(run_id)
     profile_data = profile_for_run(run_id, headers, rows)
-    proposals = analyst_proposals(profile_data.columns)
+    proposals = analyst_proposals(profile_data.columns, language=language)
     for proposal in proposals:
         request = cast(dict[str, object], proposal["request"])
-        proposal["question"] = f"Phân tích {request['metric']} theo {request['dimension']}"
+        proposal["question"] = (f"{request['metric']} thay đổi theo {request['dimension']} như thế nào?" if language == "vi" else f"How does {request['metric']} vary by {request['dimension']}?")
+
     return {
-        "summary": f"This run has {profile_data.row_count:,} rows, {profile_data.usable_column_count} usable columns, {sum(item.kind == 'num' for item in profile_data.columns)} metrics and {sum(item.kind in {'cat', 'time'} for item in profile_data.columns)} dimensions/time fields.",
+        "summary": f"Run này có {profile_data.row_count:,} dòng, {profile_data.usable_column_count} cột có thể dùng, {sum(item.kind == 'num' for item in profile_data.columns)} chỉ tiêu số và {sum(item.kind in {'cat', 'time'} for item in profile_data.columns)} trường phân tích." if language == "vi" else f"This run has {profile_data.row_count:,} rows, {profile_data.usable_column_count} usable columns, {sum(item.kind == 'num' for item in profile_data.columns)} metrics and {sum(item.kind in {'cat', 'time'} for item in profile_data.columns)} dimensions/time fields.",
         "proposals": proposals,
-        "guardrail": "Suggestions use inferred column roles and profile counts only. Charts run only after your approval and always use validated server-side aggregates.",
+        "guardrail": "Gợi ý chỉ dùng vai trò cột suy luận và số liệu profile. Chart chỉ chạy sau khi bạn phê duyệt và luôn dùng aggregate đã xác thực trên server." if language == "vi" else "Suggestions use inferred column roles and profile counts only. Charts run only after your approval and always use validated server-side aggregates.",
     }
 
 
 @app.get("/api/runs/{run_id}/analyst-proposals")
-def analyst_plan(run_id: str) -> dict[str, object]:
-    return starter_views_payload(run_id)
+def analyst_plan(run_id: str, language: Literal["en", "vi"] = "en") -> dict[str, object]:
+    return starter_views_payload(run_id, language)
 
 
 @app.get("/api/runs/{run_id}/starter-views")
-def starter_views(run_id: str) -> dict[str, object]:
-    return starter_views_payload(run_id)
+def starter_views(run_id: str, language: Literal["en", "vi"] = "en") -> dict[str, object]:
+    return starter_views_payload(run_id, language)
 
 
 @app.get("/api/runs/{run_id}/eda")
@@ -657,7 +659,7 @@ def values(run_id: str, column: str) -> dict[str, str | list[str]]:
 
 
 @app.post("/api/runs/{run_id}/chart", response_model=ChartResult)
-def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
+def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"] = "vi") -> ChartResult:
     headers, rows = load_run(run_id)
     dimension = quote_identifier(request.dimension, headers)
     metric = quote_identifier(request.metric, headers)
@@ -699,10 +701,10 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
     finally:
         connection.close()
     warnings: list[str] = []
-    if not records: warnings.append("Không có giá trị phù hợp với phạm vi hiện tại.")
-    if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Cần lọc theo đơn vị tương thích trước khi diễn giải tổng quantity.")
+    if not records: warnings.append("Không có giá trị phù hợp với phạm vi hiện tại." if language == "vi" else "No values match the current scope.")
+    if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Cần lọc theo đơn vị tương thích trước khi diễn giải tổng quantity." if language == "vi" else "Filter to compatible units before interpreting a total quantity.")
     if request.chart_type in {"line", "area"} and not chronological:
-        warnings.append("Trục đang không phải trường thời gian đã xác nhận; kết quả được xếp hạng theo giá trị thay vì diễn giải như xu hướng.")
+        warnings.append("Trục đang không phải trường thời gian đã xác nhận; kết quả được xếp hạng theo giá trị thay vì diễn giải như xu hướng." if language == "vi" else "The axis is not a confirmed time field; results are ranked by value rather than interpreted as a trend.")
     if secondary:
         chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "secondary_label": str(second), "value": 0 if value is None else float(value), "formatted_value": compact_number(0 if value is None else float(value))} for label, second, value in records]
     else:
@@ -713,9 +715,9 @@ def build_chart(run_id: str, request: ChartRequest) -> ChartResult:
         for row in chart_rows:
             running += float(row["value"])
             row["cumulative_pct"] = 0 if total == 0 else round(running / total * 100, 2)
-    insight_headline, evidence = chart_insight(chart_rows, chronological)
-    label = "Xu hướng" if chronological else f"Top {len(chart_rows)}"
-    title = f"{label} {request.metric} theo {request.dimension}" + (f" × {request.secondary_dimension}" if secondary else "")
+    insight_headline, evidence = chart_insight(chart_rows, chronological, language)
+    label = ("Xu hướng" if chronological else f"Top {len(chart_rows)}") if language == "vi" else ("Trend" if chronological else f"Top {len(chart_rows)}")
+    title = (f"{label} {request.metric} theo {request.dimension}" if language == "vi" else f"{label} {request.metric} by {request.dimension}") + (f" × {request.secondary_dimension}" if secondary else "")
     return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
 
 
@@ -816,7 +818,7 @@ def _named_columns(columns: list[ColumnProfile], message: str) -> set[str]:
     }
 
 
-def _semantic_clarification(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> list[ClarificationOption]:
+def _semantic_clarification(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]], language: Literal["en", "vi"] = "en") -> list[ClarificationOption]:
     """Ask only for roles not explicitly named in the schema or confirmed by this run's user."""
     normalized = message.lower()
     requested_measure = any(word in normalized for word in {"doanh thu", "revenue", "sales", "lợi nhuận", "profit", "margin", "chi phí", "cost", "số lượng", "quantity"})
@@ -828,9 +830,9 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
     dimensions = [item for item in columns if item.kind in {"time", "cat"}]
     if not requested_measure and not metric_named and len(metrics) > 1:
-        return [ClarificationOption(column=item.name, label=item.name, reason="Numeric measure candidate — please confirm its business meaning.", role="metric") for item in metrics[:4]]
+        return [ClarificationOption(column=item.name, label=item.name, reason="Ứng viên chỉ tiêu số — hãy xác nhận ý nghĩa nghiệp vụ." if language == "vi" else "Numeric measure candidate — please confirm its business meaning.", role="metric") for item in metrics[:4]]
     if requested_measure and not requested_dimension and not dimension_named and len(dimensions) > 1:
-        return [ClarificationOption(column=item.name, label=item.name, reason="Possible time or breakdown dimension — please confirm.", role="dimension") for item in dimensions[:4]]
+        return [ClarificationOption(column=item.name, label=item.name, reason="Trường thời gian hoặc phân tách có thể phù hợp — hãy xác nhận." if language == "vi" else "Possible time or breakdown dimension — please confirm.", role="dimension") for item in dimensions[:4]]
     return []
 
 
@@ -870,9 +872,15 @@ def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list
     return next((item for item in fields if item.kind == "time"), fields[0] if fields else None)
 
 
+def _output_intent(message: str) -> Literal["table", "chart"]:
+    normalized = message.casefold()
+    table_words = ("table", "tabular", "rows", "bảng", "dang bang", "dạng bảng")
+    return "table" if any(word in normalized for word in table_words) else "chart"
+
+
 def _starter_analysis_response(columns: list[ColumnProfile], message: str, language: Literal["en", "vi"] = "en") -> ChatResponse:
     """Return selectable, profile-only views without running a chart or calling an LLM."""
-    proposals = analyst_proposals(columns, max_charts=5)
+    proposals = analyst_proposals(columns, max_charts=5, language=language)
     english = language == "en"
     if english:
         answer = "Here are safe starter analysis views based on this dataset profile. Select a card to run its validated aggregate."
@@ -887,31 +895,25 @@ def _starter_analysis_response(columns: list[ColumnProfile], message: str, langu
     return ChatResponse(answer=answer, insight=insight, scope=scope, proposals=proposals, caveats=[caveat], mode="analysis", planner="deterministic")
 
 
-def chart_insight(rows: list[dict[str, str | float | int]], chronological: bool) -> tuple[str, list[str]]:
+def chart_insight(rows: list[dict[str, str | float | int]], chronological: bool, language: Literal["en", "vi"] = "en") -> tuple[str, list[str]]:
     if not rows:
-        return "Không có dữ liệu trong phạm vi đã chọn.", ["Không có aggregate nào phù hợp với filter và cột đã chọn."]
+        return ("Không có dữ liệu trong phạm vi đã chọn.", ["Không có aggregate nào phù hợp với filter và cột đã chọn."]) if language == "vi" else ("No data is available in the selected scope.", ["No aggregate matched the selected filters and columns."])
     values = [float(row["value"]) for row in rows]
     if chronological and len(rows) >= 2:
-        first, last = values[0], values[-1]
-        delta = last - first
-        change = 0 if first == 0 else delta / abs(first) * 100
-        peak_index, trough_index = values.index(max(values)), values.index(min(values))
-        direction = "tăng" if delta >= 0 else "giảm"
-        return (
-            f"Giá trị cuối kỳ {direction} {percent(abs(change))} so với đầu kỳ.",
-            [
-                f"Từ {rows[0]['display_label']}: {compact_number(first)} đến {rows[-1]['display_label']}: {compact_number(last)} ({direction} {compact_number(abs(delta))}).",
-                f"Đỉnh: {rows[peak_index]['display_label']} với {compact_number(values[peak_index])}; thấp nhất: {rows[trough_index]['display_label']} với {compact_number(values[trough_index])}.",
-            ],
-        )
-    total = sum(values)
-    top = rows[0]
-    share = 0 if total == 0 else float(top["value"]) / total * 100
-    second = values[1] if len(values) > 1 else None
-    bullets = [f"Dẫn đầu: {top['display_label']} với {compact_number(float(top['value']))}, chiếm {percent(share)} trong phần kết quả hiển thị."]
-    if second is not None:
-        bullets.append(f"Chênh lệch với hạng hai: {compact_number(float(top['value']) - second)}.")
-    return f"{top['display_label']} đang dẫn đầu với {compact_number(float(top['value']))}.", bullets
+        first, last = values[0], values[-1]; delta = last - first; change = 0 if first == 0 else delta / abs(first) * 100; peak_index, trough_index = values.index(max(values)), values.index(min(values))
+        if language == "vi":
+            direction = "tăng" if delta >= 0 else "giảm"
+            return (f"Giá trị cuối kỳ {direction} {percent(abs(change))} so với đầu kỳ.", [f"Từ {rows[0]['display_label']}: {compact_number(first)} đến {rows[-1]['display_label']}: {compact_number(last)} ({direction} {compact_number(abs(delta))}).", f"Đỉnh: {rows[peak_index]['display_label']} với {compact_number(values[peak_index])}; thấp nhất: {rows[trough_index]['display_label']} với {compact_number(values[trough_index])}."])
+        direction = "increased" if delta >= 0 else "decreased"
+        return (f"The final period {direction} by {percent(abs(change))} from the first period.", [f"From {rows[0]['display_label']}: {compact_number(first)} to {rows[-1]['display_label']}: {compact_number(last)} ({direction} by {compact_number(abs(delta))}).", f"Peak: {rows[peak_index]['display_label']} at {compact_number(values[peak_index])}; low: {rows[trough_index]['display_label']} at {compact_number(values[trough_index])}."])
+    total = sum(values); top = rows[0]; share = 0 if total == 0 else float(top["value"]) / total * 100; second = values[1] if len(values) > 1 else None
+    if language == "vi":
+        bullets = [f"Dẫn đầu: {top['display_label']} với {compact_number(float(top['value']))}, chiếm {percent(share)} trong phần kết quả hiển thị."]
+        if second is not None: bullets.append(f"Chênh lệch với hạng hai: {compact_number(float(top['value']) - second)}.")
+        return f"{top['display_label']} đang dẫn đầu với {compact_number(float(top['value']))}.", bullets
+    bullets = [f"Leader: {top['display_label']} at {compact_number(float(top['value']))}, representing {percent(share)} of the displayed total."]
+    if second is not None: bullets.append(f"Gap to the runner-up: {compact_number(float(top['value']) - second)}.")
+    return f"{top['display_label']} leads at {compact_number(float(top['value']))}.", bullets
 
 
 @app.post("/api/runs/{run_id}/semantic-selection", response_model=ChatResponse)
@@ -945,13 +947,15 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         return _starter_analysis_response(profile_data.columns, request.message, request.language)
     state = _selection_artifact(run_id)
     selections = cast(list[dict[str, object]], state["selections"])
-    clarification_options = _semantic_clarification(profile_data.columns, request.message, selections)
+    clarification_options = _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})
-        return ChatResponse(answer="Em thấy có hơn một cột phù hợp nhưng chưa đủ chắc về business meaning hoặc phạm vi. Anh xác nhận giúp em cột muốn dùng nhé.", insight="Chưa chạy aggregate để tránh tự suy diễn chỉ tiêu/phạm vi.", scope="Chờ xác nhận semantic", caveats=["Lựa chọn của anh sẽ chỉ áp dụng cho dataset/run hiện tại và được gắn provenance User."], clarification_options=clarification_options, mode="clarification")
+        if request.language == "vi":
+            return ChatResponse(answer="Có hơn một cột phù hợp nhưng chưa đủ chắc về ý nghĩa nghiệp vụ hoặc phạm vi. Hãy xác nhận cột muốn dùng.", insight="Chưa chạy aggregate để tránh tự suy diễn chỉ tiêu hoặc phạm vi.", scope="Chờ xác nhận semantic", caveats=["Lựa chọn chỉ áp dụng cho dataset/run hiện tại và được gắn provenance User."], clarification_options=clarification_options, mode="clarification")
+        return ChatResponse(answer="More than one column could fit, but its business meaning or scope is not yet certain. Please confirm the column to use.", insight="No aggregate has run, to avoid inferring a metric or scope.", scope="Awaiting semantic confirmation", caveats=["Your selection applies only to this dataset/run and is recorded with User provenance."], clarification_options=clarification_options, mode="clarification")
     llm_request, clarification = _llm_chart_request(profile_data.columns, request) if allow_llm else (None, None)
     if clarification:
-        return ChatResponse(answer=clarification, insight="AI cần xác nhận phạm vi trước khi chạy aggregate.", scope="Chưa chạy phân tích", caveats=[], mode="clarification", planner="llm")
+        return ChatResponse(answer=clarification, insight="AI cần xác nhận phạm vi trước khi chạy aggregate." if request.language == "vi" else "AI needs scope confirmation before running an aggregate.", scope="Chưa chạy phân tích" if request.language == "vi" else "No analysis has run", caveats=[], mode="clarification", planner="llm")
     planner = "llm" if llm_request else "deterministic"
     if llm_request:
         chart_request = llm_request
@@ -959,17 +963,19 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         metric = _chat_metric(profile_data.columns, request.message, selections)
         dimension = _chat_dimension(profile_data.columns, request.message, selections)
         if metric is None or dimension is None:
-            return ChatResponse(answer="Em cần một metric số và một trường thời gian hoặc dimension để phân tích. Anh có thể hỏi theo dạng: ‘Doanh thu theo tháng’ hoặc ‘Doanh thu theo kênh’.", insight="Chưa tìm được cặp metric/dimension an toàn trong dataset này.", scope="Chưa chạy phân tích", caveats=[], mode="clarification")
+            return ChatResponse(answer="Cần một metric số và một trường thời gian hoặc dimension để phân tích. Có thể hỏi ‘Doanh thu theo tháng’ hoặc ‘Doanh thu theo kênh’." if request.language == "vi" else "I need a numeric metric and a time or categorical dimension to analyze. Try a question such as ‘Revenue by month’ or ‘Revenue by channel’.", insight="Chưa tìm được cặp metric/dimension an toàn trong dataset này." if request.language == "vi" else "No safe metric/dimension pair was found in this dataset.", scope="Chưa chạy phân tích" if request.language == "vi" else "No analysis has run", caveats=[], mode="clarification")
         chart_request = ChartRequest(dimension=dimension.name, metric=metric.name, aggregation="sum", chart_type="line" if dimension.kind == "time" else "bar", limit=12)
-    chart = build_chart(run_id, chart_request)
+    output_intent = _output_intent(request.message)
+    chart = build_chart(run_id, chart_request, request.language)
     metric = next(item for item in profile_data.columns if item.name == chart_request.metric)
     dimension = next(item for item in profile_data.columns if item.name == chart_request.dimension)
-    scope = f"{chart.aggregation.upper()} {metric.name} theo {dimension.name}; {chart.result_count} kết quả, xếp {chart.sort_mode}"
+    scope = (f"{chart.aggregation.upper()} {metric.name} theo {dimension.name}; {chart.result_count} kết quả, xếp {chart.sort_mode}" if request.language == "vi" else f"{chart.aggregation.upper()} {metric.name} by {dimension.name}; {chart.result_count} results, sorted {chart.sort_mode}")
     insight = chart.insight_headline
     caveats = list(chart.warnings)
     if any(word in request.message.lower() for word in {"cùng kỳ", "year over year", "yoy", "năm ngoái"}):
-        caveats.append("So sánh cùng kỳ cần một trường thời gian được chuẩn hoá theo tháng/năm; bản chat hiện trả xu hướng tổng hợp trước để anh review phạm vi.")
-    return ChatResponse(answer=f"Em đã phân tích {metric.name} theo {dimension.name}.", insight=insight, scope=scope, chart=chart, table=chart.rows, caveats=caveats, mode="analysis", planner=cast(Literal["llm", "deterministic"], planner))
+        caveats.append("So sánh cùng kỳ cần một trường thời gian được chuẩn hoá theo tháng/năm; bản chat hiện trả xu hướng tổng hợp trước để bạn review phạm vi." if request.language == "vi" else "A year-over-year comparison needs a time field normalized by month/year; this response returns an aggregate trend for you to review the scope first.")
+    answer = f"Đã chuẩn bị bảng {metric.name} theo {dimension.name}." if output_intent == "table" and request.language == "vi" else f"I prepared a table of {metric.name} by {dimension.name}." if output_intent == "table" else f"Đã phân tích {metric.name} theo {dimension.name}." if request.language == "vi" else f"I analyzed {metric.name} by {dimension.name}."
+    return ChatResponse(answer=answer, insight=insight, scope=scope, title=chart.title, chart=None if output_intent == "table" else chart, table=chart.rows, caveats=caveats, mode="analysis", planner=cast(Literal["llm", "deterministic"], planner))
 
 
 @app.post("/api/runs/{run_id}/chat/stream")

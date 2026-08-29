@@ -162,7 +162,7 @@ def test_parses_explicit_filters_and_proposes_charts() -> None:
     assert chat.status_code == 200, chat.text
     assert chat.json()["chart"]["metric"] == "net_sales"
     assert chat.json()["chart"]["chart_type"] == "line"
-    assert "cuối kỳ" in chat.json()["insight"].lower()
+    assert "final period" in chat.json()["insight"].lower()
     assert chat.json()["chart"]["sort_mode"] == "chronological"
     parsed = client.post(f"/api/runs/{run_id}/parse-filter", json={"text": "net_sales >= 50"})
     assert parsed.status_code == 200, parsed.text
@@ -295,3 +295,56 @@ def test_builds_self_contained_report() -> None:
 def test_rejects_unsupported_file() -> None:
     response = client.post("/api/runs/upload", files={"file": ("sales.xls", b"bad", "application/octet-stream")})
     assert response.status_code == 415
+
+
+
+def test_starter_views_are_dynamic_and_localized() -> None:
+    data = upload_csv("event_date,revenue,channel\n2026-01-01,100,Online\n2026-01-02,40,Retail\n")
+    run_id = data["run_id"]
+    english = client.get(f"/api/runs/{run_id}/starter-views?language=en")
+    vietnamese = client.get(f"/api/runs/{run_id}/starter-views?language=vi")
+    assert english.status_code == 200, english.text
+    assert vietnamese.status_code == 200, vietnamese.text
+    en_card = english.json()["proposals"][0]
+    vi_card = vietnamese.json()["proposals"][0]
+    assert en_card["question"] == f"How does {en_card['request']['metric']} vary by {en_card['request']['dimension']}?"
+    assert vi_card["question"] == f"{vi_card['request']['metric']} thay đổi theo {vi_card['request']['dimension']} như thế nào?"
+
+
+    assert en_card["request"]["metric"] in en_card["question"]
+    assert en_card["request"]["dimension"] in en_card["question"]
+    assert "trend by" in en_card["title"].lower()
+    assert "xu hướng" in vi_card["title"].lower()
+
+
+def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> None:
+    data = upload_csv("sale_date,net_sales,channel\n2026-01-01,100,Online\n2026-01-02,40,Retail\n")
+    run_id = data["run_id"]
+    table = client.post(f"/api/runs/{run_id}/chat", json={"message": "Show net sales by channel as a table with rows", "language": "en"})
+    assert table.status_code == 200, table.text
+    body = table.json()
+    assert body["chart"] is None
+    assert body["table"]
+    assert body["title"] == "Top 2 net_sales by channel"
+    assert body["answer"] == "I prepared a table of net_sales by channel."
+    assert body["insight"] == "Online leads at 100.0."
+    assert body["scope"] == "SUM net_sales by channel; 2 results, sorted ranking"
+    assert all("Không" not in value and "theo" not in value for value in [body["answer"], body["insight"], body["scope"], *body["caveats"]])
+
+    chart = client.post(f"/api/runs/{run_id}/chat", json={"message": "Show a chart of net sales by channel", "language": "en"})
+    assert chart.status_code == 200, chart.text
+    chart_body = chart.json()
+    assert chart_body["chart"] is not None
+    assert chart_body["chart"]["title"] == "Top 2 net_sales by channel"
+    assert chart_body["chart"]["insight_headline"] == "Online leads at 100.0."
+
+
+def test_vietnamese_table_intent_omits_chart() -> None:
+    data = upload_csv("channel,net_sales\nOnline,100\nRetail,40\n")
+    response = client.post(f"/api/runs/{data['run_id']}/chat", json={"message": "Cho bảng doanh thu theo channel dạng bảng", "language": "vi"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["chart"] is None
+    assert body["table"]
+    assert body["answer"] == "Đã chuẩn bị bảng net_sales theo channel."
+    assert "dẫn đầu" in body["insight"].lower()
