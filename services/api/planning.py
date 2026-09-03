@@ -68,6 +68,20 @@ def parse_filter(text: str, allowed_columns: Iterable[str]) -> ParsedFilter:
     return ParsedFilter(column, mapping[operator], value.strip("'\""))
 
 
+
+def display_label(name: str) -> str:
+    """Presentation label for a schema field; never use this in API requests."""
+    aliases = {
+        "net_sales": "Net Sales", "gross_sales": "Gross Sales",
+        "gross_profit": "Gross Profit", "sale_date": "Sale Date",
+        "cogs": "Cost of Goods Sold", "uom": "Unit of Measure",
+    }
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+    if normalized in aliases:
+        return aliases[normalized]
+    return " ".join(part.upper() if len(part) <= 4 and part.isalpha() else part.capitalize() for part in re.split(r"[_\s-]+", name) if part)
+
+
 def propose_charts(columns: Iterable[object], max_charts: int = 8) -> list[dict[str, str]]:
     """Build transparent, supported candidates from inferred profile roles."""
     dimensions = [getattr(item, "name") for item in columns if getattr(item, "kind") in {"cat", "time"}]
@@ -115,7 +129,7 @@ def analyst_proposals(columns: Iterable[object], max_charts: int = 5, language: 
     # repeating one metric for another field. Profile ordering remains stable.
     for field in time_fields:
         for metric in metrics:
-            title = f"Xu hướng {getattr(metric, 'name')} theo {getattr(field, 'name')}" if vietnamese else f"{getattr(metric, 'name')} trend by {getattr(field, 'name')}"
+            title = f"Xu hướng {display_label(getattr(metric, 'name'))} theo {display_label(getattr(field, 'name'))}" if vietnamese else f"{display_label(getattr(metric, 'name'))} trend by {display_label(getattr(field, 'name'))}"
             rationale = (f"{getattr(field, 'name')} là trường thời gian và {getattr(metric, 'name')} là chỉ tiêu số; biểu đồ xu hướng giúp nhận diện biến động và điểm đột biến." if vietnamese else f"{getattr(field, 'name')} is a time field and {getattr(metric, 'name')} is numeric; this trend view surfaces movement and potential outliers.")
             add("trend", field, metric, "line", title, rationale)
     for field in dimensions:
@@ -123,7 +137,7 @@ def analyst_proposals(columns: Iterable[object], max_charts: int = 5, language: 
         lower = _normalized_text(name)
         kind = "mix" if any(token in lower for token in {"channel", "type", "segment", "group", "b2b", "b2c"}) else "ranking"
         for metric in metrics:
-            title = f"{getattr(metric, 'name')} theo {name}" if vietnamese else f"{getattr(metric, 'name')} by {name}"
+            title = f"{display_label(getattr(metric, 'name'))} theo {display_label(name)}" if vietnamese else f"{display_label(getattr(metric, 'name'))} by {display_label(name)}"
             rationale = (f"{name} là dimension phân loại với {getattr(field, 'distinct_count')} giá trị quan sát; góc nhìn này xếp hạng đóng góp vào {getattr(metric, 'name')}." if vietnamese else f"{name} is a categorical dimension with {getattr(field, 'distinct_count')} observed values; this view ranks contribution to {getattr(metric, 'name')}.")
             add(kind, field, metric, "bar", title, rationale)
     return proposals

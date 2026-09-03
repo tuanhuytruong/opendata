@@ -226,7 +226,7 @@ def test_stream_chat_top_three_stores_sales_by_region_is_per_region_ranking() ->
     payload = response.text.split("event: completed\ndata: ", 1)[1].split("\n\n", 1)[0]
     body = json.loads(payload)["response"]
     assert body["planner"] == "deterministic"
-    assert body["title"] == "Top 3 NET_SALES by STORE per REGION"
+    assert body["title"] == "Top 3 Net Sales by Store per Region"
     chart = body["chart"]
     assert chart["metric"] == "NET_SALES"
     assert chart["dimension"] == "STORE"
@@ -363,7 +363,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     body = table.json()
     assert body["chart"] is None
     assert body["table"]
-    assert body["title"] == "Top 2 net_sales by channel"
+    assert body["title"] == "Top 2 Net Sales by Channel"
     assert body["answer"] == "I prepared a table of net_sales by channel."
     assert body["insight"] == "Online leads at 100.0."
     assert body["scope"] == "SUM net_sales by channel; 2 results, sorted ranking"
@@ -373,7 +373,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     assert chart.status_code == 200, chart.text
     chart_body = chart.json()
     assert chart_body["chart"] is not None
-    assert chart_body["chart"]["title"] == "Top 2 net_sales by channel"
+    assert chart_body["chart"]["title"] == "Top 2 Net Sales by Channel"
     assert chart_body["chart"]["insight_headline"] == "Online leads at 100.0."
 
 
@@ -409,7 +409,7 @@ def test_streaming_exact_top_stores_sales_by_region_uses_net_sales_and_top_three
     assert '"metric": "net_sales"' in stream.text
     assert '"dimension": "store"' in stream.text
     assert '"secondary_dimension": "region"' in stream.text
-    assert '"title": "Top 3 net_sales by store per region"' in stream.text
+    assert '"title": "Top 3 Net Sales by Store per Region"' in stream.text
     assert '"label": "North D"' not in stream.text
     assert '"label": "South D"' not in stream.text
     payload = stream.text.split("event: completed\ndata: ", 1)[1].split("\n\n", 1)[0]
@@ -448,3 +448,38 @@ def test_executive_overview_is_deterministic_validated_and_excludes_sensitive_fi
     assert all(chart["rows"] for chart in body["charts"])
     assert all(chart["dimension"] != "email" and chart["metric"] != "email" for chart in body["charts"])
     assert "private@example.test" not in str(body)
+
+
+def test_custom_report_is_run_scoped_idempotent_and_glossary_is_validated() -> None:
+    data = upload_csv("store,net_sales,email\nA,100,private@example.test\nB,40,private@example.test\n")
+    run_id = data["run_id"]
+    assert client.get(f"/api/runs/{run_id}/custom-report").json()["pinned_artifacts"] == []
+    artifact = {"artifact_id": "sales-by-store", "chart": {"dimension": "store", "metric": "net_sales"}}
+    first = client.post(f"/api/runs/{run_id}/custom-report/artifacts", json=artifact)
+    second = client.post(f"/api/runs/{run_id}/custom-report/artifacts", json=artifact)
+    assert first.status_code == second.status_code == 200
+    body = second.json()
+    assert len(body["pinned_artifacts"]) == 1
+    assert body["pinned_artifacts"][0]["chart"]["metric"] == "net_sales"
+    assert body["glossary"] == [
+        {"name": "net_sales", "label": "Net Sales", "description": "Sales revenue after discounts and deductions.", "kind": "num"},
+        {"name": "store", "label": "Store", "description": "Inferred cat field from column name and observed values.", "kind": "cat"},
+    ]
+    assert "email" not in str(body)
+    removed = client.delete(f"/api/runs/{run_id}/custom-report/artifacts/sales-by-store")
+    repeated = client.delete(f"/api/runs/{run_id}/custom-report/artifacts/sales-by-store")
+    assert removed.status_code == repeated.status_code == 200
+    assert repeated.json()["pinned_artifacts"] == []
+
+
+def test_unclear_chat_never_defaults_to_first_metric_or_date_and_top_sites_alias_works() -> None:
+    data = upload_csv("event_date,margin,revenue,site,region\n2026-01-01,20,100,A,North\n2026-01-02,10,80,B,North\n")
+    run_id = data["run_id"]
+    unclear = client.post(f"/api/runs/{run_id}/chat", json={"message": "make a chart", "language": "en"})
+    assert unclear.status_code == 200
+    assert unclear.json()["mode"] == "clarification"
+    sites = client.post(f"/api/runs/{run_id}/chat", json={"message": "top 1 sites revenue by region", "language": "en"})
+    assert sites.status_code == 200
+    chart = sites.json()["chart"]
+    assert chart["metric"] == "revenue" and chart["dimension"] == "site" and chart["secondary_dimension"] == "region"
+    assert chart["title"] == "Top 1 Revenue by SITE per Region"

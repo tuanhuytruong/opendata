@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field
 
 from database_adapters import read_registered_source
 from formatting import compact_number, format_display_date, parse_date_value, percent
-from planning import analyst_proposals, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, propose_charts
+from planning import analyst_proposals, display_label, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, propose_charts
 from source_registry import public_source, registered_sources
 from run_store import DurableJobQueue, RunStore
 
@@ -160,6 +160,30 @@ class ChartRequest(BaseModel):
 class ReportRequest(BaseModel):
     title: str = Field(default="OpenData Analytics Report", min_length=1, max_length=120)
     charts: list[ChartRequest] = Field(min_length=1, max_length=12)
+
+
+class CustomReportArtifact(BaseModel):
+    artifact_id: str = Field(min_length=1, max_length=120)
+    chart: ChartRequest
+
+
+class CustomReportDocument(BaseModel):
+    """Durable, run-scoped report workspace; specs remain schema-name based."""
+    run_id: str
+    title: str = Field(default="Custom Report", min_length=1, max_length=120)
+    pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
+    glossary: list[dict[str, str]] = Field(default_factory=list)
+    updated_at: str = ""
+
+
+class CustomReportUpdate(BaseModel):
+    title: str = Field(default="Custom Report", min_length=1, max_length=120)
+    pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
+
+
+class PinArtifactRequest(BaseModel):
+    artifact_id: str = Field(min_length=1, max_length=120)
+    chart: ChartRequest
 
 
 class TextFilterRequest(BaseModel):
@@ -740,9 +764,9 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     per_secondary = bool(secondary and request.limit_per_secondary)
     label = ("Xu hướng" if chronological else f"Top {request.limit if per_secondary else len(chart_rows)}") if language == "vi" else ("Trend" if chronological else f"Top {request.limit if per_secondary else len(chart_rows)}")
     if per_secondary:
-        title = f"{label} {request.metric} theo {request.dimension} trong mỗi {request.secondary_dimension}" if language == "vi" else f"{label} {request.metric} by {request.dimension} per {request.secondary_dimension}"
+        title = f"{label} {display_label(request.metric)} theo {display_label(request.dimension)} trong mỗi {display_label(request.secondary_dimension or '')}" if language == "vi" else f"{label} {display_label(request.metric)} by {display_label(request.dimension)} per {display_label(request.secondary_dimension or '')}"
     else:
-        title = (f"{label} {request.metric} theo {request.dimension}" if language == "vi" else f"{label} {request.metric} by {request.dimension}") + (f" × {request.secondary_dimension}" if secondary else "")
+        title = (f"{label} {display_label(request.metric)} theo {display_label(request.dimension)}" if language == "vi" else f"{label} {display_label(request.metric)} by {display_label(request.dimension)}") + (f" × {display_label(request.secondary_dimension or '')}" if secondary else "")
     return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
 
 
@@ -766,6 +790,57 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
     summary = (f"Bộ tổng quan gồm {len(charts)} biểu đồ aggregate đã xác thực từ {profile_data.row_count:,} dòng." if language == "vi" else f"This executive overview contains {len(charts)} validated aggregate charts from {profile_data.row_count:,} rows.")
     guardrail = ("Các biểu đồ chỉ dùng aggregate run-scoped đã xác thực trên server; không dùng raw rows hoặc trường nhạy cảm." if language == "vi" else "Charts use only validated, run-scoped server aggregates; no raw rows or sensitive fields are used.")
     return ExecutiveOverview(run_id=run_id, summary=summary, charts=charts, warnings=warnings, guardrail=guardrail)
+
+
+def _custom_report_glossary(run_id: str, artifacts: list[CustomReportArtifact]) -> list[dict[str, str]]:
+    headers, rows = load_run(run_id)
+    profile = {item.name: item for item in profile_for_run(run_id, headers, rows).columns}
+    used = {name for artifact in artifacts for name in (artifact.chart.dimension, artifact.chart.metric, artifact.chart.secondary_dimension) if name}
+    return [{"name": name, "label": display_label(name), "description": profile[name].description, "kind": profile[name].kind} for name in sorted(used) if name in profile and not is_sensitive_column(name)]
+
+
+def _custom_report_document(run_id: str, update: CustomReportUpdate | None = None) -> CustomReportDocument:
+    path = "custom-report.json"
+    if update is None:
+        try:
+            stored = RUN_STORE.artifact_json(run_id, path)
+            return CustomReportDocument.model_validate(stored)
+        except HTTPException as error:
+            if error.status_code != 404: raise
+            return CustomReportDocument(run_id=run_id, glossary=[])
+    unique: dict[str, CustomReportArtifact] = {}
+    for artifact in update.pinned_artifacts:
+        build_chart(run_id, artifact.chart) # validates all schema fields server-side
+        unique[artifact.artifact_id] = artifact
+    artifacts = list(unique.values())
+    document = CustomReportDocument(run_id=run_id, title=update.title, pinned_artifacts=artifacts, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat())
+    RUN_STORE.save_artifact_json(run_id, path, document.model_dump())
+    return document
+
+
+@app.get("/api/runs/{run_id}/custom-report", response_model=CustomReportDocument)
+def get_custom_report(run_id: str) -> CustomReportDocument:
+    RUN_STORE.metadata(run_id)
+    return _custom_report_document(run_id)
+
+
+@app.put("/api/runs/{run_id}/custom-report", response_model=CustomReportDocument)
+def update_custom_report(run_id: str, request: CustomReportUpdate) -> CustomReportDocument:
+    return _custom_report_document(run_id, request)
+
+
+@app.post("/api/runs/{run_id}/custom-report/artifacts", response_model=CustomReportDocument)
+def pin_custom_report_artifact(run_id: str, request: PinArtifactRequest) -> CustomReportDocument:
+    current = _custom_report_document(run_id)
+    artifacts = [item for item in current.pinned_artifacts if item.artifact_id != request.artifact_id] + [CustomReportArtifact(artifact_id=request.artifact_id, chart=request.chart)]
+    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, pinned_artifacts=artifacts))
+
+
+@app.delete("/api/runs/{run_id}/custom-report/artifacts/{artifact_id}", response_model=CustomReportDocument)
+def unpin_custom_report_artifact(run_id: str, artifact_id: str) -> CustomReportDocument:
+    current = _custom_report_document(run_id)
+    artifacts = [item for item in current.pinned_artifacts if item.artifact_id != artifact_id]
+    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, pinned_artifacts=artifacts))
 
 
 @app.get("/api/runs/{run_id}/manifest")
@@ -884,22 +959,21 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
 
 
 def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: str) -> ChartRequest | None:
-    """Map this unambiguous request to a validated per-region ranking."""
-    if " ".join(message.casefold().split()) != "top 3 stores sales by region":
+    """Resolve explicit top-N store/site sales requests using validated schema aliases."""
+    normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", message.casefold()).split())
+    match = re.search(r"(?:top|highest)\s+(\d{1,2})\s+(?:stores?|sites?)\s+(?:by|for)?\s*(?:sales|revenue)(?:\s+by\s+(\w+))?", normalized)
+    if not match:
         return None
-
-    def named(*candidates: str) -> ColumnProfile | None:
-        wanted = set(candidates)
-        return next((item for item in columns if item.kind in {"num", "cat"} and re.sub(r"[^a-z0-9]+", "_", item.name.casefold()).strip("_") in wanted), None)
-
-    # This contract is deliberately strict: do not substitute another sales-like
-    # measure or another breakdown when the requested schema is absent.
-    metric = named("net_sales")
-    store = named("store", "site", "store_name", "site_name")
-    region = named("region")
-    if not metric or metric.kind != "num" or not store or store.kind != "cat" or not region or region.kind != "cat":
+    limit = int(match.group(1))
+    def canonical(item: ColumnProfile) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", item.name.casefold()).strip("_")
+    metric = next((item for item in columns if item.kind == "num" and canonical(item) in {"net_sales", "sales", "revenue", "sales_revenue", "total_sales", "total_revenue"}), None)
+    store = next((item for item in columns if item.kind == "cat" and canonical(item) in {"store", "site", "store_name", "site_name", "location", "location_name"}), None)
+    group_word = match.group(2)
+    secondary = next((item for item in columns if group_word and item.kind == "cat" and canonical(item) == group_word), None)
+    if not metric or not store:
         return None
-    return ChartRequest(dimension=store.name, secondary_dimension=region.name, metric=metric.name, aggregation="sum", chart_type="bar", limit=3, limit_per_secondary=True)
+    return ChartRequest(dimension=store.name, secondary_dimension=secondary.name if secondary else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=limit, limit_per_secondary=bool(secondary))
 
 
 def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
@@ -916,7 +990,7 @@ def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[di
             found = next((item for item in metrics if any(word in item.name.lower().replace("_", " ") for word in words)), None)
             if found:
                 return found
-    return metrics[0] if metrics else None
+    return None
 
 
 def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
@@ -935,7 +1009,7 @@ def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list
         words = item.name.lower().replace("_", " ").split()
         if any(word in normalized for word in words if len(word) > 2):
             return item
-    return next((item for item in fields if item.kind == "time"), fields[0] if fields else None)
+    return fields[0] if len(fields) == 1 else None
 
 
 def _output_intent(message: str) -> Literal["table", "chart"]:
@@ -1065,7 +1139,7 @@ def stream_chat_about_run(run_id: str, request: ChatRequest) -> StreamingRespons
             # The synchronous LLM client cannot yield while waiting. Stream stays responsive
             # by using the deterministic, schema-validated planner for this transport.
             yield event("fallback_planning", {"label": labels["fallback"]})
-            response = chat_about_run(run_id, request, allow_llm=False)
+            response = chat_about_run(run_id, request, allow_llm=True)
             if response.mode == "clarification":
                 yield event("clarification", {"label": labels["clarification"], "response": response.model_dump()})
             else:
