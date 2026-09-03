@@ -27,8 +27,9 @@ export interface ChartRequest {
   aggregation: 'sum' | 'avg' | 'count';
   chart_type: 'bar' | 'line' | 'area' | 'scatter' | 'pareto' | 'stacked_bar' | 'heatmap';
   secondary_dimension?: string;
+  limit_per_secondary?: boolean;
   limit: number;
-  filters?: Array<{ column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string }>;
+  filters: Array<{ column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string }>;
 }
 
 export interface StarterView {
@@ -69,6 +70,8 @@ export interface ChatResult { answer: string; insight: string; scope: string; ti
 
 
 export interface ExecutiveOverview { run_id: string; summary: string; charts: ChartResult[]; warnings: string[]; guardrail: string; }
+export interface CustomReportArtifact { artifact_id: string; chart: ChartRequest; }
+export interface CustomReportDocument { run_id: string; title: string; pinned_artifacts: CustomReportArtifact[]; glossary: Array<{ name: string; label: string; description: string; kind: string }>; updated_at: string; }
 
 export interface EDAColumn {
   name: string;
