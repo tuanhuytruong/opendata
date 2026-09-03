@@ -543,3 +543,27 @@ def test_filtered_data_export_matches_active_query_and_excludes_sensitive_values
     assert response.text == "store,net_sales\r\nBeta,20\r\nGamma,30\r\n"
     assert "email" not in response.text
     assert "@example.test" not in response.text
+
+
+
+def test_data_explorer_excludes_identifier_fields_and_csv_formula_cells_are_neutralized() -> None:
+    data = upload_csv("store,customer_id,note\nAlpha,CUST-001,=SUM(1+1)\n")
+    run_id = data["run_id"]
+    response = client.get(f"/api/runs/{run_id}/data?page_size=10")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [column["name"] for column in body["columns"]] == ["store", "note"]
+    assert "customer_id" not in str(body)
+    assert client.get(f"/api/runs/{run_id}/data?page_size=10&sort_by=customer_id").status_code == 422
+    assert client.get(f"/api/runs/{run_id}/data?page_size=10&filters=[{{\"column\":\"customer_id\",\"value\":\"CUST-001\"}}]").status_code == 422
+    exported = client.get(f"/api/runs/{run_id}/data/export?page_size=10")
+    assert exported.status_code == 200, exported.text
+    assert "'=SUM(1+1)" in exported.text
+
+
+def test_data_explorer_validates_page_bounds_and_export_cap() -> None:
+    data = upload_csv("store,amount\n" + "\n".join(f"S{index},{index}" for index in range(10_001)) + "\n")
+    run_id = data["run_id"]
+    assert client.get(f"/api/runs/{run_id}/data?page=0&page_size=10").status_code == 422
+    assert client.get(f"/api/runs/{run_id}/data?page=1&page_size=101").status_code == 422
+    assert client.get(f"/api/runs/{run_id}/data/export?page_size=10").status_code == 422

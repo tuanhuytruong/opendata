@@ -563,11 +563,13 @@ def _data_query_from_params(page: int, page_size: int, search: str, sort_by: str
 
 
 def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str]) -> tuple[str, list[str | float]]:
-    """Build only parameterized predicates against quoted, run-schema identifiers."""
+    """Build only parameterized predicates against non-sensitive, non-identifier fields."""
     clauses: list[str] = []
     parameters: list[str | float] = []
     operators = {"equals": "=", "not_equals": "<>", "greater_than": ">", "greater_or_equal": ">=", "less_than": "<", "less_or_equal": "<="}
     for item in query.filters:
+        if item.column not in visible_headers:
+            raise HTTPException(422, "Only non-sensitive, non-identifier columns can be used in data exploration.")
         field = quote_identifier(item.column, headers)
         operator = operators[item.operator]
         if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
@@ -588,9 +590,10 @@ def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str]
 
 def _run_data_query(run_id: str, query: DataQuery) -> tuple[list[str], list[dict[str, object]], int, list[dict[str, str]]]:
     headers, rows = load_run(run_id)
-    visible_headers = [header for header in headers if not is_sensitive_column(header)]
+    profile_columns = {item.name: item for item in profile_for_run(run_id, headers, rows).columns}
+    visible_headers = [header for header in headers if not is_sensitive_column(header) and profile_columns[header].kind != "id"]
     if not visible_headers:
-        raise HTTPException(422, "This run has no non-sensitive columns available for exploration.")
+        raise HTTPException(422, "This run has no non-sensitive, non-identifier columns available for exploration.")
     sort_column = query.sort_by or visible_headers[0]
     sort_identifier = quote_identifier(sort_column, headers)
     if sort_column not in visible_headers:
@@ -608,8 +611,7 @@ def _run_data_query(run_id: str, query: DataQuery) -> tuple[list[str], list[dict
         rows_out = [dict(zip(visible_headers, record, strict=True)) for record in result.fetchall()]
     finally:
         connection.close()
-    profile = {item.name: item for item in profile_for_run(run_id, headers, rows).columns}
-    columns = [{"name": header, "display_name": display_label(header), "kind": profile[header].kind} for header in visible_headers]
+    columns = [{"name": header, "display_name": display_label(header), "kind": profile_columns[header].kind} for header in visible_headers]
     return visible_headers, rows_out, total, columns
 
 
@@ -781,7 +783,9 @@ def export_data(run_id: str, page: int = 1, page_size: int = 25, search: str = "
     output = io.StringIO(newline="")
     writer = csv.DictWriter(output, fieldnames=headers, extrasaction="ignore")
     writer.writeheader()
-    writer.writerows(result_rows)
+    # Prevent spreadsheet applications from evaluating formula-leading cells on open.
+    safe_rows = [{key: (f"'{value}" if isinstance(value, str) and value[:1] in {"=", "+", "-", "@"} else value) for key, value in row.items()} for row in result_rows]
+    writer.writerows(safe_rows)
     filename = f"opendata-{run_id[:8]}-filtered.csv"
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"', "X-OpenData-Export-Row-Count": str(total)})
 
