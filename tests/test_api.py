@@ -483,3 +483,63 @@ def test_unclear_chat_never_defaults_to_first_metric_or_date_and_top_sites_alias
     chart = sites.json()["chart"]
     assert chart["metric"] == "revenue" and chart["dimension"] == "site" and chart["secondary_dimension"] == "region"
     assert chart["title"] == "Top 1 Revenue by SITE per Region"
+
+
+def test_data_explorer_paginates_searches_sorts_and_suppresses_sensitive_values() -> None:
+    data = upload_csv(
+        "store,net_sales,email\n"
+        "Beta,20,beta@example.test\n"
+        "Alpha,10,alpha@example.test\n"
+        "Gamma,20,gamma@example.test\n"
+        "Delta,5,delta@example.test\n"
+    )
+    run_id = data["run_id"]
+    url = f"/api/runs/{run_id}/data?page=1&page_size=10&search=A&sort_by=store"
+    first = client.get(url)
+    second = client.get(url)
+    assert first.status_code == 200, first.text
+    assert first.json() == second.json()
+    body = first.json()
+    assert body["total"] == 4
+    assert [row["store"] for row in body["rows"]] == ["Alpha", "Beta", "Delta", "Gamma"]
+    assert body["pagination"] == {"page": 1, "page_size": 10, "page_count": 1, "has_next": False, "has_previous": False}
+    assert [column["name"] for column in body["columns"]] == ["store", "net_sales"]
+    assert "example.test" not in str(body)
+
+    many = upload_csv("store,net_sales\n" + "\n".join(f"Store{index:02d},{index}" for index in range(12)) + "\n")
+    page_one = client.get(f"/api/runs/{many['run_id']}/data?page=1&page_size=10&sort_by=store")
+    page_two = client.get(f"/api/runs/{many['run_id']}/data?page=2&page_size=10&sort_by=store")
+    assert page_one.status_code == 200 and page_two.status_code == 200
+    assert [row["store"] for row in page_one.json()["rows"]] == [f"Store{index:02d}" for index in range(12)][:10]
+    assert [row["store"] for row in page_two.json()["rows"]] == ["Store10", "Store11"]
+    assert page_two.json()["pagination"]["has_previous"] is True
+
+
+def test_data_explorer_rejects_invalid_or_sensitive_schema_and_filters() -> None:
+    data = upload_csv("store,net_sales,email\nAlpha,10,alpha@example.test\n")
+    run_id = data["run_id"]
+    base = f"/api/runs/{run_id}/data?page_size=10"
+    assert client.get(base + "&sort_by=missing").status_code == 422
+    assert client.get(base + "&sort_by=email").status_code == 422
+    assert client.get(base + '&filters=[{"column":"missing","value":"x"}]').status_code == 422
+    assert client.get(base + '&filters=[{"column":"email","value":"alpha@example.test"}]').status_code == 422
+    assert client.get(base + '&filters=[{"column":"net_sales","operator":"greater_than","value":"not-number"}]').status_code == 422
+    assert client.get(base + "&filters=SELECT%20*%20FROM%20dataset").status_code == 422
+
+
+def test_filtered_data_export_matches_active_query_and_excludes_sensitive_values() -> None:
+    data = upload_csv(
+        "store,net_sales,email\n"
+        "Alpha,10,alpha@example.test\n"
+        "Beta,20,beta@example.test\n"
+        "Gamma,30,gamma@example.test\n"
+    )
+    run_id = data["run_id"]
+    filters = '[{"column":"net_sales","operator":"greater_or_equal","value":"20"}]'
+    response = client.get(f"/api/runs/{run_id}/data/export?page_size=10&sort_by=store&filters={filters}")
+    assert response.status_code == 200, response.text
+    assert response.headers["content-disposition"].endswith('-filtered.csv"')
+    assert response.headers["x-opendata-export-row-count"] == "2"
+    assert response.text == "store,net_sales\r\nBeta,20\r\nGamma,30\r\n"
+    assert "email" not in response.text
+    assert "@example.test" not in response.text

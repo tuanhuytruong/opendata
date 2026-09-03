@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from openpyxl import load_workbook
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from database_adapters import read_registered_source
 from formatting import compact_number, format_display_date, parse_date_value, percent
@@ -41,6 +41,9 @@ MAX_PROFILE_ROWS = 600_000
 MAX_REQUESTS_PER_MINUTE = 240
 MAX_EDA_COLUMNS = 100
 MAX_EDA_TOP_CATEGORIES = 10
+MAX_DATA_PAGE_SIZE = 100
+MAX_DATA_EXPORT_ROWS = 10_000
+MAX_DATA_SEARCH_LENGTH = 200
 # Attach profiles inspect a bounded, deterministic sample. Full profiles are computed
 # only when a caller explicitly asks for one of the richer analysis endpoints.
 ATTACH_PROFILE_SAMPLE_ROWS = 1_000
@@ -142,6 +145,16 @@ class FilterSpec(BaseModel):
     column: str
     operator: Literal["equals", "not_equals", "greater_than", "greater_or_equal", "less_than", "less_or_equal"] = "equals"
     value: str = Field(min_length=1, max_length=500)
+
+
+class DataQuery(BaseModel):
+    """Validated raw-data query; filters are schema fields, never client SQL."""
+    page: int = Field(default=1, ge=1)
+    page_size: int = Field(default=25, ge=10, le=MAX_DATA_PAGE_SIZE)
+    search: str = Field(default="", max_length=MAX_DATA_SEARCH_LENGTH)
+    sort_by: str | None = Field(default=None, max_length=160)
+    sort_direction: Literal["asc", "desc"] = "asc"
+    filters: list[FilterSpec] = Field(default_factory=list, max_length=10)
 
 
 class ChartRequest(BaseModel):
@@ -535,6 +548,70 @@ def quote_identifier(name: str, headers: list[str]) -> str:
         raise HTTPException(422, "Sensitive columns cannot be used in filters, previews, or charts.")
     return '"' + name.replace('"', '""') + '"'
 
+def _data_query_from_params(page: int, page_size: int, search: str, sort_by: str | None, sort_direction: str, filters: str) -> DataQuery:
+    """Decode the one JSON query parameter without accepting expressions or SQL."""
+    try:
+        decoded_filters = json.loads(filters)
+    except json.JSONDecodeError as error:
+        raise HTTPException(422, "filters must be a JSON array of validated filter objects.") from error
+    if not isinstance(decoded_filters, list):
+        raise HTTPException(422, "filters must be a JSON array of validated filter objects.")
+    try:
+        return DataQuery(page=page, page_size=page_size, search=search, sort_by=sort_by, sort_direction=sort_direction, filters=decoded_filters)
+    except ValidationError as error:
+        raise HTTPException(422, "Invalid data query.") from error
+
+
+def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str]) -> tuple[str, list[str | float]]:
+    """Build only parameterized predicates against quoted, run-schema identifiers."""
+    clauses: list[str] = []
+    parameters: list[str | float] = []
+    operators = {"equals": "=", "not_equals": "<>", "greater_than": ">", "greater_or_equal": ">=", "less_than": "<", "less_or_equal": "<="}
+    for item in query.filters:
+        field = quote_identifier(item.column, headers)
+        operator = operators[item.operator]
+        if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
+            if not is_number(item.value):
+                raise HTTPException(422, f"Numeric comparison requires a numeric value for {item.column}.")
+            clauses.append(f"TRY_CAST(REPLACE({field}, ',', '') AS DOUBLE) {operator} ?")
+            parameters.append(float(item.value.replace(",", "")))
+        else:
+            clauses.append(f"{field} {operator} ?")
+            parameters.append(item.value)
+    term = query.search.strip()
+    if term:
+        # Search visible columns only, so a sensitive value can neither match nor leak.
+        clauses.append("(" + " OR ".join(f"LOWER(COALESCE({quote_identifier(header, headers)}, '')) LIKE ?" for header in visible_headers) + ")")
+        parameters.extend([f"%{term.lower()}%"] * len(visible_headers))
+    return (" WHERE " + " AND ".join(clauses)) if clauses else "", parameters
+
+
+def _run_data_query(run_id: str, query: DataQuery) -> tuple[list[str], list[dict[str, object]], int, list[dict[str, str]]]:
+    headers, rows = load_run(run_id)
+    visible_headers = [header for header in headers if not is_sensitive_column(header)]
+    if not visible_headers:
+        raise HTTPException(422, "This run has no non-sensitive columns available for exploration.")
+    sort_column = query.sort_by or visible_headers[0]
+    sort_identifier = quote_identifier(sort_column, headers)
+    if sort_column not in visible_headers:
+        raise HTTPException(422, "Sensitive columns cannot be used in filters, previews, or charts.")
+    where_clause, parameters = _data_where(query, headers, visible_headers)
+    select_columns = ", ".join(quote_identifier(header, headers) for header in visible_headers)
+    # Add all visible columns as stable secondary keys so pagination has no ambiguous ties.
+    tie_breakers = ", ".join(f"{quote_identifier(header, headers)} ASC" for header in visible_headers if header != sort_column)
+    order_by = f"{sort_identifier} {query.sort_direction.upper()}" + (f", {tie_breakers}" if tie_breakers else "")
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
+        total = int(connection.execute(f"SELECT COUNT(*) FROM dataset{where_clause}", parameters).fetchone()[0])
+        result = connection.execute(f"SELECT {select_columns} FROM dataset{where_clause} ORDER BY {order_by} LIMIT ? OFFSET ?", [*parameters, query.page_size, (query.page - 1) * query.page_size])
+        rows_out = [dict(zip(visible_headers, record, strict=True)) for record in result.fetchall()]
+    finally:
+        connection.close()
+    profile = {item.name: item for item in profile_for_run(run_id, headers, rows).columns}
+    columns = [{"name": header, "display_name": display_label(header), "kind": profile[header].kind} for header in visible_headers]
+    return visible_headers, rows_out, total, columns
+
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
@@ -683,6 +760,30 @@ def parse_text_filter(run_id: str, request: TextFilterRequest) -> dict[str, obje
     except ValueError as error:
         raise HTTPException(422, str(error)) from error
     return {"filter": {"column": parsed.column, "operator": parsed.operator, "value": parsed.value}, "confirmation": f"Apply {parsed.column} {parsed.operator.replace('_', ' ')} {parsed.value}?"}
+
+
+@app.get("/api/runs/{run_id}/data")
+def explore_data(run_id: str, page: int = 1, page_size: int = 25, search: str = "", sort_by: str | None = None, sort_direction: Literal["asc", "desc"] = "asc", filters: str = "[]") -> dict[str, object]:
+    query = _data_query_from_params(page, page_size, search, sort_by, sort_direction, filters)
+    _, result_rows, total, columns = _run_data_query(run_id, query)
+    page_count = max(1, math.ceil(total / query.page_size))
+    return {"run_id": run_id, "columns": columns, "rows": result_rows, "total": total, "filters": [item.model_dump() for item in query.filters], "pagination": {"page": query.page, "page_size": query.page_size, "page_count": page_count, "has_next": query.page < page_count, "has_previous": query.page > 1}}
+
+
+@app.get("/api/runs/{run_id}/data/export")
+def export_data(run_id: str, page: int = 1, page_size: int = 25, search: str = "", sort_by: str | None = None, sort_direction: Literal["asc", "desc"] = "asc", filters: str = "[]") -> StreamingResponse:
+    """Export the active filtered scope only; reject, rather than truncate, oversized exports."""
+    query = _data_query_from_params(page, page_size, search, sort_by, sort_direction, filters)
+    export_query = query.model_copy(update={"page": 1, "page_size": MAX_DATA_EXPORT_ROWS})
+    headers, result_rows, total, _ = _run_data_query(run_id, export_query)
+    if total > MAX_DATA_EXPORT_ROWS:
+        raise HTTPException(422, f"Filtered export has {total:,} rows; refine filters to at most {MAX_DATA_EXPORT_ROWS:,} rows before exporting.")
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(result_rows)
+    filename = f"opendata-{run_id[:8]}-filtered.csv"
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="{filename}"', "X-OpenData-Export-Row-Count": str(total)})
 
 
 @app.get("/api/runs/{run_id}/values/{column}")
