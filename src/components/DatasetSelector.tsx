@@ -16,7 +16,7 @@ export default function DatasetSelector({ profile, language, onProfile }: Datase
   const [uploading, setUploading] = useState(false);
 
   const upload = async (file: File) => {
-    if (!/\.(csv|xlsx)$/i.test(file.name)) { setError('Upload a CSV or XLSX file. Legacy XLS is not supported.'); return; }
+    if (!/\.(csv|xlsx)$/i.test(file.name)) { setError(text(language, 'uploadInvalid')); return; }
     setUploading(true); setError(null);
     try {
       const form = new FormData(); form.append('file', file);
