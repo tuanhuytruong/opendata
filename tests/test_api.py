@@ -1,4 +1,6 @@
+import json
 from io import BytesIO
+import json
 from pathlib import Path
 import sys
 import time
@@ -201,6 +203,42 @@ def test_chat_starter_analysis_requests_return_deterministic_safe_cards() -> Non
     assert "Here are safe starter" in responses[2].json()["answer"]
 
 
+def test_starter_cards_rotate_across_eligible_metrics() -> None:
+    data = upload_csv(
+        "sale_date,channel,net_sales,cogs,gross_profit\n"
+        "2026-01-01,Online,100,60,40\n"
+        "2026-01-02,Retail,40,25,15\n"
+    )
+    proposals = client.get(f"/api/runs/{data['run_id']}/starter-views?language=en").json()["proposals"]
+    assert [item["request"]["metric"] for item in proposals[:3]] == ["net_sales", "cogs", "gross_profit"]
+    assert all(item["request"]["dimension"] == "sale_date" for item in proposals[:3])
+
+
+def test_stream_chat_top_three_stores_sales_by_region_is_per_region_ranking() -> None:
+    data = upload_csv(
+        "sale_date,STORE,REGION,NET_SALES\n"
+        "2026-01-01,A,North,100\n2026-01-02,B,North,90\n2026-01-03,C,North,80\n2026-01-04,D,North,70\n"
+        "2026-01-01,A,South,10\n2026-01-02,B,South,50\n2026-01-03,C,South,40\n2026-01-04,D,South,30\n"
+    )
+    response = client.post(f"/api/runs/{data['run_id']}/chat/stream", json={"message": "top 3 stores sales by region", "language": "en"})
+    assert response.status_code == 200, response.text
+    assert "event: completed" in response.text
+    payload = response.text.split("event: completed\ndata: ", 1)[1].split("\n\n", 1)[0]
+    body = json.loads(payload)["response"]
+    assert body["planner"] == "deterministic"
+    assert body["title"] == "Top 3 NET_SALES by STORE per REGION"
+    chart = body["chart"]
+    assert chart["metric"] == "NET_SALES"
+    assert chart["dimension"] == "STORE"
+    assert chart["secondary_dimension"] == "REGION"
+    assert chart["chart_type"] == "bar"
+    assert chart["sort_mode"] == "ranking"
+    assert [(row["secondary_label"], row["label"]) for row in chart["rows"]] == [
+        ("North", "A"), ("North", "B"), ("North", "C"),
+        ("South", "B"), ("South", "C"), ("South", "D"),
+    ]
+
+
 def test_starter_views_stream_progress_and_semantic_clarification() -> None:
     data = upload_csv("sale_date,channel,net_sales,cogs\n2026-01-01,Online,100,70\n2026-01-02,Retail,40,30\n")
     run_id = data["run_id"]
@@ -348,3 +386,42 @@ def test_vietnamese_table_intent_omits_chart() -> None:
     assert body["table"]
     assert body["answer"] == "Đã chuẩn bị bảng net_sales theo channel."
     assert "dẫn đầu" in body["insight"].lower()
+
+
+def test_streaming_exact_top_stores_sales_by_region_uses_net_sales_and_top_three_per_region() -> None:
+    data = upload_csv(
+        "store,region,net_sales,gross_sales\n"
+        "North A,North,100,900\n"
+        "North B,North,90,10\n"
+        "North C,North,80,800\n"
+        "North D,North,70,700\n"
+        "South A,South,60,600\n"
+        "South B,South,50,500\n"
+        "South C,South,40,400\n"
+        "South D,South,30,300\n"
+    )
+    stream = client.post(
+        f"/api/runs/{data['run_id']}/chat/stream",
+        json={"message": "top 3 stores sales by region", "language": "en"},
+    )
+    assert stream.status_code == 200, stream.text
+    assert "event: completed" in stream.text
+    assert '"metric": "net_sales"' in stream.text
+    assert '"dimension": "store"' in stream.text
+    assert '"secondary_dimension": "region"' in stream.text
+    assert '"title": "Top 3 net_sales by store per region"' in stream.text
+    assert '"label": "North D"' not in stream.text
+    assert '"label": "South D"' not in stream.text
+    assert stream.text.count('"secondary_label": "North"') == 3
+    assert stream.text.count('"secondary_label": "South"') == 3
+
+
+def test_starter_cards_cycle_through_available_metrics() -> None:
+    data = upload_csv(
+        "sale_date,channel,net_sales,gross_profit,cogs\n"
+        "2026-01-01,Online,100,30,70\n"
+        "2026-01-02,Retail,40,10,30\n"
+    )
+    proposals = client.get(f"/api/runs/{data['run_id']}/starter-views?language=en").json()["proposals"]
+    metrics = [card["request"]["metric"] for card in proposals]
+    assert len(set(metrics)) >= 3

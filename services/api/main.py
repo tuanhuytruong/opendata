@@ -150,6 +150,9 @@ class ChartRequest(BaseModel):
     aggregation: Literal["sum", "avg", "count"] = "sum"
     chart_type: Literal["bar", "line", "area", "scatter", "pareto", "stacked_bar", "heatmap"] = "bar"
     secondary_dimension: str | None = None
+    # When grouping by a secondary dimension, retain the ranked limit inside each
+    # group rather than applying one global limit to all groups.
+    limit_per_secondary: bool = False
     limit: int = Field(default=12, ge=1, le=30)
     filters: list[FilterSpec] = Field(default_factory=list, max_length=10)
 
@@ -691,7 +694,17 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
         where_clause = " AND ".join(filter_clauses)
-        if secondary:
+        if secondary and request.limit_per_secondary:
+            query = f"""WITH aggregates AS (
+                SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value
+                FROM dataset WHERE {where_clause} GROUP BY 1, 2
+            ), ranked AS (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY secondary_label ORDER BY value DESC NULLS LAST, label ASC) AS group_rank
+                FROM aggregates
+            )
+            SELECT label, secondary_label, value FROM ranked
+            WHERE group_rank <= ? ORDER BY secondary_label ASC, value DESC NULLS LAST, label ASC"""
+        elif secondary:
             query = f"SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1, 2 ORDER BY value DESC NULLS LAST LIMIT ?"
         elif chronological:
             query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY TRY_CAST({dimension} AS TIMESTAMP) ASC NULLS LAST LIMIT ?"
@@ -716,8 +729,12 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
             running += float(row["value"])
             row["cumulative_pct"] = 0 if total == 0 else round(running / total * 100, 2)
     insight_headline, evidence = chart_insight(chart_rows, chronological, language)
-    label = ("Xu hướng" if chronological else f"Top {len(chart_rows)}") if language == "vi" else ("Trend" if chronological else f"Top {len(chart_rows)}")
-    title = (f"{label} {request.metric} theo {request.dimension}" if language == "vi" else f"{label} {request.metric} by {request.dimension}") + (f" × {request.secondary_dimension}" if secondary else "")
+    per_secondary = bool(secondary and request.limit_per_secondary)
+    label = ("Xu hướng" if chronological else f"Top {request.limit if per_secondary else len(chart_rows)}") if language == "vi" else ("Trend" if chronological else f"Top {request.limit if per_secondary else len(chart_rows)}")
+    if per_secondary:
+        title = f"{label} {request.metric} theo {request.dimension} trong mỗi {request.secondary_dimension}" if language == "vi" else f"{label} {request.metric} by {request.dimension} per {request.secondary_dimension}"
+    else:
+        title = (f"{label} {request.metric} theo {request.dimension}" if language == "vi" else f"{label} {request.metric} by {request.dimension}") + (f" × {request.secondary_dimension}" if secondary else "")
     return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
 
 
@@ -836,6 +853,25 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
     return []
 
 
+def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: str) -> ChartRequest | None:
+    """Map this unambiguous request to a validated per-region ranking."""
+    if " ".join(message.casefold().split()) != "top 3 stores sales by region":
+        return None
+
+    def named(*candidates: str) -> ColumnProfile | None:
+        wanted = set(candidates)
+        return next((item for item in columns if item.kind in {"num", "cat"} and re.sub(r"[^a-z0-9]+", "_", item.name.casefold()).strip("_") in wanted), None)
+
+    # This contract is deliberately strict: do not substitute another sales-like
+    # measure or another breakdown when the requested schema is absent.
+    metric = named("net_sales")
+    store = named("store", "site", "store_name", "site_name")
+    region = named("region")
+    if not metric or metric.kind != "num" or not store or store.kind != "cat" or not region or region.kind != "cat":
+        return None
+    return ChartRequest(dimension=store.name, secondary_dimension=region.name, metric=metric.name, aggregation="sum", chart_type="bar", limit=3, limit_per_secondary=True)
+
+
 def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
     normalized = message.lower()
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
@@ -947,7 +983,8 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         return _starter_analysis_response(profile_data.columns, request.message, request.language)
     state = _selection_artifact(run_id)
     selections = cast(list[dict[str, object]], state["selections"])
-    clarification_options = _semantic_clarification(profile_data.columns, request.message, selections, request.language)
+    exact_request = _top_stores_sales_by_region_request(profile_data.columns, request.message)
+    clarification_options = [] if exact_request else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})
         if request.language == "vi":
@@ -957,7 +994,9 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     if clarification:
         return ChatResponse(answer=clarification, insight="AI cần xác nhận phạm vi trước khi chạy aggregate." if request.language == "vi" else "AI needs scope confirmation before running an aggregate.", scope="Chưa chạy phân tích" if request.language == "vi" else "No analysis has run", caveats=[], mode="clarification", planner="llm")
     planner = "llm" if llm_request else "deterministic"
-    if llm_request:
+    if exact_request:
+        chart_request = exact_request
+    elif llm_request:
         chart_request = llm_request
     else:
         metric = _chat_metric(profile_data.columns, request.message, selections)
