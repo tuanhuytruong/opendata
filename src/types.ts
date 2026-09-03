@@ -19,5 +19,7 @@ export interface EDAResult { coverage: { row_count: number; column_count: number
 export interface AnalystProposal { id: string; title: string; rationale: string; confidence: 'profile-based'; request: ChartRequest; }
 export interface AnalystPlan { summary: string; proposals: AnalystProposal[]; guardrail: string; }
 export interface DataFilter { column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string; }
+/** UI-only chart provenance. Filters still go through the existing validated data API. */
+export interface DeepDiveScope { title: string; aggregation: ChartRequest['aggregation']; metric: string; dimension: string; secondary_dimension?: string; filters: DataFilter[]; }
 export interface DataColumn { name: string; display_name: string; kind: ColumnKind; }
 export interface DataQueryResult { run_id: string; columns: DataColumn[]; rows: Record<string, string>[]; total: number; filters: DataFilter[]; pagination: { page: number; page_size: number; page_count: number; has_next: boolean; has_previous: boolean }; }
