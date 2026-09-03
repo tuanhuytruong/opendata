@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from database_adapters import read_registered_source
 from formatting import compact_number, format_display_date, parse_date_value, percent
-from planning import analyst_proposals, display_label, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, propose_charts
+from planning import analyst_proposals, business_semantic_catalog, canonical_field_name, display_label, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, propose_charts
 from source_registry import public_source, registered_sources
 from run_store import DurableJobQueue, RunStore
 
@@ -751,8 +751,11 @@ def starter_views_payload(run_id: str, language: Literal["en", "vi"] = "en") -> 
     profile_data = profile_for_run(run_id, headers, rows)
     proposals = analyst_proposals(profile_data.columns, language=language)
     for proposal in proposals:
-        request = cast(dict[str, object], proposal["request"])
-        proposal["question"] = (f"{request['metric']} thay đổi theo {request['dimension']} như thế nào?" if language == "vi" else f"How does {request['metric']} vary by {request['dimension']}?")
+        chart_request = ChartRequest.model_validate(cast(dict[str, object], proposal["request"]))
+        # The card payload is the exact schema-validated request that can execute.
+        proposal["request"] = chart_request.model_dump()
+        proposal["question"] = (f"Tổng {chart_request.metric} theo {chart_request.dimension}" if language == "vi" else f"Show sum of {chart_request.metric} by {chart_request.dimension}")
+        proposal["prompt"] = proposal["question"]
 
     return {
         "summary": f"Run này có {profile_data.row_count:,} dòng, {profile_data.usable_column_count} cột có thể dùng, {sum(item.kind == 'num' for item in profile_data.columns)} chỉ tiêu số và {sum(item.kind in {'cat', 'time'} for item in profile_data.columns)} trường phân tích." if language == "vi" else f"This run has {profile_data.row_count:,} rows, {profile_data.usable_column_count} usable columns, {sum(item.kind == 'num' for item in profile_data.columns)} metrics and {sum(item.kind in {'cat', 'time'} for item in profile_data.columns)} dimensions/time fields.",
@@ -1095,6 +1098,16 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
     dimension_named = any(item.kind in {"time", "cat"} and (item.name in named or selected.get(item.name) == "dimension") for item in columns)
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
     dimensions = [item for item in columns if item.kind in {"time", "cat"}]
+    catalog = business_semantic_catalog(columns)
+    requested_business_metric = any(word in normalized for word in {"doanh thu", "revenue", "sales", "lợi nhuận", "profit", "margin", "chi phí", "cost", "số lượng", "quantity"})
+    semantic_metric = (
+        catalog.metric("sales") if any(word in normalized for word in {"doanh thu", "revenue", "sales"}) else
+        catalog.metric("profit") if any(word in normalized for word in {"lợi nhuận", "profit", "margin"}) else
+        catalog.metric("cost") if any(word in normalized for word in {"chi phí", "cost"}) else
+        catalog.metric("quantity") if any(word in normalized for word in {"số lượng", "quantity"}) else None
+    )
+    if requested_business_metric and not metric_named and semantic_metric is None and metrics:
+        return [ClarificationOption(column=item.name, label=item.name, reason="Không có alias chỉ tiêu kinh doanh được xác thực; hãy chọn một trường số." if language == "vi" else "No validated business alias matched; select the numeric field to use.", role="metric") for item in metrics[:4]]
     if not requested_measure and not metric_named and len(metrics) > 1:
         return [ClarificationOption(column=item.name, label=item.name, reason="Ứng viên chỉ tiêu số — hãy xác nhận ý nghĩa nghiệp vụ." if language == "vi" else "Numeric measure candidate — please confirm its business meaning.", role="metric") for item in metrics[:4]]
     if requested_measure and not requested_dimension and not dimension_named and len(dimensions) > 1:
@@ -1103,54 +1116,48 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
 
 
 def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: str) -> ChartRequest | None:
-    """Resolve explicit top-N store/site sales requests using validated schema aliases."""
+    """Resolve explicit top-N store/site sales requests from the run's semantic catalog."""
     normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", message.casefold()).split())
     match = re.search(r"(?:top|highest)\s+(\d{1,2})\s+(?:stores?|sites?)\s+(?:by|for)?\s*(?:sales|revenue)(?:\s+by\s+(\w+))?", normalized)
     if not match:
         return None
-    limit = int(match.group(1))
-    def canonical(item: ColumnProfile) -> str:
-        return re.sub(r"[^a-z0-9]+", "_", item.name.casefold()).strip("_")
-    metric = next((item for item in columns if item.kind == "num" and canonical(item) in {"net_sales", "sales", "revenue", "sales_revenue", "total_sales", "total_revenue"}), None)
-    store = next((item for item in columns if item.kind == "cat" and canonical(item) in {"store", "site", "store_name", "site_name", "location", "location_name"}), None)
+    catalog = business_semantic_catalog(columns)
+    metric, store = catalog.metric("sales"), catalog.location()
     group_word = match.group(2)
-    secondary = next((item for item in columns if group_word and item.kind == "cat" and canonical(item) == group_word), None)
+    secondary = next((item for item in columns if group_word and item.kind == "cat" and canonical_field_name(item.name) == canonical_field_name(group_word)), None)
     if not metric or not store:
         return None
-    return ChartRequest(dimension=store.name, secondary_dimension=secondary.name if secondary else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=limit, limit_per_secondary=bool(secondary))
+    return ChartRequest(dimension=store.name, secondary_dimension=secondary.name if secondary else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=int(match.group(1)), limit_per_secondary=bool(secondary))
 
 
 def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
-    normalized = message.lower()
+    normalized = canonical_field_name(message).replace("_", " ")
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
     selected = {str(item.get("column")) for item in selections if item.get("role") == "metric"}
     named = _named_columns(columns, message)
     direct = next((item for item in metrics if item.name in named or item.name in selected), None)
     if direct:
         return direct
-    priorities = (("doanh thu", "revenue", "sales"), ("lợi nhuận", "profit", "margin"), ("số lượng", "quantity", "volume"), ("chi phí", "cost"))
-    for words in priorities:
+    catalog = business_semantic_catalog(columns)
+    intents = (("sales", ("doanh thu", "revenue", "sales")), ("profit", ("loi nhuan", "profit", "margin")), ("quantity", ("so luong", "quantity", "volume")), ("cost", ("chi phi", "cost")))
+    for intent, words in intents:
         if any(word in normalized for word in words):
-            found = next((item for item in metrics if any(word in item.name.lower().replace("_", " ") for word in words)), None)
-            if found:
-                return found
+            return cast(ColumnProfile | None, catalog.metric(intent))
     return None
 
 
 def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
-    normalized = message.lower()
+    normalized = canonical_field_name(message).replace("_", " ")
     fields = [item for item in columns if item.kind in {"time", "cat"}]
     selected = {str(item.get("column")) for item in selections if item.get("role") == "dimension"}
     named = _named_columns(columns, message)
     direct = next((item for item in fields if item.name in named or item.name in selected), None)
     if direct:
         return direct
-    if any(word in normalized for word in {"tháng", "month", "ngày", "day", "trend", "xu hướng", "6 tháng", "năm"}):
-        timed = next((item for item in fields if item.kind == "time"), None)
-        if timed:
-            return timed
+    if any(word in normalized for word in {"thang", "month", "ngay", "day", "trend", "xu huong", "6 thang", "nam"}):
+        return cast(ColumnProfile | None, business_semantic_catalog(columns).time())
     for item in fields:
-        words = item.name.lower().replace("_", " ").split()
+        words = canonical_field_name(item.name).split("_")
         if any(word in normalized for word in words if len(word) > 2):
             return item
     return fields[0] if len(fields) == 1 else None

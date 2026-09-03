@@ -357,9 +357,9 @@ def test_starter_views_are_dynamic_and_localized() -> None:
     assert vietnamese.status_code == 200, vietnamese.text
     en_card = english.json()["proposals"][0]
     vi_card = vietnamese.json()["proposals"][0]
-    assert en_card["question"] == f"How does {en_card['request']['metric']} vary by {en_card['request']['dimension']}?"
-    assert vi_card["question"] == f"{vi_card['request']['metric']} thay đổi theo {vi_card['request']['dimension']} như thế nào?"
-
+    assert en_card["question"] == f"Show sum of {en_card['request']['metric']} by {en_card['request']['dimension']}"
+    assert vi_card["question"] == f"Tổng {vi_card['request']['metric']} theo {vi_card['request']['dimension']}"
+    assert en_card["prompt"] == en_card["question"]
 
     assert en_card["request"]["metric"] in en_card["question"]
     assert en_card["request"]["dimension"] in en_card["question"]
@@ -579,3 +579,37 @@ def test_data_explorer_validates_page_bounds_and_export_cap() -> None:
     assert client.get(f"/api/runs/{run_id}/data?page=0&page_size=10").status_code == 422
     assert client.get(f"/api/runs/{run_id}/data?page=1&page_size=101").status_code == 422
     assert client.get(f"/api/runs/{run_id}/data/export?page_size=10").status_code == 422
+
+
+def test_business_aliases_resolve_sale_excl_vat_for_store_ranking_and_monthly_revenue() -> None:
+    data = upload_csv(
+        "SALE_DATE,SITE_NAME,SALE_EXCL_VAT,COST,QUANTITY\n"
+        "2026-01-01,Alpha,100,60,2\n"
+        "2026-01-15,Beta,150,90,3\n"
+        "2026-02-01,Alpha,40,30,1\n"
+    )
+    run_id = data["run_id"]
+
+    ranking = client.post(f"/api/runs/{run_id}/chat", json={"message": "top 5 stores by sales", "language": "en"})
+    assert ranking.status_code == 200, ranking.text
+    ranking_chart = ranking.json()["chart"]
+    assert ranking_chart["metric"] == "SALE_EXCL_VAT"
+    assert ranking_chart["dimension"] == "SITE_NAME"
+    assert len(ranking_chart["rows"]) == 2
+    assert ranking_chart["rows"][0]["label"] == "Beta"
+
+    monthly = client.post(f"/api/runs/{run_id}/chat", json={"message": "revenue by month", "language": "en"})
+    assert monthly.status_code == 200, monthly.text
+    monthly_chart = monthly.json()["chart"]
+    assert monthly_chart["metric"] == "SALE_EXCL_VAT"
+    assert monthly_chart["dimension"] == "SALE_DATE"
+    assert monthly_chart["chart_type"] == "line"
+    assert monthly_chart["sort_mode"] == "chronological"
+
+    starter = client.get(f"/api/runs/{run_id}/starter-views?language=en")
+    assert starter.status_code == 200, starter.text
+    proposal = starter.json()["proposals"][0]
+    assert proposal["request"]["metric"] == "SALE_EXCL_VAT"
+    assert proposal["request"]["dimension"] == "SALE_DATE"
+    executed = client.post(f"/api/runs/{run_id}/chart", json=proposal["request"])
+    assert executed.status_code == 200, executed.text

@@ -29,6 +29,11 @@ def _normalized_text(value: str) -> str:
     return "".join(character for character in decomposed if unicodedata.category(character) != "Mn").replace("đ", "d")
 
 
+def canonical_field_name(value: str) -> str:
+    """Normalize a schema name for matching only; requests retain the original name."""
+    return re.sub(r"[^a-z0-9]+", "_", _normalized_text(value)).strip("_")
+
+
 def is_starter_analysis_request(message: str) -> bool:
     """Identify requests for suggested views, rather than a single aggregate chart."""
     normalized = _normalized_text(message)
@@ -37,7 +42,7 @@ def is_starter_analysis_request(message: str) -> bool:
 
 def _is_safe_analytic_field(item: object) -> bool:
     name = getattr(item, "name", "")
-    normalized = re.sub(r"[^a-z0-9]+", "_", _normalized_text(name)).strip("_")
+    normalized = canonical_field_name(name)
     return getattr(item, "kind", "") != "id" and not any(token in normalized for token in _SENSITIVE_FIELD_TOKENS)
 
 
@@ -46,6 +51,61 @@ class ParsedFilter:
     column: str
     operator: str
     value: str
+
+
+@dataclass(frozen=True)
+class BusinessSemanticCatalog:
+    """Profile-derived business roles, with schema order as deterministic tie-breaker.
+
+    Aliases are deliberately conservative: an intent resolves only to a field that
+    is present in the current run profile and has the appropriate inferred kind.
+    """
+    sales_metrics: tuple[object, ...]
+    profit_metrics: tuple[object, ...]
+    cost_metrics: tuple[object, ...]
+    quantity_metrics: tuple[object, ...]
+    locations: tuple[object, ...]
+    time_fields: tuple[object, ...]
+
+    def metric(self, intent: str) -> object | None:
+        candidates = {
+            "sales": self.sales_metrics,
+            "revenue": self.sales_metrics,
+            "profit": self.profit_metrics,
+            "cost": self.cost_metrics,
+            "quantity": self.quantity_metrics,
+        }.get(intent, ())
+        return candidates[0] if candidates else None
+
+    def location(self) -> object | None:
+        return self.locations[0] if self.locations else None
+
+    def time(self) -> object | None:
+        return self.time_fields[0] if self.time_fields else None
+
+
+def business_semantic_catalog(columns: Iterable[object]) -> BusinessSemanticCatalog:
+    """Derive canonical business aliases from a run's validated profile fields."""
+    fields = tuple(columns)
+
+    def matching(kind: str, aliases: tuple[str, ...]) -> tuple[object, ...]:
+        # Alias precedence is the semantic contract; profile ordering breaks ties.
+        return tuple(
+            item for alias in aliases for item in fields
+            if getattr(item, "kind", "") == kind and canonical_field_name(getattr(item, "name", "")) == alias
+        )
+
+    return BusinessSemanticCatalog(
+        sales_metrics=matching("num", (
+            "net_sales", "sale_excl_vat", "sales_excl_vat", "revenue_excl_vat",
+            "total_net_sales", "total_sales", "sales", "revenue", "gross_sales",
+        )),
+        profit_metrics=matching("num", ("gross_profit", "net_profit", "profit", "margin")),
+        cost_metrics=matching("num", ("cost", "cogs", "cost_of_goods_sold", "total_cost")),
+        quantity_metrics=matching("num", ("quantity", "qty", "units", "unit_quantity", "volume")),
+        locations=matching("cat", ("store_name", "site_name", "store", "site", "location_name", "location")),
+        time_fields=matching("time", ("sale_date", "sales_date", "transaction_date", "order_date", "date", "event_date")),
+    )
 
 
 _FILTER = re.compile(r"^\s*([\w .-]+?)\s*(=|!=|>=|<=|>|<)\s*(.+?)\s*$")
@@ -60,13 +120,12 @@ def parse_filter(text: str, allowed_columns: Iterable[str]) -> ParsedFilter:
     if column not in set(allowed_columns):
         raise ValueError(f"Unknown column: {column}")
     normalized = re.sub(r"[^a-z0-9]+", "_", column.lower()).strip("_")
-    if any(token in normalized for token in {"email", "phone", "mobile", "address", "password", "token", "secret", "ssn", "passport", "national_id", "credit_card"}):
+    if any(token in normalized for token in _SENSITIVE_FIELD_TOKENS):
         raise ValueError("Sensitive columns cannot be used in filters.")
     if len(value) > 500 or not value:
         raise ValueError("Filter value must be between 1 and 500 characters.")
     mapping = {"=": "equals", "!=": "not_equals", ">": "greater_than", ">=": "greater_or_equal", "<": "less_than", "<=": "less_or_equal"}
     return ParsedFilter(column, mapping[operator], value.strip("'\""))
-
 
 
 def display_label(name: str) -> str:
@@ -76,7 +135,7 @@ def display_label(name: str) -> str:
         "gross_profit": "Gross Profit", "sale_date": "Sale Date",
         "cogs": "Cost of Goods Sold", "uom": "Unit of Measure",
     }
-    normalized = re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_")
+    normalized = canonical_field_name(name)
     if normalized in aliases:
         return aliases[normalized]
     return " ".join(part.upper() if len(part) <= 4 and part.isalpha() else part.capitalize() for part in re.split(r"[_\s-]+", name) if part)
@@ -97,17 +156,20 @@ def propose_charts(columns: Iterable[object], max_charts: int = 8) -> list[dict[
 
 
 def analyst_proposals(columns: Iterable[object], max_charts: int = 5, language: str = "en") -> list[dict[str, object]]:
-    """Return stable, selectable views from safe profile metadata only.
-
-    Ordering follows the profile column order, so equivalent profiles always produce
-    the same cards.  The cards intentionally contain no values or row samples.
-    """
+    """Return stable, executable starter views from safe profile metadata only."""
     max_charts = max(0, min(max_charts, 5))
     safe_columns = [item for item in columns if _is_safe_analytic_field(item)]
     dimensions = [item for item in safe_columns if getattr(item, "kind", "") == "cat" and getattr(item, "null_ratio", 1) < .95]
     time_fields = [item for item in safe_columns if getattr(item, "kind", "") == "time" and getattr(item, "null_ratio", 1) < .95]
-    # Numeric identifiers can be summed syntactically but have no analytical meaning.
     metrics = [item for item in safe_columns if getattr(item, "kind", "") == "num" and getattr(item, "null_ratio", 1) < .95 and not any(token in _normalized_text(getattr(item, "name", "")) for token in {"_id", " id", "code", "key"})]
+    catalog = business_semantic_catalog(safe_columns)
+    # Lead with the validated sales metric where available, then preserve profile order.
+    preferred = list(catalog.sales_metrics) + [item for item in metrics if item not in catalog.sales_metrics]
+    metrics = preferred
+    if catalog.time() in time_fields:
+        time_fields = [catalog.time()] + [item for item in time_fields if item != catalog.time()]
+    if catalog.location() in dimensions:
+        dimensions = [catalog.location()] + [item for item in dimensions if item != catalog.location()]
     proposals: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
 
@@ -116,17 +178,14 @@ def analyst_proposals(columns: Iterable[object], max_charts: int = 5, language: 
         if key in seen or len(proposals) >= max_charts:
             return
         seen.add(key)
+        request = {"dimension": key[0], "metric": key[1], "aggregation": "sum", "chart_type": chart_type, "limit": 12, "filters": []}
         proposals.append({
-            "id": f"{kind}-{len(proposals) + 1}",
-            "title": title,
-            "rationale": rationale,
-            "confidence": "profile-based",
-            "request": {"dimension": key[0], "metric": key[1], "aggregation": "sum", "chart_type": chart_type, "limit": 12, "filters": []},
+            "id": f"{kind}-{len(proposals) + 1}", "title": title, "rationale": rationale,
+            "confidence": "profile-based", "request": request,
+            "prompt": f"Show sum of {key[1]} by {key[0]}",
         })
 
     vietnamese = language == "vi"
-    # Iterate fields first so the cards cycle through eligible metrics before
-    # repeating one metric for another field. Profile ordering remains stable.
     for field in time_fields:
         for metric in metrics:
             title = f"Xu hướng {display_label(getattr(metric, 'name'))} theo {display_label(getattr(field, 'name'))}" if vietnamese else f"{display_label(getattr(metric, 'name'))} trend by {display_label(getattr(field, 'name'))}"
