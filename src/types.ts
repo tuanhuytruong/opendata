@@ -98,3 +98,15 @@ export interface AnalystProposal {
 }
 
 export interface AnalystPlan { summary: string; proposals: AnalystProposal[]; guardrail: string; }
+
+export interface DataFilter {
+  column: string;
+  operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal';
+  value: string;
+}
+
+export interface DataColumn { name: string; display_name: string; kind: ColumnKind; }
+export interface DataQueryResult {
+  run_id: string; columns: DataColumn[]; rows: Record<string, string>[]; total: number; filters: DataFilter[];
+  pagination: { page: number; page_size: number; page_count: number; has_next: boolean; has_previous: boolean };
+}
