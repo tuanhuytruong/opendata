@@ -226,6 +226,14 @@ class ChartResult(BaseModel):
     evidence: list[str] = Field(default_factory=list)
 
 
+class ExecutiveOverview(BaseModel):
+    run_id: str
+    summary: str
+    charts: list[ChartResult]
+    warnings: list[str] = Field(default_factory=list)
+    guardrail: str
+
+
 def safe_name(name: str) -> str:
     return Path(name).name
 
@@ -736,6 +744,28 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     else:
         title = (f"{label} {request.metric} theo {request.dimension}" if language == "vi" else f"{label} {request.metric} by {request.dimension}") + (f" × {request.secondary_dimension}" if secondary else "")
     return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
+
+
+@app.get("/api/runs/{run_id}/executive-overview", response_model=ExecutiveOverview)
+def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> ExecutiveOverview:
+    """Generate a bounded, read-only overview from validated server aggregates."""
+    headers, rows = load_run(run_id)
+    profile_data = profile_for_run(run_id, headers, rows)
+    charts: list[ChartResult] = []
+    warnings: list[str] = []
+    for proposal in analyst_proposals(profile_data.columns, max_charts=5, language=language):
+        try:
+            request = ChartRequest.model_validate(cast(dict[str, object], proposal["request"]))
+            chart = build_chart(run_id, request, language)
+            if chart.rows:
+                charts.append(chart)
+            else:
+                warnings.append(f"{chart.title}: " + (chart.warnings[0] if chart.warnings else "no matching values"))
+        except (HTTPException, ValueError, TypeError) as error:
+            warnings.append(str(getattr(error, "detail", error))[:220])
+    summary = (f"Bộ tổng quan gồm {len(charts)} biểu đồ aggregate đã xác thực từ {profile_data.row_count:,} dòng." if language == "vi" else f"This executive overview contains {len(charts)} validated aggregate charts from {profile_data.row_count:,} rows.")
+    guardrail = ("Các biểu đồ chỉ dùng aggregate run-scoped đã xác thực trên server; không dùng raw rows hoặc trường nhạy cảm." if language == "vi" else "Charts use only validated, run-scoped server aggregates; no raw rows or sensitive fields are used.")
+    return ExecutiveOverview(run_id=run_id, summary=summary, charts=charts, warnings=warnings, guardrail=guardrail)
 
 
 @app.get("/api/runs/{run_id}/manifest")

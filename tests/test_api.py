@@ -412,8 +412,10 @@ def test_streaming_exact_top_stores_sales_by_region_uses_net_sales_and_top_three
     assert '"title": "Top 3 net_sales by store per region"' in stream.text
     assert '"label": "North D"' not in stream.text
     assert '"label": "South D"' not in stream.text
-    assert stream.text.count('"secondary_label": "North"') == 3
-    assert stream.text.count('"secondary_label": "South"') == 3
+    payload = stream.text.split("event: completed\ndata: ", 1)[1].split("\n\n", 1)[0]
+    chart = json.loads(payload)["response"]["chart"]
+    assert sum(row["secondary_label"] == "North" for row in chart["rows"]) == 3
+    assert sum(row["secondary_label"] == "South" for row in chart["rows"]) == 3
 
 
 def test_starter_cards_cycle_through_available_metrics() -> None:
@@ -425,3 +427,24 @@ def test_starter_cards_cycle_through_available_metrics() -> None:
     proposals = client.get(f"/api/runs/{data['run_id']}/starter-views?language=en").json()["proposals"]
     metrics = [card["request"]["metric"] for card in proposals]
     assert len(set(metrics)) >= 3
+
+
+
+def test_executive_overview_is_deterministic_validated_and_excludes_sensitive_fields() -> None:
+    data = upload_csv(
+        "sale_date,region,channel,net_sales,cogs,gross_profit,email\n"
+        "2026-01-01,North,Online,100,60,40,private@example.test\n"
+        "2026-01-02,South,Retail,70,45,25,private@example.test\n"
+        "2026-01-03,North,Online,90,55,35,private@example.test\n"
+    )
+    url = f"/api/runs/{data['run_id']}/executive-overview?language=en"
+    first = client.get(url)
+    second = client.get(url)
+    assert first.status_code == 200, first.text
+    assert first.json() == second.json()
+    body = first.json()
+    assert 1 <= len(body["charts"]) <= 5
+    assert {chart["metric"] for chart in body["charts"]} >= {"net_sales", "cogs", "gross_profit"}
+    assert all(chart["rows"] for chart in body["charts"])
+    assert all(chart["dimension"] != "email" and chart["metric"] != "email" for chart in body["charts"])
+    assert "private@example.test" not in str(body)
