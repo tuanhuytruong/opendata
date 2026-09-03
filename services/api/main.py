@@ -171,33 +171,57 @@ class ChartRequest(BaseModel):
 
 
 class ReportRequest(BaseModel):
+    """Deprecated compatibility input; converted into the persisted run document."""
     title: str = Field(default="OpenData Analytics Report", min_length=1, max_length=120)
     charts: list[ChartRequest] = Field(min_length=1, max_length=12)
+
+
+class ReportSection(BaseModel):
+    section_id: str = Field(min_length=1, max_length=80)
+    heading: str = Field(default="Untitled section", min_length=1, max_length=160)
+    commentary: str = Field(default="", max_length=8_000)
+    recommended_actions: list[str] = Field(default_factory=list, max_length=20)
+
+
+class ManualGlossaryNote(BaseModel):
+    note_id: str = Field(min_length=1, max_length=80)
+    text: str = Field(min_length=1, max_length=1_000)
 
 
 class CustomReportArtifact(BaseModel):
     artifact_id: str = Field(min_length=1, max_length=120)
     chart: ChartRequest
+    annotation: str = Field(default="", max_length=2_000)
+    title: str = ""
+    scope: str = ""
+    evidence: list[str] = Field(default_factory=list, max_length=20)
+    warnings: list[str] = Field(default_factory=list, max_length=20)
 
 
 class CustomReportDocument(BaseModel):
-    """Durable, run-scoped report workspace; specs remain schema-name based."""
+    """Durable, run-scoped authored briefing; evidence is always server-derived."""
     run_id: str
     title: str = Field(default="Custom Report", min_length=1, max_length=120)
+    executive_summary: str = Field(default="", max_length=8_000)
+    sections: list[ReportSection] = Field(default_factory=list, max_length=20)
     pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
+    manual_glossary_notes: list[ManualGlossaryNote] = Field(default_factory=list, max_length=30)
     glossary: list[dict[str, str]] = Field(default_factory=list)
     updated_at: str = ""
 
 
 class CustomReportUpdate(BaseModel):
     title: str = Field(default="Custom Report", min_length=1, max_length=120)
+    executive_summary: str = Field(default="", max_length=8_000)
+    sections: list[ReportSection] = Field(default_factory=list, max_length=20)
     pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
+    manual_glossary_notes: list[ManualGlossaryNote] = Field(default_factory=list, max_length=30)
 
 
 class PinArtifactRequest(BaseModel):
     artifact_id: str = Field(min_length=1, max_length=120)
     chart: ChartRequest
-
+    annotation: str = Field(default="", max_length=2_000)
 
 class TextFilterRequest(BaseModel):
     text: str = Field(min_length=3, max_length=600)
@@ -904,21 +928,27 @@ def _custom_report_glossary(run_id: str, artifacts: list[CustomReportArtifact]) 
     return [{"name": name, "label": display_label(name), "description": profile[name].description, "kind": profile[name].kind} for name in sorted(used) if name in profile and not is_sensitive_column(name)]
 
 
+def _report_artifact(run_id: str, artifact: CustomReportArtifact) -> CustomReportArtifact:
+    chart = build_chart(run_id, artifact.chart)
+    scope = f"{chart.aggregation} of {display_label(chart.metric)} by {display_label(chart.dimension)}"
+    if chart.secondary_dimension:
+        scope += f"; grouped by {display_label(chart.secondary_dimension)}"
+    if chart.filters:
+        scope += "; filtered to " + "; ".join(f"{display_label(item.column)} {item.operator.replace('_', ' ')} {item.value}" for item in chart.filters)
+    scope += f"; top {chart.result_count or len(chart.rows)} {chart.sort_mode or 'results'}."
+    return CustomReportArtifact(artifact_id=artifact.artifact_id, chart=artifact.chart, annotation=artifact.annotation, title=chart.title, scope=scope, evidence=chart.evidence, warnings=chart.warnings)
+
+
 def _custom_report_document(run_id: str, update: CustomReportUpdate | None = None) -> CustomReportDocument:
     path = "custom-report.json"
     if update is None:
         try:
-            stored = RUN_STORE.artifact_json(run_id, path)
-            return CustomReportDocument.model_validate(stored)
+            return CustomReportDocument.model_validate(RUN_STORE.artifact_json(run_id, path))
         except HTTPException as error:
             if error.status_code != 404: raise
             return CustomReportDocument(run_id=run_id, glossary=[])
-    unique: dict[str, CustomReportArtifact] = {}
-    for artifact in update.pinned_artifacts:
-        build_chart(run_id, artifact.chart) # validates all schema fields server-side
-        unique[artifact.artifact_id] = artifact
-    artifacts = list(unique.values())
-    document = CustomReportDocument(run_id=run_id, title=update.title, pinned_artifacts=artifacts, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat())
+    artifacts = list({item.artifact_id: _report_artifact(run_id, item) for item in update.pinned_artifacts}.values())
+    document = CustomReportDocument(run_id=run_id, title=update.title, executive_summary=update.executive_summary, sections=update.sections, pinned_artifacts=artifacts, manual_glossary_notes=update.manual_glossary_notes, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat())
     RUN_STORE.save_artifact_json(run_id, path, document.model_dump())
     return document
 
@@ -937,15 +967,15 @@ def update_custom_report(run_id: str, request: CustomReportUpdate) -> CustomRepo
 @app.post("/api/runs/{run_id}/custom-report/artifacts", response_model=CustomReportDocument)
 def pin_custom_report_artifact(run_id: str, request: PinArtifactRequest) -> CustomReportDocument:
     current = _custom_report_document(run_id)
-    artifacts = [item for item in current.pinned_artifacts if item.artifact_id != request.artifact_id] + [CustomReportArtifact(artifact_id=request.artifact_id, chart=request.chart)]
-    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, pinned_artifacts=artifacts))
+    artifacts = [item for item in current.pinned_artifacts if item.artifact_id != request.artifact_id] + [CustomReportArtifact(artifact_id=request.artifact_id, chart=request.chart, annotation=request.annotation)]
+    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
 
 
 @app.delete("/api/runs/{run_id}/custom-report/artifacts/{artifact_id}", response_model=CustomReportDocument)
 def unpin_custom_report_artifact(run_id: str, artifact_id: str) -> CustomReportDocument:
     current = _custom_report_document(run_id)
     artifacts = [item for item in current.pinned_artifacts if item.artifact_id != artifact_id]
-    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, pinned_artifacts=artifacts))
+    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
 
 
 @app.get("/api/runs/{run_id}/manifest")
@@ -953,21 +983,30 @@ def get_manifest(run_id: str) -> dict[str, object]:
     return RUN_STORE.artifact_json(run_id, "report.manifest.json")
 
 
+@app.get("/api/runs/{run_id}/report", response_class=HTMLResponse)
 @app.post("/api/runs/{run_id}/report", response_class=HTMLResponse)
-def build_report(run_id: str, request: ReportRequest) -> HTMLResponse:
-    """Render a portable HTML artifact from validated, server-calculated charts."""
-    charts = [build_chart(run_id, item) for item in request.charts]
-    payload = [chart.model_dump() for chart in charts]
+def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLResponse:
+    """Render portable HTML from the persisted authored document, never client charts."""
+    document = _custom_report_document(run_id)
+    if request is not None and not document.pinned_artifacts:
+        document = _custom_report_document(run_id, CustomReportUpdate(title=request.title, pinned_artifacts=[CustomReportArtifact(artifact_id=f"legacy-{index}", chart=chart) for index, chart in enumerate(request.charts)]))
+    charts = [build_chart(run_id, item.chart) for item in document.pinned_artifacts]
     evidence = [fact for chart in charts for fact in evidence_for_chart(chart)]
-    narratives = narrative_from_evidence(evidence)
     metadata = RUN_STORE.metadata(run_id)
-    manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256(RUN_STORE.dataset_path(run_id).read_bytes()).hexdigest(), "source_type": metadata["source_type"], "source_label": metadata["source_label"], "chart_specs": [item.model_dump() for item in request.charts], "chart_count": len(charts), "evidence": evidence}
+    manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256(RUN_STORE.dataset_path(run_id).read_bytes()).hexdigest(), "source_type": metadata["source_type"], "source_label": metadata["source_label"], "chart_specs": [item.chart.model_dump() for item in document.pinned_artifacts], "chart_count": len(charts), "evidence": evidence, "document_updated_at": document.updated_at}
     RUN_STORE.save_artifact_json(run_id, "report.manifest.json", manifest)
-    safe_title = html.escape(request.title)
-    safe_chart_payload = json.dumps(payload).replace("</", "<\\/")
-    artifact = f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{safe_title}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left}}th{{color:#475569}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}</style></head><body><main><h1>{safe_title}</h1><p>Generated from validated report run <code>{run_id[:8]}</code>. Values below are deterministic server-side aggregates.</p><section class="meta"><h2>Evidence-bound highlights</h2><ul>{''.join(f'<li>{html.escape(item)}</li>' for item in narratives) or '<li>No narrative evidence was available.</li>'}</ul></section><section class="meta"><h2>Provenance</h2><p>Dataset checksum: <code>{manifest['dataset_sha256']}</code>. Filter scope and chart specifications are retained in the run manifest.</p></section><div id="charts"></div></main><script>const charts={safe_chart_payload};const e=s=>String(s).replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));document.querySelector('#charts').innerHTML=charts.map(c=>`<section class="card"><h2>${{e(c.title)}}</h2>${{c.warnings.map(w=>`<p class="warning">${{e(w)}}</p>`).join('')}}<table><thead><tr><th>${{e(c.dimension)}}</th>${{c.secondary_dimension?`<th>${{e(c.secondary_dimension)}}</th>`:''}}<th>${{e(c.aggregation)}} ${{e(c.metric)}}</th></tr></thead><tbody>${{c.rows.map(r=>`<tr><td>${{e(r.label)}}</td>${{c.secondary_dimension?`<td>${{e(r.secondary_label ?? '')}}</td>`:''}}<td>${{r.value.toLocaleString()}}</td></tr>`).join('')}}</tbody></table></section>`).join('');</script></body></html>'''
-    return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-report.html"'})
-
+    esc = lambda value: html.escape(str(value))
+    artifact_parts = []
+    for saved, chart in zip(document.pinned_artifacts, charts):
+        rows = "".join("<tr><td>{}</td>{}<td>{}</td></tr>".format(esc(row.get("display_label") or row["label"]), "<td>{}</td>".format(esc(row.get("secondary_label") or "")) if chart.secondary_dimension else "", esc(row.get("formatted_value", row["value"]))) for row in chart.rows)
+        artifact_parts.append("<section class='card'><h2>{}</h2><p class='scope'>{}</p>{}<h3>Validated evidence</h3><ul>{}</ul>{}<table><thead><tr><th>{}</th>{}<th>{} {}</th></tr></thead><tbody>{}</tbody></table></section>".format(esc(saved.title or chart.title), esc(saved.scope), "<p><strong>Author note:</strong> {}</p>".format(esc(saved.annotation)) if saved.annotation else "", "".join("<li>{}</li>".format(esc(item)) for item in saved.evidence) or "<li>No summary evidence was available.</li>", "".join("<p class='warning'>{}</p>".format(esc(item)) for item in saved.warnings), esc(display_label(chart.dimension)), "<th>{}</th>".format(esc(display_label(chart.secondary_dimension))) if chart.secondary_dimension else "", esc(chart.aggregation), esc(display_label(chart.metric)), rows))
+    sections = "".join("<section class='card'><h2>{}</h2><p>{}</p>{}</section>".format(esc(section.heading), esc(section.commentary), "<h3>Recommended actions</h3><ul>{}</ul>".format("".join("<li>{}</li>".format(esc(action)) for action in section.recommended_actions)) if section.recommended_actions else "") for section in document.sections)
+    glossary = "".join("<li><strong>{}</strong> ({}) — {}</li>".format(esc(item["label"]), esc(item["kind"]), esc(item["description"])) for item in document.glossary) or "<li>No validated glossary entries yet.</li>"
+    notes = "".join("<li class='manual'><strong>Manual note:</strong> {}</li>".format(esc(note.text)) for note in document.manual_glossary_notes) or "<li class='manual'>No manual glossary notes.</li>"
+    artifact = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}.scope{{font-size:13px;color:#475569}}.manual{{color:#5b21b6}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p>Authored briefing from validated report run <code>{}</code>. Use your browser’s Print command to save as PDF.</p><section class='meta'><h2>Executive summary</h2><p>{}</p></section>{}<section class='meta'><h2>Validated artifacts and evidence</h2>{}</section><section class='meta'><h2>Glossary</h2><ul>{}</ul><h3>Author notes (not validated evidence)</h3><ul>{}</ul></section><section class='meta'><h2>Provenance</h2><p>Dataset checksum: <code>{}</code>. Source: {} / {}. Generated: {}. Artifact specifications and evidence are retained in the run manifest.</p></section></main></body></html>""".format(esc(document.title), esc(document.title), esc(run_id[:8]), esc(document.executive_summary) or "No executive summary supplied.", sections, "".join(artifact_parts) or "<section class='card'><p>No validated artifacts have been pinned.</p></section>", glossary, notes, esc(manifest["dataset_sha256"]), esc(metadata["source_type"]), esc(metadata["source_label"]), esc(manifest["generated_at"]))
+    compatibility_payload = json.dumps([chart.model_dump() for chart in charts]).replace("</", "<\\/")
+    artifact += f"<!-- validated-artifact-json: {compatibility_payload} -->"
+    return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-authored-report.html"'})
 
 def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tuple[ChartRequest | None, str | None]:
     """Ask the configured LLM for JSON intent only; never disclose rows or execute its SQL."""

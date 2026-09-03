@@ -312,22 +312,34 @@ def test_builds_pareto_and_two_dimension_chart_contracts() -> None:
     assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "chart_type": "heatmap"}).status_code == 422
 
 
-def test_builds_self_contained_report() -> None:
-    data = upload_csv("channel,net_sales\nOnline,100\nRetail,40\n")
-    response = client.post(f"/api/runs/{data['run_id']}/report", json={"title": "Sales report", "charts": [{"dimension": "channel", "metric": "net_sales"}]})
+def test_exports_persisted_authored_report_and_escapes_hostile_input() -> None:
+    data = upload_csv("channel,net_sales,email\nOnline,100,private@example.test\nRetail,40,private@example.test\n")
+    run_id = data["run_id"]
+    update = {
+        "title": "Sales <script>alert(1)</script> briefing",
+        "executive_summary": "<img src=x onerror=alert(1)> Executive conclusion",
+        "sections": [{"section_id": "findings", "heading": "Findings", "commentary": "<b>Comment</b>", "recommended_actions": ["Review retail mix"]}],
+        "pinned_artifacts": [{"artifact_id": "sales-by-channel", "chart": {"dimension": "channel", "metric": "net_sales"}, "annotation": "<i>Author annotation</i>"}],
+        "manual_glossary_notes": [{"note_id": "note-1", "text": "<script>bad()</script> manual context"}],
+    }
+    saved = client.put(f"/api/runs/{run_id}/custom-report", json=update)
+    assert saved.status_code == 200, saved.text
+    document = saved.json()
+    assert document["pinned_artifacts"][0]["evidence"]
+    assert "email" not in str(document)
+    response = client.get(f"/api/runs/{run_id}/report")
     assert response.status_code == 200, response.text
     assert "text/html" in response.headers["content-type"]
-    assert "Sales report" in response.text
-    assert "Online" in response.text
-    assert "100.0" in response.text
-    assert "Evidence-bound highlights" in response.text
-    assert "Online is the leading segment" in response.text
+    assert "Executive conclusion" in response.text
+    assert "Findings" in response.text and "Review retail mix" in response.text
+    assert "Validated artifacts and evidence" in response.text and "Provenance" in response.text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
+    assert "private@example.test" not in response.text
+    assert "browser’s Print command" in response.text
     from main import RUN_STORE
-    manifest = (RUN_STORE._dir(data["run_id"]) / "report.manifest.json").read_text()
+    manifest = (RUN_STORE._dir(run_id) / "report.manifest.json").read_text()
     assert 'dataset_sha256' in manifest
-    fetched_manifest = client.get(f"/api/runs/{data['run_id']}/manifest")
-    assert fetched_manifest.status_code == 200
-    assert fetched_manifest.json()["chart_count"] == 1
+    assert client.get(f"/api/runs/{run_id}/manifest").json()["chart_count"] == 1
 
 
 def test_rejects_unsupported_file() -> None:
