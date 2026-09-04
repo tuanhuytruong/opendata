@@ -3,7 +3,7 @@
 @theme { --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 body { background:#f1f5f9; color:#0f172a; font-family:var(--font-sans); }
 .font-display { font-family:var(--font-display); }
-.font-mono, .tabular-nums, .kpi-card b, .result-count, .data-table td { font-family:var(--font-mono); font-variant-numeric:tabular-nums; }.validated-chart { height:100%; min-height:0; font-variant-numeric:tabular-nums; }
+.font-mono, .tabular-nums, .kpi-card b, .result-count, .data-table td { font-family:var(--font-mono); font-variant-numeric:tabular-nums; }.validated-chart { height:100%; min-height:260px; font-variant-numeric:tabular-nums; }
 ::-webkit-scrollbar { width:6px; height:6px; } ::-webkit-scrollbar-thumb { background:#cbd5e1; border-radius:4px; }
 .app-header { height:66px; background:rgb(255 255 255 / .94); border-bottom:1px solid #e2e8f0; position:sticky; top:0; z-index:20; backdrop-filter:blur(12px); }
 .app-header-inner, .workspace-shell { width:min(100%, 1920px); margin-inline:auto; }

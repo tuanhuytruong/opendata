@@ -34,7 +34,7 @@ export default function ExecutiveChartCard({ instance, profile, language, onPin,
  }, [fingerprint]);
  const updateRequest = (next: ChartRequest) => { setResult(null); setRequest(next); };
  const grouped = Boolean(request.secondary_dimension);
- const types: ChartRequest['chart_type'][] = request.x_metric ? ['scatter'] : grouped ? ['bar', 'stacked_bar'] : ['bar', 'line', 'area', 'pie', 'donut'];
+ const types: ChartRequest['chart_type'][] = request.x_metric ? ['scatter'] : grouped ? ['bar', 'stacked_bar'] : ['bar', 'line', 'area', 'pie', 'donut']; // pareto/heatmap reserved server-side only
  const updateType = (chart_type: ChartRequest['chart_type']) => updateRequest({ ...request, chart_type, x_metric: chart_type === 'scatter' ? metrics.find(x => x.name !== request.metric)?.name : undefined });
  const pin = async () => { if (!result || loading || pinning) return; setPinning(true); try { onPin(instance.id, result, request); } finally { window.setTimeout(() => setPinning(false), 300); } };
  const viewRecords = () => { if (result && !loading) onViewRecords?.(result, request); };

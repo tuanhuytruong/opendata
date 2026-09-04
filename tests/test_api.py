@@ -809,3 +809,14 @@ def test_report_template_shape_cannot_replace_validated_artifacts() -> None:
     assert saved["sections"][0]["heading"] == "Key decisions"
     assert saved["pinned_artifacts"][0]["artifact_id"] == "validated"
     assert "FABRICATED" not in str(saved["pinned_artifacts"])
+
+def test_chart_rejects_identifier_dimension_secondary_and_filters() -> None:
+    data = upload_csv("customer_id,store,sales\nA1,North,100\nA2,North,90\nB1,South,75\nB2,South,25\n")
+    run_id = data["run_id"]
+    dimension = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "customer_id", "metric": "sales", "chart_type": "bar"})
+    assert dimension.status_code == 422
+    secondary = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "sales", "secondary_dimension": "customer_id", "chart_type": "stacked_bar"})
+    assert secondary.status_code == 422
+    filters = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "sales", "chart_type": "bar", "filters": [{"column": "customer_id", "operator": "equals", "value": "A1"}]})
+    assert filters.status_code == 422
+    assert client.get(f"/api/runs/{run_id}/values/customer_id").status_code == 422

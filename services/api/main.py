@@ -861,6 +861,9 @@ def export_data(run_id: str, page: int = 1, page_size: int = 25, search: str = "
 def values(run_id: str, column: str) -> dict[str, str | list[str]]:
     headers, rows = load_run(run_id)
     quote_identifier(column, headers)
+    values_profile = profile_for_run(run_id, headers, rows)
+    if any(item.name == column and item.kind == "id" for item in values_profile.columns):
+        raise HTTPException(422, "Identifier fields cannot be listed.")
     result = sorted({(row.get(column) or "").strip() for row in rows if (row.get(column) or "").strip()})[:100]
     return {"column": column, "values": result}
 
@@ -868,6 +871,14 @@ def values(run_id: str, column: str) -> dict[str, str | list[str]]:
 @app.post("/api/runs/{run_id}/chart", response_model=ChartResult)
 def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"] = "vi") -> ChartResult:
     headers, rows = load_run(run_id)
+    profile_guard = profile_for_run(run_id, headers, rows)
+    guard_profiles = {item.name: item for item in profile_guard.columns}
+    for role, column in (("dimension", request.dimension), ("secondary_dimension", request.secondary_dimension), ("x_metric", request.x_metric)):
+        if column and guard_profiles.get(column) and guard_profiles[column].kind == "id":
+            raise HTTPException(422, f"Identifier fields cannot be used as chart {role}.")
+    for item in request.filters:
+        if item.column in guard_profiles and guard_profiles[item.column].kind == "id":
+            raise HTTPException(422, "Identifier fields cannot be used in chart filters.")
     dimension = quote_identifier(request.dimension, headers)
     metric = quote_identifier(request.metric, headers)
     secondary = quote_identifier(request.secondary_dimension, headers) if request.secondary_dimension else None
@@ -1152,7 +1163,10 @@ def _report_chart_svg(chart: ChartResult) -> str:
             if chart.chart_type == "bar":
                 bar_width = max(5, step * .68)
                 bar_y, bar_height = min(y, baseline), abs(baseline - y)
-                svg.append(f"<rect x='{x - bar_width / 2:.1f}' y='{bar_y:.1f}' width='{bar_width:.1f}' height='{max(1, bar_height):.1f}' rx='2' fill='{colors[index % len(colors)]}'><title>{esc(label(row))}: {esc(row.get('formatted_value', value))}</title></rect>")
+                grouped_series = sorted({str(row.get("secondary_label")) for row in rows if row.get("secondary_label")})
+                fill = colors[index % len(colors)] if not grouped_series else colors[grouped_series.index(str(row.get("secondary_label"))) % len(colors)]
+                title_label = label(row) if not grouped_series else f"{label(row)} · {row.get('secondary_label')}"
+                svg.append(f"<rect x='{x - bar_width / 2:.1f}' y='{bar_y:.1f}' width='{bar_width:.1f}' height='{max(1, bar_height):.1f}' rx='2' fill='{fill}'><title>{esc(title_label)}: {esc(row.get('formatted_value', value))}</title></rect>")
             svg.append(f"<text x='{x:.1f}' y='{height - bottom + 18}' text-anchor='middle' font-size='11'>{esc(label(row)[:14])}</text>")
         if chart.chart_type in {"line", "area"}:
             point_string = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
