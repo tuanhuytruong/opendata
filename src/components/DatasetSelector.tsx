@@ -1,15 +1,16 @@
 import React, { useRef, useState } from 'react';
-import { AlertCircle, CheckCircle2, Database, LoaderCircle, Upload } from 'lucide-react';
+import { AlertCircle, Database, LoaderCircle, Upload } from 'lucide-react';
 import { DatasetProfile } from '../types';
 import { Language, text } from '../i18n';
 
 interface DatasetSelectorProps {
-  profile: DatasetProfile | null;
   language: Language;
   onProfile: (profile: DatasetProfile) => void;
+  onUploadStart?: (file: File) => void;
+  onUploadFailure?: () => void;
 }
 
-export default function DatasetSelector({ profile, language, onProfile }: DatasetSelectorProps) {
+export default function DatasetSelector({ language, onProfile, onUploadStart, onUploadFailure }: DatasetSelectorProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -17,6 +18,7 @@ export default function DatasetSelector({ profile, language, onProfile }: Datase
 
   const upload = async (file: File) => {
     if (!/\.(csv|xlsx)$/i.test(file.name)) { setError(text(language, 'uploadInvalid')); return; }
+    onUploadStart?.(file);
     setUploading(true); setError(null);
     try {
       const form = new FormData(); form.append('file', file);
@@ -24,7 +26,7 @@ export default function DatasetSelector({ profile, language, onProfile }: Datase
       const result = await response.json();
       if (!response.ok) throw new Error(result.detail || 'The profiling service rejected this file.');
       onProfile(result as DatasetProfile);
-    } catch (err) { setError(err instanceof Error ? err.message : 'Upload failed. Check that the report API is running.'); }
+    } catch (err) { onUploadFailure?.(); setError(err instanceof Error ? err.message : 'Upload failed. Check that the report API is running.'); }
     finally { setUploading(false); }
   };
 
@@ -37,6 +39,5 @@ export default function DatasetSelector({ profile, language, onProfile }: Datase
       <p className="text-xs text-slate-400 mt-1">100 MB · 600,000 rows</p>
     </div>
     {error && <div className="flex gap-2 p-3 mt-4 bg-rose-50 border border-rose-100 text-rose-700 rounded-xl text-xs"><AlertCircle className="w-4 h-4 shrink-0" />{error}</div>}
-    {profile && <div className="flex gap-2 p-3 mt-4 bg-emerald-50 border border-emerald-100 text-emerald-800 rounded-xl text-xs"><CheckCircle2 className="w-4 h-4 shrink-0" /><span><strong>{profile.file_name}</strong> · {profile.row_count.toLocaleString()} {text(language, 'rows')} · {profile.column_count} {text(language, 'columns')}</span></div>}
   </section>;
 }
