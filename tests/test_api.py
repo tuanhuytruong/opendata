@@ -228,7 +228,7 @@ def test_stream_chat_top_three_stores_sales_by_region_is_per_region_ranking() ->
     payload = response.text.split("event: completed\ndata: ", 1)[1].split("\n\n", 1)[0]
     body = json.loads(payload)["response"]
     assert body["planner"] == "deterministic"
-    assert body["title"] == "Top 3 Net Sales by Store per Region"
+    assert body["title"] == "Sales by Store and Region"
     chart = body["chart"]
     assert chart["metric"] == "NET_SALES"
     assert chart["dimension"] == "STORE"
@@ -436,8 +436,8 @@ def test_starter_views_are_dynamic_and_localized() -> None:
 
     assert en_card["request"]["metric"] in en_card["question"]
     assert en_card["request"]["dimension"] in en_card["question"]
-    assert "trend by" in en_card["title"].lower()
-    assert "xu hướng" in vi_card["title"].lower()
+    assert "by" in en_card["title"].lower()
+    assert "theo" in vi_card["title"].lower()
 
 
 def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> None:
@@ -448,7 +448,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     body = table.json()
     assert body["chart"] is None
     assert body["table"]
-    assert body["title"] == "Top 2 Net Sales by Channel"
+    assert body["title"] == "Top 2 Channel by Sales"
     assert body["answer"] == "I prepared a table of net_sales by channel."
     assert body["insight"] == "Online leads at 100."
     assert body["scope"] == "SUM net_sales by channel; 2 results, sorted ranking"
@@ -458,7 +458,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     assert chart.status_code == 200, chart.text
     chart_body = chart.json()
     assert chart_body["chart"] is not None
-    assert chart_body["chart"]["title"] == "Top 2 Net Sales by Channel"
+    assert chart_body["chart"]["title"] == "Top 2 Channel by Sales"
     assert chart_body["chart"]["insight_headline"] == "Online leads at 100."
 
 
@@ -494,7 +494,7 @@ def test_streaming_exact_top_stores_sales_by_region_uses_net_sales_and_top_three
     assert '"metric": "net_sales"' in stream.text
     assert '"dimension": "store"' in stream.text
     assert '"secondary_dimension": "region"' in stream.text
-    assert '"title": "Top 3 Net Sales by Store per Region"' in stream.text
+    assert '"title": "Sales by Store and Region"' in stream.text
     assert '"label": "North D"' not in stream.text
     assert '"label": "South D"' not in stream.text
     payload = stream.text.split("event: completed\ndata: ", 1)[1].split("\n\n", 1)[0]
@@ -567,7 +567,7 @@ def test_unclear_chat_never_defaults_to_first_metric_or_date_and_top_sites_alias
     assert sites.status_code == 200
     chart = sites.json()["chart"]
     assert chart["metric"] == "revenue" and chart["dimension"] == "site" and chart["secondary_dimension"] == "region"
-    assert chart["title"] == "Top 1 Revenue by SITE per Region"
+    assert chart["title"] == "Sales by SITE and Region"
 
 
 def test_data_explorer_paginates_searches_sorts_and_suppresses_sensitive_values() -> None:
@@ -738,3 +738,74 @@ def test_report_artifact_persists_validated_chart_snapshot() -> None:
     assert artifact["result"]["rows"][0]["label"] == "Online"
     exported = client.get(f"/api/runs/{data['run_id']}/report").text
     assert "Validated evidence" in exported and "Online" in exported
+
+
+def test_b2b_b2c_comparison_uses_schema_category_or_clarifies() -> None:
+    data = upload_csv("sale_date,business_model,net_sales\n2026-01-01,B2B,100\n2026-01-02,B2C,40\n2026-01-03,Other,999\n")
+    response = client.post(f"/api/runs/{data['run_id']}/chat", json={"message": "Compare B2B and B2C Sales", "language": "en"})
+    assert response.status_code == 200, response.text
+    chart = response.json()["chart"]
+    assert chart["dimension"] == "business_model"
+    assert chart["chart_type"] == "bar"
+    assert {row["label"] for row in chart["rows"]} == {"B2B", "B2C"}
+    assert chart["filters"] == [{"column": "business_model", "operator": "in", "value": "", "values": ["B2B", "B2C"]}]
+
+    missing = upload_csv("sale_date,region,net_sales\n2026-01-01,North,100\n")
+    clarification = client.post(f"/api/runs/{missing['run_id']}/chat", json={"message": "Compare B2B and B2C Sales", "language": "en"}).json()
+    assert clarification["mode"] == "clarification"
+    assert clarification["chart"] is None
+    assert "no unrelated trend" in clarification["answer"]
+
+
+def test_presentation_titles_and_data_handoff_filters_and_type_sorting() -> None:
+    data = upload_csv("sale_date,channel,net_sales\n2026-01-10,Beta,10\n2026-01-02,Alpha,2\n2026-01-03,Gamma,100\n2026-01-01,,\n")
+    run_id = data["run_id"]
+    chart = client.post(f"/api/runs/{run_id}/chart?language=en", json={"dimension": "sale_date", "metric": "net_sales", "chart_type": "line"})
+    assert chart.status_code == 200
+    assert chart.json()["title"] == "Sales Performance Over Time"
+    ranked = client.post(f"/api/runs/{run_id}/chart?language=en", json={"dimension": "channel", "metric": "net_sales", "chart_type": "bar"})
+    assert ranked.json()["title"] == "Top 3 Channel by Sales"
+
+    category_filters = '[{"column":"channel","operator":"in","values":["Alpha","Gamma"]}]'
+    scoped = client.get(f"/api/runs/{run_id}/data?page_size=10&filters={category_filters}")
+    assert scoped.status_code == 200, scoped.text
+    assert [row["channel"] for row in scoped.json()["rows"]] == ["Alpha", "Gamma"]
+    dates = '[{"column":"sale_date","operator":"date_range","values":["2026-01-02","2026-01-03"]}]'
+    dated = client.get(f"/api/runs/{run_id}/data?page_size=10&filters={dates}&sort_by=sale_date")
+    assert [row["sale_date"] for row in dated.json()["rows"]] == ["2026-01-02", "2026-01-03"]
+    assert client.get(f'/api/runs/{run_id}/data?page_size=10&filters=[{{"column":"channel","operator":"in","values":[]}}]').status_code == 422
+    assert client.get(f'/api/runs/{run_id}/data?page_size=10&filters=[{{"column":"channel","operator":"date_range","values":["x","y"]}}]').status_code == 422
+
+    numeric = client.get(f"/api/runs/{run_id}/data?page_size=10&sort_by=net_sales")
+    assert [row["net_sales"] for row in numeric.json()["rows"]][:3] == ["2", "10", "100"]
+    descending = client.get(f"/api/runs/{run_id}/data?page_size=10&sort_by=net_sales&sort_direction=desc")
+    assert [row["net_sales"] for row in descending.json()["rows"]][:3] == ["100", "10", "2"]
+
+
+def test_executive_overview_has_four_real_scorecards_and_eligible_visual_mix() -> None:
+    data = upload_csv(
+        "sale_date,store,division,channel,net_sales,quantity,cogs,gross_profit\n"
+        "2026-01-01,A,North,Online,100,4,60,40\n"
+        "2026-01-02,B,South,Retail,70,3,45,25\n"
+        "2026-01-03,A,North,Online,90,2,55,35\n"
+    )
+    body = client.get(f"/api/runs/{data['run_id']}/executive-overview?language=en").json()
+    assert len(body["scorecards"]) == 4
+    assert {card["metric"] for card in body["scorecards"]} == {"net_sales", "quantity", "cogs", "gross_profit"}
+    assert {card["label"] for card in body["scorecards"]}.isdisjoint({"MRR", "ARR"})
+    assert all(card["scope"].startswith("Full-dataset sum") for card in body["scorecards"])
+    assert [card["value"] for card in body["scorecards"]] == [260.0, 9.0, 160.0, 100.0]
+    chart_types = [chart["chart_type"] for chart in body["charts"]]
+    assert {"line", "area", "donut"}.issubset(chart_types)
+    assert chart_types.count("bar") >= 2
+
+
+def test_report_template_shape_cannot_replace_validated_artifacts() -> None:
+    data = upload_csv("channel,net_sales\nOnline,100\nRetail,40\n")
+    run_id = data["run_id"]
+    pinned = client.post(f"/api/runs/{run_id}/custom-report/artifacts", json={"artifact_id": "validated", "chart": {"dimension": "channel", "metric": "net_sales"}}).json()["pinned_artifacts"]
+    saved = client.put(f"/api/runs/{run_id}/custom-report", json={"title": "Executive Summary", "executive_summary": "Writing prompt only", "sections": [{"section_id": "decisions", "heading": "Key decisions", "commentary": "What should be decided?", "recommended_actions": ["Assign an owner"]}], "pinned_artifacts": [{**pinned[0], "evidence": ["FABRICATED"]}]}).json()
+    assert saved["title"] == "Executive Summary"
+    assert saved["sections"][0]["heading"] == "Key decisions"
+    assert saved["pinned_artifacts"][0]["artifact_id"] == "validated"
+    assert "FABRICATED" not in str(saved["pinned_artifacts"])

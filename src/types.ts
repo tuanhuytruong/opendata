@@ -3,14 +3,15 @@ export type ColumnKind = 'time' | 'num' | 'cat' | 'id' | 'unknown';
 export interface ColumnProfile { name: string; kind: ColumnKind; null_count: number; null_ratio: number; distinct_count: number; description: string; }
 export interface DatasetProfile { run_id: string; file_name: string; row_count: number; column_count: number; usable_column_count: number; columns: ColumnProfile[]; warnings: string[]; preview: Record<string, string>[]; profile_status?: 'sampled' | 'complete'; }
 export type ChartType = 'bar' | 'line' | 'area' | 'pie' | 'donut' | 'scatter' | 'pareto' | 'stacked_bar' | 'heatmap';
-export interface ChartRequest { dimension: string; metric: string; aggregation: 'sum' | 'avg' | 'count'; chart_type: ChartType; x_metric?: string; secondary_dimension?: string; limit_per_secondary?: boolean; limit: number; filters: Array<{ column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string }>; }
+export interface ChartRequest { dimension: string; metric: string; aggregation: 'sum' | 'avg' | 'count'; chart_type: ChartType; x_metric?: string; secondary_dimension?: string; limit_per_secondary?: boolean; limit: number; filters: Array<{ column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal' | 'in' | 'date_range'; value?: string; values?: string[] }>; }
 export interface ChartInstance { id: string; role: 'trend' | 'ranking' | 'custom'; title: string; request: ChartRequest; result?: ChartResult; status: 'idle' | 'loading' | 'refreshing' | 'ready' | 'error'; }
 export interface StarterView { id: string; title: string; rationale: string; request: ChartRequest; question?: string; }
 export interface ChartRow { label: string; display_label?: string; secondary_label?: string; value: number; x_value?: number; formatted_value?: string; cumulative_pct?: number; }
 export interface ChartResult { dimension: string; metric: string; aggregation: string; chart_type: ChartType; title: string; metric_display_name?: string; value_format?: { style: 'number'; precision: number; compact_precision: number }; secondary_dimension?: string; filters: ChartRequest['filters']; rows: ChartRow[]; warnings: string[]; sort_mode?: 'chronological' | 'ranking'; result_count?: number; insight_headline?: string; evidence?: string[]; }
 export interface ClarificationOption { column: string; label: string; reason: string; role: 'metric' | 'dimension'; }
 export interface ChatResult { answer: string; insight: string; scope: string; title?: string; chart?: ChartResult; table: ChartRow[]; caveats: string[]; clarification_options?: ClarificationOption[]; proposals?: StarterView[]; mode: 'analysis' | 'clarification'; planner: 'llm' | 'deterministic'; }
-export interface ExecutiveOverview { run_id: string; summary: string; charts: ChartResult[]; warnings: string[]; guardrail: string; }
+export interface ExecutiveScorecard { label: string; value: number; formatted_value: string; metric: string; aggregation: 'sum' | 'avg' | 'count'; scope: string; }
+export interface ExecutiveOverview { run_id: string; summary: string; scorecards: ExecutiveScorecard[]; charts: ChartResult[]; warnings: string[]; guardrail: string; }
 export interface ReportSection { section_id: string; heading: string; commentary: string; recommended_actions: string[]; }
 export interface ManualGlossaryNote { note_id: string; text: string; }
 export interface CustomReportArtifact { artifact_id: string; chart: ChartRequest; annotation: string; title: string; scope: string; evidence: string[]; warnings: string[]; result?: ChartResult | null; }
@@ -19,7 +20,7 @@ export interface EDAColumn { name: string; kind: ColumnKind; quality: { non_null
 export interface EDAResult { coverage: { row_count: number; column_count: number; analyzed_column_count: number; suppressed_sensitive_column_count: number; suppressed_column_count: number }; columns: EDAColumn[]; provenance: { dataset_sha256: string; source_type: string; source_label: string; analysis: string; top_category_limit: number }; guardrails: string[]; }
 export interface AnalystProposal { id: string; title: string; rationale: string; confidence: 'profile-based'; request: ChartRequest; }
 export interface AnalystPlan { summary: string; proposals: AnalystProposal[]; guardrail: string; }
-export interface DataFilter { column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal'; value: string; }
+export interface DataFilter { column: string; operator: 'equals' | 'not_equals' | 'greater_than' | 'greater_or_equal' | 'less_than' | 'less_or_equal' | 'in' | 'date_range'; value?: string; values?: string[]; }
 /** UI-only chart provenance. Filters still go through the existing validated data API. */
 export interface DeepDiveScope { title: string; aggregation: ChartRequest['aggregation']; metric: string; dimension: string; secondary_dimension?: string; filters: DataFilter[]; }
 export interface DataColumn { name: string; display_name: string; kind: ColumnKind; }

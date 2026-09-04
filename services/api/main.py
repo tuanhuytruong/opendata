@@ -32,7 +32,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from database_adapters import read_registered_source
 from formatting import compact_number, format_display_date, format_number, parse_date_value, percent, value_format_descriptor
-from planning import analyst_proposals, business_semantic_catalog, canonical_field_name, display_label, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, propose_charts
+from planning import analyst_proposals, business_semantic_catalog, canonical_field_name, comparison_target, display_label, executive_overview_proposals, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, presentation_title, propose_charts
 from source_registry import public_source, registered_sources
 from run_store import DurableJobQueue, RunStore
 
@@ -143,8 +143,16 @@ class DatasetProfile(BaseModel):
 
 class FilterSpec(BaseModel):
     column: str
-    operator: Literal["equals", "not_equals", "greater_than", "greater_or_equal", "less_than", "less_or_equal"] = "equals"
-    value: str = Field(min_length=1, max_length=500)
+    operator: Literal["equals", "not_equals", "greater_than", "greater_or_equal", "less_than", "less_or_equal", "in", "date_range"] = "equals"
+    value: str = Field(default="", max_length=500)
+    values: list[str] = Field(default_factory=list, max_length=30)
+
+    def model_post_init(self, __context: object) -> None:
+        if self.operator in {"in", "date_range"}:
+            if not self.values or any(not value or len(value) > 500 for value in self.values):
+                raise ValueError(f"{self.operator} requires non-empty values.")
+        elif not self.value:
+            raise ValueError("A filter value is required.")
 
 
 class DataQuery(BaseModel):
@@ -294,9 +302,19 @@ class ChartResult(BaseModel):
     evidence: list[str] = Field(default_factory=list)
 
 
+class ExecutiveScorecard(BaseModel):
+    label: str
+    value: float
+    formatted_value: str
+    metric: str
+    aggregation: Literal['sum', 'avg', 'count']
+    scope: str
+
+
 class ExecutiveOverview(BaseModel):
     run_id: str
     summary: str
+    scorecards: list[ExecutiveScorecard] = Field(default_factory=list)
     charts: list[ChartResult]
     warnings: list[str] = Field(default_factory=list)
     guardrail: str
@@ -593,7 +611,7 @@ def _data_query_from_params(page: int, page_size: int, search: str, sort_by: str
         raise HTTPException(422, "Invalid data query.") from error
 
 
-def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str]) -> tuple[str, list[str | float]]:
+def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str], profile_columns: dict[str, ColumnProfile]) -> tuple[str, list[str | float]]:
     """Build only parameterized predicates against non-sensitive, non-identifier fields."""
     clauses: list[str] = []
     parameters: list[str | float] = []
@@ -602,22 +620,32 @@ def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str]
         if item.column not in visible_headers:
             raise HTTPException(422, "Only non-sensitive, non-identifier columns can be used in data exploration.")
         field = quote_identifier(item.column, headers)
-        operator = operators[item.operator]
-        if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
-            if not is_number(item.value):
-                raise HTTPException(422, f"Numeric comparison requires a numeric value for {item.column}.")
-            clauses.append(f"TRY_CAST(REPLACE({field}, ',', '') AS DOUBLE) {operator} ?")
-            parameters.append(float(item.value.replace(",", "")))
-        else:
-            clauses.append(f"{field} {operator} ?")
-            parameters.append(item.value)
+        kind = profile_columns[item.column].kind
+        if item.operator == "in":
+            if kind not in {"cat", "time", "num"}: raise HTTPException(422, "IN filters require a categorical, time, or numeric field.")
+            clauses.append(f"{field} IN ({', '.join('?' for _ in item.values)})")
+            parameters.extend(item.values)
+        elif item.operator == "date_range":
+            if kind != "time" or len(item.values) != 2 or not all(is_date(value) for value in item.values):
+                raise HTTPException(422, f"date_range requires two valid dates for time field {item.column}.")
+            clauses.append(f"TRY_CAST({field} AS TIMESTAMP) BETWEEN TRY_CAST(? AS TIMESTAMP) AND TRY_CAST(? AS TIMESTAMP)")
+            parameters.extend(item.values)
+        elif item.operator in operators:
+            operator = operators[item.operator]
+            if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
+                if kind != "num" or not is_number(item.value):
+                    raise HTTPException(422, f"Numeric comparison requires a numeric value for {item.column}.")
+                clauses.append(f"TRY_CAST(REPLACE({field}, ',', '') AS DOUBLE) {operator} ?")
+                parameters.append(float(item.value.replace(',', '')))
+            else:
+                clauses.append(f"{field} {operator} ?")
+                parameters.append(item.value)
+        else: raise HTTPException(422, "Unsupported filter operator.")
     term = query.search.strip()
     if term:
-        # Search visible columns only, so a sensitive value can neither match nor leak.
         clauses.append("(" + " OR ".join(f"LOWER(COALESCE({quote_identifier(header, headers)}, '')) LIKE ?" for header in visible_headers) + ")")
         parameters.extend([f"%{term.lower()}%"] * len(visible_headers))
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", parameters
-
 
 def _run_data_query(run_id: str, query: DataQuery) -> tuple[list[str], list[dict[str, object]], int, list[dict[str, str]]]:
     headers, rows = load_run(run_id)
@@ -629,11 +657,16 @@ def _run_data_query(run_id: str, query: DataQuery) -> tuple[list[str], list[dict
     sort_identifier = quote_identifier(sort_column, headers)
     if sort_column not in visible_headers:
         raise HTTPException(422, "Sensitive columns cannot be used in filters, previews, or charts.")
-    where_clause, parameters = _data_where(query, headers, visible_headers)
+    where_clause, parameters = _data_where(query, headers, visible_headers, profile_columns)
     select_columns = ", ".join(quote_identifier(header, headers) for header in visible_headers)
-    # Add all visible columns as stable secondary keys so pagination has no ambiguous ties.
-    tie_breakers = ", ".join(f"{quote_identifier(header, headers)} ASC" for header in visible_headers if header != sort_column)
-    order_by = f"{sort_identifier} {query.sort_direction.upper()}" + (f", {tie_breakers}" if tie_breakers else "")
+    # Sort by inferred storage kind, with null/invalid values last in either direction.
+    sort_kind = profile_columns[sort_column].kind
+    if sort_kind == "num": sort_value = f"TRY_CAST(REPLACE({sort_identifier}, ',', '') AS DOUBLE)"
+    elif sort_kind == "time": sort_value = f"TRY_CAST({sort_identifier} AS TIMESTAMP)"
+    else: sort_value = f"{sort_identifier} COLLATE NOCASE"
+    invalid_last = f"CASE WHEN {sort_identifier} IS NULL OR TRIM({sort_identifier}) = '' OR {sort_value} IS NULL THEN 1 ELSE 0 END"
+    tie_breakers = ", ".join(f"{quote_identifier(header, headers)} COLLATE NOCASE ASC" for header in visible_headers if header != sort_column)
+    order_by = f"{invalid_last} ASC, {sort_value} {query.sort_direction.upper()}" + (f", {tie_breakers}" if tie_breakers else "")
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
@@ -862,6 +895,15 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     for item in request.filters:
         field = quote_identifier(item.column, headers)
         operators = {"equals": "=", "not_equals": "<>", "greater_than": ">", "greater_or_equal": ">=", "less_than": "<", "less_or_equal": "<="}
+        if item.operator == "in":
+            filter_clauses.append(f"{field} IN ({', '.join('?' for _ in item.values)})")
+            parameters.extend(item.values)
+            continue
+        if item.operator == "date_range":
+            if len(item.values) != 2 or not all(is_date(value) for value in item.values): raise HTTPException(422, f"date_range requires two valid dates for {item.column}.")
+            filter_clauses.append(f"TRY_CAST({field} AS TIMESTAMP) BETWEEN TRY_CAST(? AS TIMESTAMP) AND TRY_CAST(? AS TIMESTAMP)")
+            parameters.extend(item.values)
+            continue
         operator = operators[item.operator]
         if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
             if not is_number(item.value):
@@ -916,22 +958,19 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
             row["cumulative_pct"] = 0 if total == 0 else round(running / total * 100, 2)
     insight_headline, evidence = chart_insight(chart_rows, chronological, language)
     per_secondary = bool(secondary and request.limit_per_secondary)
-    label = ("Xu hướng" if chronological else f"Top {request.limit if per_secondary else len(chart_rows)}") if language == "vi" else ("Trend" if chronological else f"Top {request.limit if per_secondary else len(chart_rows)}")
-    if per_secondary:
-        title = f"{label} {display_label(request.metric)} theo {display_label(request.dimension)} trong mỗi {display_label(request.secondary_dimension or '')}" if language == "vi" else f"{label} {display_label(request.metric)} by {display_label(request.dimension)} per {display_label(request.secondary_dimension or '')}"
-    else:
-        title = (f"{label} {display_label(request.metric)} theo {display_label(request.dimension)}" if language == "vi" else f"{label} {display_label(request.metric)} by {display_label(request.dimension)}") + (f" × {display_label(request.secondary_dimension or '')}" if secondary else "")
+    title = presentation_title(request.metric, request.dimension, request.chart_type, language=language, limit=request.limit if per_secondary else len(chart_rows), secondary_dimension=request.secondary_dimension)
     return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
 
 
 @app.get("/api/runs/{run_id}/executive-overview", response_model=ExecutiveOverview)
 def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> ExecutiveOverview:
-    """Generate a bounded, read-only overview from validated server aggregates."""
+    """Generate only schema-derived, server-validated executive aggregates."""
     headers, rows = load_run(run_id)
     profile_data = profile_for_run(run_id, headers, rows)
+    proposals, omissions = executive_overview_proposals(profile_data.columns)
     charts: list[ChartResult] = []
-    warnings: list[str] = []
-    for proposal in analyst_proposals(profile_data.columns, max_charts=5, language=language):
+    warnings: list[str] = list(omissions)
+    for proposal in proposals:
         try:
             request = ChartRequest.model_validate(cast(dict[str, object], proposal["request"]))
             chart = build_chart(run_id, request, language)
@@ -941,10 +980,30 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
                 warnings.append(f"{chart.title}: " + (chart.warnings[0] if chart.warnings else "no matching values"))
         except (HTTPException, ValueError, TypeError) as error:
             warnings.append(str(getattr(error, "detail", error))[:220])
-    summary = (f"Bộ tổng quan gồm {len(charts)} biểu đồ aggregate đã xác thực từ {profile_data.row_count:,} dòng." if language == "vi" else f"This executive overview contains {len(charts)} validated aggregate charts from {profile_data.row_count:,} rows.")
-    guardrail = ("Các biểu đồ chỉ dùng aggregate run-scoped đã xác thực trên server; không dùng raw rows hoặc trường nhạy cảm." if language == "vi" else "Charts use only validated, run-scoped server aggregates; no raw rows or sensitive fields are used.")
-    return ExecutiveOverview(run_id=run_id, summary=summary, charts=charts, warnings=warnings, guardrail=guardrail)
-
+    catalog = business_semantic_catalog(profile_data.columns)
+    all_metrics = [item for item in [*catalog.sales_metrics, *catalog.quantity_metrics, *catalog.cost_metrics, *catalog.profit_metrics] if item is not None]
+    all_metrics.extend(item for item in profile_data.columns if item.kind == "num" and item not in all_metrics and not any(token in canonical_field_name(item.name) for token in ("id", "code", "key")))
+    scorecards: list[ExecutiveScorecard] = []
+    connection = duckdb.connect(":memory:")
+    try:
+        connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
+        for metric in all_metrics:
+            if len(scorecards) == 4:
+                break
+            identifier = quote_identifier(metric.name, headers)
+            value = connection.execute(f"SELECT SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) FROM dataset").fetchone()[0]
+            if value is None:
+                continue
+            label = display_label(metric.name)
+            scope = (f"Tổng {label} trên toàn bộ dataset" if language == "vi" else f"Full-dataset sum of {label}")
+            scorecards.append(ExecutiveScorecard(label=label, value=float(value), formatted_value=format_number(float(value)), metric=metric.name, aggregation="sum", scope=scope))
+    finally:
+        connection.close()
+    if len(scorecards) < 4:
+        warnings.append((f"Chỉ có {len(scorecards)} scorecard vì schema không có đủ bốn metric số an toàn." if language == "vi" else f"Only {len(scorecards)} scorecards are available because the schema has fewer than four safe numeric metrics."))
+    summary = (f"Bộ tổng quan gồm {len(scorecards)} scorecard và {len(charts)} biểu đồ aggregate đã xác thực từ {profile_data.row_count:,} dòng." if language == "vi" else f"This executive overview contains {len(scorecards)} validated scorecards and {len(charts)} validated aggregate charts from {profile_data.row_count:,} rows.")
+    guardrail = ("Scorecard và biểu đồ chỉ dùng aggregate run-scoped đã xác thực trên server; không dùng raw rows hoặc trường nhạy cảm." if language == "vi" else "Scorecards and charts use only validated, run-scoped server aggregates; no raw rows or sensitive fields are used.")
+    return ExecutiveOverview(run_id=run_id, summary=summary, scorecards=scorecards, charts=charts, warnings=warnings, guardrail=guardrail)
 
 def _custom_report_glossary(run_id: str, artifacts: list[CustomReportArtifact]) -> list[dict[str, str]]:
     headers, rows = load_run(run_id)
@@ -1423,6 +1482,11 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         state = _selection_artifact(run_id)
     selections = cast(list[dict[str, object]], state["selections"])
     exact_request = _top_stores_sales_by_region_request(profile_data.columns, request.message, selections)
+    comparison = comparison_target(profile_data.columns, request.message)
+    explicit_b2b_b2c = bool(re.search(r"\b(?:compare|comparison|vs|versus|so sánh)\b", canonical_field_name(request.message).replace("_", " ")) and re.search(r"\bb2b\b", request.message, re.I) and re.search(r"\bb2c\b", request.message, re.I))
+    if explicit_b2b_b2c and comparison is None:
+        answer = "I could not find a validated business-model or channel field to compare B2B and B2C, so no unrelated trend was run." if request.language == "en" else "Không tìm thấy trường mô hình kinh doanh hoặc kênh đã xác thực để so sánh B2B và B2C; chưa chạy xu hướng thay thế."
+        return ChatResponse(answer=answer, insight="No aggregate ran." if request.language == "en" else "Chưa chạy aggregate.", scope="Awaiting a comparison field" if request.language == "en" else "Chờ trường so sánh", caveats=[], clarification_options=[ClarificationOption(column=item.name, label=display_label(item.name), reason="Categorical comparison candidate.", role="dimension") for item in profile_data.columns if item.kind == "cat" and not is_sensitive_column(item.name)][:4], mode="clarification")
     if _has_explicit_unresolved_ranking(request.message) and exact_request is None:
         clarification = _ranking_clarification(profile_data.columns, request.message, request.language)
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {
@@ -1437,7 +1501,7 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
             },
         })
         return clarification
-    clarification_options = [] if exact_request else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
+    clarification_options = [] if (exact_request or comparison) else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})
         if request.language == "vi":
@@ -1449,6 +1513,11 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     planner = "llm" if llm_request else "deterministic"
     if exact_request:
         chart_request = exact_request
+    elif comparison:
+        metric = _chat_metric(profile_data.columns, request.message, selections)
+        if metric is None:
+            return ChatResponse(answer="I need a validated numeric sales metric before comparing B2B and B2C." if request.language == "en" else "Cần chỉ tiêu doanh số dạng số đã xác thực trước khi so sánh B2B và B2C.", insight="No aggregate ran." if request.language == "en" else "Chưa chạy aggregate.", scope="Awaiting metric" if request.language == "en" else "Chờ chỉ tiêu", caveats=[], mode="clarification")
+        chart_request = ChartRequest(dimension=comparison.column, metric=metric.name, aggregation="sum", chart_type="bar", limit=30, filters=[FilterSpec(column=comparison.column, operator="in", values=["B2B", "B2C"])])
     elif llm_request:
         chart_request = llm_request
     else:

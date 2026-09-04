@@ -10,6 +10,13 @@ export const formatChartValue = (value: number, language: Language) => formatNum
 /** Visual labels stay bounded; the chart exposes the full value through its tooltip and aria-label. */
 export const truncateChartLabel = (value: string, maxLength: number) => value.length > maxLength ? `${value.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…` : value;
 
+/** Keeps a categorical axis legible while preserving its complete text in tooltip and ARIA. */
+export const chartCategoryLabel = (value: string, plotWidth: number, categoryCount: number, horizontal = false) => {
+  const perCategory = horizontal ? 30 : Math.max(4, plotWidth / Math.max(1, categoryCount));
+  const maxLength = horizontal ? Math.min(34, Math.max(12, Math.floor(perCategory / 6))) : Math.min(18, Math.max(5, Math.floor(perCategory / 6)));
+  return truncateChartLabel(value, maxLength);
+};
+
 export const formatDataCell = (value: unknown, kind: ColumnKind, language: Language) => {
   const text = String(value ?? '');
   if (kind === 'num') { const number = Number(text.replaceAll(',', '')); return Number.isFinite(number) ? formatNumber(number, language) : text; }
