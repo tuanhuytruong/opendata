@@ -1,0 +1,15 @@
+import { Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, LabelList, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Scatter, ScatterChart, Tooltip, XAxis, YAxis } from 'recharts';
+import { ChartResult } from '../types';
+import { Language } from '../i18n';
+import { formatChartValue } from '../formatting';
+const colors = ['#4f46e5', '#0f766e', '#c2410c', '#be185d', '#0284c7', '#65a30d', '#9333ea', '#ea580c', '#475569', '#db2777'];
+export default function ValidatedChart({ result, language, report = false }: { result: ChartResult; language: Language; report?: boolean }) {
+ const metric = result.metric_display_name ?? result.metric; const compact = (value: number) => formatChartValue(value, language);
+ const tooltip = (value: number) => [compact(Number(value)), metric]; const label = (p: { value?: number }) => compact(Number(p.value ?? 0));
+ const common = <><CartesianGrid strokeDasharray="3 3" vertical={false}/><XAxis dataKey="display_label" interval={0} angle={result.sort_mode === 'chronological' ? -35 : 0} textAnchor={result.sort_mode === 'chronological' ? 'end' : 'middle'} height={result.sort_mode === 'chronological' ? 58 : 30} tick={{ fontSize: 10 }}/><YAxis tickFormatter={compact} tick={{ fontSize: 10 }} width={52}/><Tooltip formatter={tooltip} labelFormatter={(_, payload) => payload[0]?.payload?.display_label ?? ''}/></>;
+ if (result.chart_type === 'pie' || result.chart_type === 'donut') return <ResponsiveContainer width="100%" height="100%"><PieChart><Tooltip formatter={tooltip}/><Legend verticalAlign="bottom" wrapperStyle={{fontSize: 11}}/><Pie data={result.rows} dataKey="value" nameKey="display_label" outerRadius="72%" label={label} innerRadius={result.chart_type === 'donut' ? '42%' : 0}>{result.rows.map((_, i) => <Cell key={i} fill={colors[i % colors.length]}/>)}</Pie></PieChart></ResponsiveContainer>;
+ if (result.chart_type === 'scatter') return <ResponsiveContainer width="100%" height="100%"><ScatterChart><CartesianGrid/><XAxis dataKey="x_value" tickFormatter={compact}/><YAxis dataKey="value" tickFormatter={compact}/><Tooltip formatter={tooltip}/><Scatter data={result.rows} fill={colors[0]}><LabelList dataKey="value" content={label}/></Scatter></ScatterChart></ResponsiveContainer>;
+ if (result.chart_type === 'line') return <ResponsiveContainer width="100%" height="100%"><LineChart data={result.rows}>{common}<Line type="monotone" dataKey="value" stroke={colors[0]} strokeWidth={2} dot={{r: 3}}><LabelList dataKey="value" content={label}/></Line></LineChart></ResponsiveContainer>;
+ if (result.chart_type === 'area') return <ResponsiveContainer width="100%" height="100%"><AreaChart data={result.rows}>{common}<Area type="monotone" dataKey="value" stroke={colors[0]} fill="#c7d2fe"><LabelList dataKey="value" content={label}/></Area></AreaChart></ResponsiveContainer>;
+ return <ResponsiveContainer width="100%" height="100%"><BarChart data={result.rows}>{common}<Bar dataKey="value" fill={colors[0]} radius={[4,4,0,0]}><LabelList dataKey="value" position="top" formatter={compact}/></Bar></BarChart></ResponsiveContainer>;
+}

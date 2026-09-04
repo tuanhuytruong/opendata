@@ -5,6 +5,8 @@ const locale = (language: Language) => language === 'vi' ? 'vi-VN' : 'en-US';
 export const formatNumber = (value: number, language: Language, compact = false) => new Intl.NumberFormat(locale(language), {
   notation: compact ? 'compact' : 'standard', maximumFractionDigits: compact ? 1 : 2,
 }).format(Number(value));
+/** One compact format contract for axes, labels, and chart tooltips. */
+export const formatChartValue = (value: number, language: Language) => formatNumber(value, language, true);
 
 export const formatDataCell = (value: unknown, kind: ColumnKind, language: Language) => {
   const text = String(value ?? '');

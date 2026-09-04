@@ -97,7 +97,7 @@ def business_semantic_catalog(columns: Iterable[object]) -> BusinessSemanticCata
 
     return BusinessSemanticCatalog(
         sales_metrics=matching("num", (
-            "net_sales", "sale_excl_vat", "sales_excl_vat", "revenue_excl_vat",
+            "net_sales", "sale_excl_vat", "sales_excl_vat", "excl_vat", "revenue_excl_vat",
             "total_net_sales", "total_sales", "sales", "revenue", "gross_sales",
         )),
         profit_metrics=matching("num", ("gross_profit", "net_profit", "profit", "margin")),

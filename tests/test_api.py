@@ -361,6 +361,8 @@ def test_exports_persisted_authored_report_and_escapes_hostile_input() -> None:
     assert "Executive conclusion" in response.text
     assert "Findings" in response.text and "Review retail mix" in response.text
     assert "Validated artifacts and evidence" in response.text and "Provenance" in response.text
+    assert "<svg" in response.text and "class='report-chart'" in response.text
+    assert "Accessible data table for" in response.text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
     assert "private@example.test" not in response.text
     assert "browser’s Print command" in response.text
@@ -641,3 +643,55 @@ def test_business_aliases_resolve_sale_excl_vat_for_store_ranking_and_monthly_re
     assert proposal["request"]["dimension"] == "SALE_DATE"
     executed = client.post(f"/api/runs/{run_id}/chart", json=proposal["request"])
     assert executed.status_code == 200, executed.text
+
+
+def test_sale_excl_vat_channel_alias_and_missing_region_are_actionable() -> None:
+    data = upload_csv("SALE_DATE,SITE_NAME,CHANNEL,SALE_EXCL_VAT,EXCL_VAT,QUANTITY,COST\n2026-01-01,A,Online,100,90,1,40\n2026-01-02,B,Retail,60,50,1,25\n")
+    run_id = data["run_id"]
+    channel = client.post(f"/api/runs/{run_id}/chat", json={"message": "top 3 channel by sale excl vat", "language": "en"})
+    assert channel.status_code == 200, channel.text
+    assert channel.json()["chart"]["dimension"] == "CHANNEL"
+    assert channel.json()["chart"]["metric"] == "SALE_EXCL_VAT"
+    missing = client.post(f"/api/runs/{run_id}/chat", json={"message": "top 3 stores each region by sales", "language": "en"}).json()
+    assert missing["mode"] == "clarification"
+    assert "Region is not available" in missing["answer"]
+    assert any(option["column"] == "CHANNEL" for option in missing["clarification_options"])
+
+def test_custom_report_put_rebuilds_fabricated_artifact_snapshot() -> None:
+    data = upload_csv("channel,net_sales\nOnline,100\nRetail,40\n")
+    run_id = data["run_id"]
+    saved = client.put(f"/api/runs/{run_id}/custom-report", json={
+        "pinned_artifacts": [{
+            "artifact_id": "untrusted-artifact",
+            "chart": {"dimension": "channel", "metric": "net_sales"},
+            "annotation": "Author supplied annotation remains allowed.",
+            "title": "FABRICATED TITLE",
+            "scope": "FABRICATED SCOPE",
+            "evidence": ["FABRICATED EVIDENCE"],
+            "warnings": ["FABRICATED WARNING"],
+            "result": {
+                "dimension": "channel", "metric": "net_sales", "aggregation": "sum", "chart_type": "bar",
+                "title": "FABRICATED RESULT", "metric_display_name": "Fake", "value_format": {},
+                "rows": [{"label": "FABRICATED ROW", "display_label": "FABRICATED ROW", "value": 999999, "formatted_value": "999999"}],
+                "warnings": ["FABRICATED RESULT WARNING"], "sort_mode": "ranking", "result_count": 1,
+                "insight_headline": "FABRICATED INSIGHT", "evidence": ["FABRICATED RESULT EVIDENCE"], "filters": [],
+            },
+        }],
+    })
+    assert saved.status_code == 200, saved.text
+    artifact = saved.json()["pinned_artifacts"][0]
+    assert artifact["annotation"] == "Author supplied annotation remains allowed."
+    assert artifact["title"] != "FABRICATED TITLE"
+    assert artifact["scope"] != "FABRICATED SCOPE"
+    assert "FABRICATED" not in str(artifact)
+    assert artifact["result"]["rows"][0]["label"] == "Online"
+    assert artifact["evidence"]
+
+
+def test_report_artifact_persists_validated_chart_snapshot() -> None:
+    data = upload_csv("channel,net_sales\nOnline,100\nRetail,40\n")
+    doc = client.post(f"/api/runs/{data['run_id']}/custom-report/artifacts", json={"artifact_id": "snapshot", "chart": {"dimension": "channel", "metric": "net_sales"}}).json()
+    artifact = doc["pinned_artifacts"][0]
+    assert artifact["result"]["rows"][0]["label"] == "Online"
+    exported = client.get(f"/api/runs/{data['run_id']}/report").text
+    assert "Validated evidence" in exported and "Online" in exported

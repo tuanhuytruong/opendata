@@ -199,6 +199,8 @@ class CustomReportArtifact(BaseModel):
     scope: str = ""
     evidence: list[str] = Field(default_factory=list, max_length=20)
     warnings: list[str] = Field(default_factory=list, max_length=20)
+    # Immutable server-validated result retained as report evidence; never client supplied.
+    result: ChartResult | None = None
 
 
 class CustomReportDocument(BaseModel):
@@ -952,6 +954,11 @@ def _custom_report_glossary(run_id: str, artifacts: list[CustomReportArtifact]) 
 
 
 def _report_artifact(run_id: str, artifact: CustomReportArtifact) -> CustomReportArtifact:
+    """Rebuild the immutable report snapshot; client artifact metadata is never trusted."""
+    # CustomReportUpdate accepts the complete document for editor convenience.  Only
+    # the chart specification and author annotation are client-authored, however:
+    # title, scope, evidence, warnings, and result must always be derived from this
+    # run's data at write time.
     chart = build_chart(run_id, artifact.chart)
     scope = f"{chart.aggregation} of {display_label(chart.metric)} by {display_label(chart.dimension)}"
     if chart.secondary_dimension:
@@ -959,7 +966,7 @@ def _report_artifact(run_id: str, artifact: CustomReportArtifact) -> CustomRepor
     if chart.filters:
         scope += "; filtered to " + "; ".join(f"{display_label(item.column)} {item.operator.replace('_', ' ')} {item.value}" for item in chart.filters)
     scope += f"; top {chart.result_count or len(chart.rows)} {chart.sort_mode or 'results'}."
-    return CustomReportArtifact(artifact_id=artifact.artifact_id, chart=artifact.chart, annotation=artifact.annotation, title=chart.title, scope=scope, evidence=chart.evidence, warnings=chart.warnings)
+    return CustomReportArtifact(artifact_id=artifact.artifact_id, chart=artifact.chart, annotation=artifact.annotation, title=chart.title, scope=scope, evidence=chart.evidence, warnings=chart.warnings, result=chart)
 
 
 def _custom_report_document(run_id: str, update: CustomReportUpdate | None = None) -> CustomReportDocument:
@@ -1006,6 +1013,100 @@ def get_manifest(run_id: str) -> dict[str, object]:
     return RUN_STORE.artifact_json(run_id, "report.manifest.json")
 
 
+def _report_chart_svg(chart: ChartResult) -> str:
+    """Render a deterministic, self-contained SVG from a validated chart snapshot."""
+    esc = lambda value: html.escape(str(value), quote=True)
+    rows = chart.rows[:30]
+    width, height = 760, 360
+    left, top, right, bottom = 66, 38, 24, 66
+    plot_width, plot_height = width - left - right, height - top - bottom
+    title = f"{chart.title} ({chart.chart_type} chart)"
+    description = f"{chart.aggregation} of {chart.metric_display_name or display_label(chart.metric)} by {display_label(chart.dimension)}. " + "; ".join(
+        f"{row.get('display_label') or row.get('label', '')}: {row.get('formatted_value') or row.get('value', 0)}"
+        for row in rows
+    )
+    if not rows:
+        return (f"<svg class='report-chart' viewBox='0 0 {width} {height}' role='img' aria-labelledby='chart-title chart-desc' "
+                f"xmlns='http://www.w3.org/2000/svg'><title id='chart-title'>{esc(title)}</title><desc id='chart-desc'>{esc(description)}</desc>"
+                f"<text x='{width / 2}' y='{height / 2}' text-anchor='middle'>No validated chart values are available.</text></svg>")
+
+    def numeric(row: dict[str, str | float | int], key: str = "value") -> float:
+        try:
+            value = float(row.get(key, 0) or 0)
+            return value if math.isfinite(value) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def label(row: dict[str, str | float | int]) -> str:
+        return str(row.get("display_label") or row.get("label") or "")
+
+    svg = [f"<svg class='report-chart' viewBox='0 0 {width} {height}' role='img' aria-labelledby='chart-title chart-desc' xmlns='http://www.w3.org/2000/svg'>",
+           f"<title id='chart-title'>{esc(title)}</title><desc id='chart-desc'>{esc(description)}</desc>",
+           "<rect width='100%' height='100%' rx='10' fill='#f8fafc'/>"]
+    values = [numeric(row) for row in rows]
+    colors = ("#2563eb", "#0d9488", "#7c3aed", "#ea580c", "#db2777", "#0891b2", "#65a30d", "#ca8a04")
+
+    if chart.chart_type in {"pie", "donut"}:
+        positive = [max(0.0, value) for value in values]
+        total = sum(positive)
+        center_x, center_y, radius = width / 2, height / 2, min(plot_height / 2 - 12, 118)
+        if total <= 0:
+            svg.append(f"<text x='{center_x}' y='{center_y}' text-anchor='middle'>No positive values to chart.</text>")
+        else:
+            angle = -math.pi / 2
+            for index, (row, value) in enumerate(zip(rows, positive)):
+                sweep = value / total * math.tau
+                end = angle + sweep
+                x1, y1 = center_x + radius * math.cos(angle), center_y + radius * math.sin(angle)
+                x2, y2 = center_x + radius * math.cos(end), center_y + radius * math.sin(end)
+                large = 1 if sweep > math.pi else 0
+                path = f"M {center_x:.1f} {center_y:.1f} L {x1:.1f} {y1:.1f} A {radius:.1f} {radius:.1f} 0 {large} 1 {x2:.1f} {y2:.1f} Z"
+                svg.append(f"<path d='{path}' fill='{colors[index % len(colors)]}'><title>{esc(label(row))}: {esc(row.get('formatted_value', value))}</title></path>")
+                angle = end
+            if chart.chart_type == "donut":
+                svg.append(f"<circle cx='{center_x}' cy='{center_y}' r='{radius * .52:.1f}' fill='#f8fafc'/><text x='{center_x}' y='{center_y + 5}' text-anchor='middle' font-weight='700'>{esc(format_number(total))}</text>")
+            for index, row in enumerate(rows[:8]):
+                y = top + index * 24
+                svg.append(f"<rect x='{width - 205}' y='{y - 10}' width='12' height='12' fill='{colors[index % len(colors)]}'/><text x='{width - 188}' y='{y}' font-size='12'>{esc(label(row)[:24])}: {esc(row.get('formatted_value', values[index]))}</text>")
+    elif chart.chart_type == "scatter":
+        x_values = [numeric(row, "x_value") for row in rows]
+        x_min, x_max = min(x_values), max(x_values)
+        y_min, y_max = min(values), max(values)
+        x_span, y_span = max(1.0, x_max - x_min), max(1.0, y_max - y_min)
+        svg.append(f"<path d='M {left} {top} V {height - bottom} H {width - right}' stroke='#64748b' fill='none'/>")
+        for index, (row, x_value, value) in enumerate(zip(rows, x_values, values)):
+            x = left + (x_value - x_min) / x_span * plot_width
+            y = top + (y_max - value) / y_span * plot_height
+            svg.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='5' fill='{colors[index % len(colors)]}'><title>{esc(label(row))}: {esc(row.get('formatted_value', value))}</title></circle>")
+        svg.append(f"<text x='{left}' y='{height - 18}' font-size='12'>{esc(format_number(x_min))}</text><text x='{width - right}' y='{height - 18}' text-anchor='end' font-size='12'>{esc(format_number(x_max))}</text>")
+    else:
+        minimum, maximum = min(0.0, min(values)), max(0.0, max(values))
+        span = max(1.0, maximum - minimum)
+        baseline = top + (maximum / span) * plot_height
+        svg.append(f"<path d='M {left} {baseline:.1f} H {width - right}' stroke='#64748b' fill='none'/>")
+        points: list[tuple[float, float]] = []
+        step = plot_width / max(1, len(rows))
+        for index, (row, value) in enumerate(zip(rows, values)):
+            x = left + step * (index + .5)
+            y = top + (maximum - value) / span * plot_height
+            points.append((x, y))
+            if chart.chart_type == "bar":
+                bar_width = max(5, step * .68)
+                bar_y, bar_height = min(y, baseline), abs(baseline - y)
+                svg.append(f"<rect x='{x - bar_width / 2:.1f}' y='{bar_y:.1f}' width='{bar_width:.1f}' height='{max(1, bar_height):.1f}' rx='2' fill='{colors[index % len(colors)]}'><title>{esc(label(row))}: {esc(row.get('formatted_value', value))}</title></rect>")
+            svg.append(f"<text x='{x:.1f}' y='{height - bottom + 18}' text-anchor='middle' font-size='11'>{esc(label(row)[:14])}</text>")
+        if chart.chart_type in {"line", "area"}:
+            point_string = " ".join(f"{x:.1f},{y:.1f}" for x, y in points)
+            if chart.chart_type == "area":
+                svg.append(f"<path d='M {points[0][0]:.1f},{baseline:.1f} L {point_string} L {points[-1][0]:.1f},{baseline:.1f} Z' fill='#93c5fd' opacity='.7'/>")
+            svg.append(f"<polyline points='{point_string}' fill='none' stroke='#2563eb' stroke-width='3'/>")
+            for (row, value), (x, y) in zip(zip(rows, values), points):
+                svg.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='4' fill='#1d4ed8'><title>{esc(label(row))}: {esc(row.get('formatted_value', value))}</title></circle>")
+        svg.append(f"<text x='{left - 8}' y='{top + 4}' text-anchor='end' font-size='12'>{esc(format_number(maximum))}</text><text x='{left - 8}' y='{height - bottom + 4}' text-anchor='end' font-size='12'>{esc(format_number(minimum))}</text>")
+    svg.append("</svg>")
+    return "".join(svg)
+
+
 @app.get("/api/runs/{run_id}/report", response_class=HTMLResponse)
 @app.post("/api/runs/{run_id}/report", response_class=HTMLResponse)
 def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLResponse:
@@ -1013,7 +1114,8 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     document = _custom_report_document(run_id)
     if request is not None and not document.pinned_artifacts:
         document = _custom_report_document(run_id, CustomReportUpdate(title=request.title, pinned_artifacts=[CustomReportArtifact(artifact_id=f"legacy-{index}", chart=chart) for index, chart in enumerate(request.charts)]))
-    charts = [build_chart(run_id, item.chart) for item in document.pinned_artifacts]
+    # Export exactly the persisted validated evidence; old artifacts are hydrated on read/save.
+    charts = [item.result or build_chart(run_id, item.chart) for item in document.pinned_artifacts]
     evidence = [fact for chart in charts for fact in evidence_for_chart(chart)]
     metadata = RUN_STORE.metadata(run_id)
     manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256(RUN_STORE.dataset_path(run_id).read_bytes()).hexdigest(), "source_type": metadata["source_type"], "source_label": metadata["source_label"], "chart_specs": [item.chart.model_dump() for item in document.pinned_artifacts], "chart_count": len(charts), "evidence": evidence, "document_updated_at": document.updated_at}
@@ -1022,11 +1124,11 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     artifact_parts = []
     for saved, chart in zip(document.pinned_artifacts, charts):
         rows = "".join("<tr><td>{}</td>{}<td>{}</td></tr>".format(esc(row.get("display_label") or row["label"]), "<td>{}</td>".format(esc(row.get("secondary_label") or "")) if chart.secondary_dimension else "", esc(row.get("formatted_value", row["value"]))) for row in chart.rows)
-        artifact_parts.append("<section class='card'><h2>{}</h2><p class='scope'>{}</p>{}<h3>Validated evidence</h3><ul>{}</ul>{}<table><thead><tr><th>{}</th>{}<th>{} {}</th></tr></thead><tbody>{}</tbody></table></section>".format(esc(saved.title or chart.title), esc(saved.scope), "<p><strong>Author note:</strong> {}</p>".format(esc(saved.annotation)) if saved.annotation else "", "".join("<li>{}</li>".format(esc(item)) for item in saved.evidence) or "<li>No summary evidence was available.</li>", "".join("<p class='warning'>{}</p>".format(esc(item)) for item in saved.warnings), esc(display_label(chart.dimension)), "<th>{}</th>".format(esc(display_label(chart.secondary_dimension))) if chart.secondary_dimension else "", esc(chart.aggregation), esc(display_label(chart.metric)), rows))
+        artifact_parts.append("<section class='card'><h2>{}</h2><p class='scope'>{}</p>{}<div class='chart-visual'>{}</div><h3>Validated evidence</h3><ul>{}</ul>{}<table><caption>Accessible data table for {}</caption><thead><tr><th>{}</th>{}<th>{} {}</th></tr></thead><tbody>{}</tbody></table></section>".format(esc(saved.title or chart.title), esc(saved.scope), "<p><strong>Author note:</strong> {}</p>".format(esc(saved.annotation)) if saved.annotation else "", _report_chart_svg(chart), "".join("<li>{}</li>".format(esc(item)) for item in saved.evidence) or "<li>No summary evidence was available.</li>", esc(saved.title or chart.title), "".join("<p class='warning'>{}</p>".format(esc(item)) for item in saved.warnings), esc(display_label(chart.dimension)), "<th>{}</th>".format(esc(display_label(chart.secondary_dimension))) if chart.secondary_dimension else "", esc(chart.aggregation), esc(display_label(chart.metric)), rows))
     sections = "".join("<section class='card'><h2>{}</h2><p>{}</p>{}</section>".format(esc(section.heading), esc(section.commentary), "<h3>Recommended actions</h3><ul>{}</ul>".format("".join("<li>{}</li>".format(esc(action)) for action in section.recommended_actions)) if section.recommended_actions else "") for section in document.sections)
     glossary = "".join("<li><strong>{}</strong> ({}) — {}</li>".format(esc(item["label"]), esc(item["kind"]), esc(item["description"])) for item in document.glossary) or "<li>No validated glossary entries yet.</li>"
     notes = "".join("<li class='manual'><strong>Manual note:</strong> {}</li>".format(esc(note.text)) for note in document.manual_glossary_notes) or "<li class='manual'>No manual glossary notes.</li>"
-    artifact = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}.scope{{font-size:13px;color:#475569}}.manual{{color:#5b21b6}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p>Authored briefing from validated report run <code>{}</code>. Use your browser’s Print command to save as PDF.</p><section class='meta'><h2>Executive summary</h2><p>{}</p></section>{}<section class='meta'><h2>Validated artifacts and evidence</h2>{}</section><section class='meta'><h2>Glossary</h2><ul>{}</ul><h3>Author notes (not validated evidence)</h3><ul>{}</ul></section><section class='meta'><h2>Provenance</h2><p>Dataset checksum: <code>{}</code>. Source: {} / {}. Generated: {}. Artifact specifications and evidence are retained in the run manifest.</p></section></main></body></html>""".format(esc(document.title), esc(document.title), esc(run_id[:8]), esc(document.executive_summary) or "No executive summary supplied.", sections, "".join(artifact_parts) or "<section class='card'><p>No validated artifacts have been pinned.</p></section>", glossary, notes, esc(manifest["dataset_sha256"]), esc(metadata["source_type"]), esc(metadata["source_label"]), esc(manifest["generated_at"]))
+    artifact = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}.scope{{font-size:13px;color:#475569}}.manual{{color:#5b21b6}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p>Authored briefing from validated report run <code>{}</code>. Use your browser’s Print command to save as PDF.</p><section class='meta'><h2>Executive summary</h2><p>{}</p></section>{}<section class='meta'><h2>Validated artifacts and evidence</h2>{}</section><section class='meta'><h2>Glossary</h2><ul>{}</ul><h3>Author notes (not validated evidence)</h3><ul>{}</ul></section><section class='meta'><h2>Provenance</h2><p>Dataset checksum: <code>{}</code>. Source: {} / {}. Generated: {}. Artifact specifications and evidence are retained in the run manifest.</p></section></main></body></html>""".format(esc(document.title), esc(document.title), esc(run_id[:8]), esc(document.executive_summary) or "No executive summary supplied.", sections, "".join(artifact_parts) or "<section class='card'><p>No validated artifacts have been pinned.</p></section>", glossary, notes, esc(manifest["dataset_sha256"]), esc(metadata["source_type"]), esc(metadata["source_label"]), esc(manifest["generated_at"]))
     compatibility_payload = json.dumps([chart.model_dump() for chart in charts]).replace("</", "<\\/")
     artifact += f"<!-- validated-artifact-json: {compatibility_payload} -->"
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-authored-report.html"'})
@@ -1119,9 +1221,9 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
     dimensions = [item for item in columns if item.kind in {"time", "cat"}]
     catalog = business_semantic_catalog(columns)
-    requested_business_metric = any(word in normalized for word in {"doanh thu", "revenue", "sales", "lợi nhuận", "profit", "margin", "chi phí", "cost", "số lượng", "quantity"})
+    requested_business_metric = any(word in normalized for word in {"doanh thu", "revenue", "sales", "sale", "excl vat", "lợi nhuận", "profit", "margin", "chi phí", "cost", "số lượng", "quantity"})
     semantic_metric = (
-        catalog.metric("sales") if any(word in normalized for word in {"doanh thu", "revenue", "sales"}) else
+        catalog.metric("sales") if any(word in normalized for word in {"doanh thu", "revenue", "sales", "sale", "excl vat"}) else
         catalog.metric("profit") if any(word in normalized for word in {"lợi nhuận", "profit", "margin"}) else
         catalog.metric("cost") if any(word in normalized for word in {"chi phí", "cost"}) else
         catalog.metric("quantity") if any(word in normalized for word in {"số lượng", "quantity"}) else None
@@ -1144,7 +1246,7 @@ def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: s
     normalized = canonical_field_name(message).replace("_", " ")
     top = re.search(r"(?:top|highest|cao nhat)\s+(\d{1,2})", normalized)
     wants_store = bool(re.search(r"\b(?:store|stores|site|sites|cua hang)\b", normalized))
-    wants_sales = bool(re.search(r"\b(?:sales?|revenue|doanh thu)\b", normalized))
+    wants_sales = bool(re.search(r"\b(?:sales?|sale|revenue|doanh thu|excl vat|vat excluded)\b", normalized))
     wants_region = bool(re.search(r"\b(?:region|regions|vung|mien)\b", normalized))
     if not top or not wants_store or not wants_sales:
         return None
@@ -1158,13 +1260,27 @@ def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: s
 
 def _has_explicit_unresolved_ranking(message: str) -> bool:
     normalized = canonical_field_name(message).replace("_", " ")
-    return bool(re.search(r"(?:top|highest|cao nhat)\s+\d", normalized) and re.search(r"\b(?:store|stores|site|sites|cua hang|region|regions|vung|mien|sales?|revenue|doanh thu)\b", normalized))
+    # This guard protects the compound store/region contract only. Other ranked
+    # dimensions (for example channel by sales) proceed through normal resolution.
+    return bool(re.search(r"(?:top|highest|cao nhat)\s+\d", normalized) and re.search(r"\b(?:store|stores|site|sites|cua hang|region|regions|vung|mien)\b", normalized))
 
 
-def _ranking_clarification(language: Literal["en", "vi"]) -> ChatResponse:
+def _ranking_clarification(columns: list[ColumnProfile], message: str, language: Literal["en", "vi"]) -> ChatResponse:
+    """Name the missing requested role instead of issuing a generic rejection."""
+    normalized = canonical_field_name(message).replace("_", " ")
+    wants_region = bool(re.search(r"\b(?:region|regions|vung|mien)\b", normalized))
+    catalog = business_semantic_catalog(columns)
+    has_region = any(item.kind == "cat" and canonical_field_name(item.name) in {"region", "sales_region", "area", "territory", "vung", "mien"} for item in columns)
+    candidates = [item for item in columns if item.kind == "cat" and item != catalog.location()][:4]
+    options = [ClarificationOption(column=item.name, label=display_label(item.name), reason="Available categorical grouping candidate." if language == "en" else "Ứng viên nhóm phân loại hiện có.", role="dimension") for item in candidates]
+    if wants_region and not has_region:
+        names = ", ".join(display_label(item.name) for item in candidates) or ("no safe categorical fields" if language == "en" else "không có trường phân loại an toàn")
+        answer = (f"Region is not available in this dataset, so I cannot rank stores within each Region. Available grouping columns: {names}." if language == "en" else f"Dataset này không có trường Region nên không thể xếp hạng cửa hàng theo từng Region. Các cột nhóm hiện có: {names}.")
+        insight = "No aggregate ran; Region was not substituted with another field." if language == "en" else "Chưa chạy aggregate; Region không bị thay thế bằng trường khác."
+        return ChatResponse(answer=answer, insight=insight, scope="Awaiting a grouping choice" if language == "en" else "Chờ chọn trường nhóm", caveats=[], clarification_options=options, mode="clarification")
     if language == "vi":
-        return ChatResponse(answer="Chưa thể xác thực đủ cửa hàng, vùng và chỉ tiêu doanh số trong schema này. Hãy chọn các cột tương ứng.", insight="Chưa chạy aggregate để tránh thay thế yêu cầu xếp hạng bằng xu hướng ngày.", scope="Chờ xác nhận semantic", caveats=[], mode="clarification")
-    return ChatResponse(answer="I could not verify every requested store, region, and sales role in this schema. Please select the matching columns.", insight="No aggregate ran, so the requested ranking is not replaced by a date trend.", scope="Awaiting semantic confirmation", caveats=[], mode="clarification")
+        return ChatResponse(answer="Chưa thể xác thực đủ cửa hàng, vùng và chỉ tiêu doanh số trong schema này. Hãy chọn các cột tương ứng.", insight="Chưa chạy aggregate để tránh thay thế yêu cầu xếp hạng bằng xu hướng ngày.", scope="Chờ xác nhận semantic", caveats=[], clarification_options=options, mode="clarification")
+    return ChatResponse(answer="I could not verify every requested store, region, and sales role in this schema. Please select the matching columns.", insight="No aggregate ran, so the requested ranking is not replaced by a date trend.", scope="Awaiting semantic confirmation", caveats=[], clarification_options=options, mode="clarification")
 
 
 def _validate_explicit_roles(message: str, chart: ChartRequest) -> bool:
@@ -1185,7 +1301,7 @@ def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[di
     if direct:
         return direct
     catalog = business_semantic_catalog(columns)
-    intents = (("sales", ("doanh thu", "revenue", "sales")), ("profit", ("loi nhuan", "profit", "margin")), ("quantity", ("so luong", "quantity", "volume")), ("cost", ("chi phi", "cost")))
+    intents = (("sales", ("doanh thu", "revenue", "sales", "sale", "excl vat")), ("profit", ("loi nhuan", "profit", "margin")), ("quantity", ("so luong", "quantity", "volume")), ("cost", ("chi phi", "cost")))
     for intent, words in intents:
         if any(word in normalized for word in words):
             return cast(ColumnProfile | None, catalog.metric(intent))
@@ -1286,7 +1402,7 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     selections = cast(list[dict[str, object]], state["selections"])
     exact_request = _top_stores_sales_by_region_request(profile_data.columns, request.message)
     if _has_explicit_unresolved_ranking(request.message) and exact_request is None:
-        return _ranking_clarification(request.language)
+        return _ranking_clarification(profile_data.columns, request.message, request.language)
     clarification_options = [] if exact_request else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})
