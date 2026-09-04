@@ -31,7 +31,7 @@ from openpyxl import load_workbook
 from pydantic import BaseModel, Field, ValidationError
 
 from database_adapters import read_registered_source
-from formatting import compact_number, format_display_date, parse_date_value, percent
+from formatting import compact_number, format_display_date, format_number, parse_date_value, percent, value_format_descriptor
 from planning import analyst_proposals, business_semantic_catalog, canonical_field_name, display_label, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, propose_charts
 from source_registry import public_source, registered_sources
 from run_store import DurableJobQueue, RunStore
@@ -161,7 +161,10 @@ class ChartRequest(BaseModel):
     dimension: str
     metric: str
     aggregation: Literal["sum", "avg", "count"] = "sum"
-    chart_type: Literal["bar", "line", "area", "scatter", "pareto", "stacked_bar", "heatmap"] = "bar"
+    chart_type: Literal["bar", "line", "area", "pie", "donut", "scatter", "pareto", "stacked_bar", "heatmap"] = "bar"
+    # Scatter is a genuine two-measure aggregate: dimension supplies safe labels,
+    # metric is Y and x_metric is X. Other charts ignore x_metric.
+    x_metric: str | None = None
     secondary_dimension: str | None = None
     # When grouping by a secondary dimension, retain the ranked limit inside each
     # group rather than applying one global limit to all groups.
@@ -277,6 +280,8 @@ class ChartResult(BaseModel):
     aggregation: str
     chart_type: str
     title: str
+    metric_display_name: str = ""
+    value_format: dict[str, object] = Field(default_factory=dict)
     secondary_dimension: str | None = None
     filters: list[FilterSpec] = Field(default_factory=list)
     rows: list[dict[str, str | float | int]]
@@ -831,10 +836,23 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     dimension = quote_identifier(request.dimension, headers)
     metric = quote_identifier(request.metric, headers)
     secondary = quote_identifier(request.secondary_dimension, headers) if request.secondary_dimension else None
+    x_metric = quote_identifier(request.x_metric, headers) if request.x_metric else None
+    profile_data = profile_for_run(run_id, headers, rows)
+    profiles = {item.name: item for item in profile_data.columns}
+    dimension_profile = profiles[request.dimension]
+    metric_profile = profiles[request.metric]
+    if metric_profile.kind != "num" and request.aggregation != "count":
+        raise HTTPException(422, "The selected metric must be numeric.")
     if request.chart_type in {"stacked_bar", "heatmap"} and not secondary:
         raise HTTPException(422, f"{request.chart_type} requires a secondary_dimension.")
+    if request.chart_type in {"pie", "donut"} and (secondary or dimension_profile.kind != "cat"):
+        raise HTTPException(422, f"{request.chart_type} requires one categorical dimension and no secondary_dimension.")
+    if request.chart_type == "scatter":
+        if secondary or not request.x_metric or request.x_metric == request.metric or profiles[request.x_metric].kind != "num":
+            raise HTTPException(422, "scatter requires distinct numeric metric and x_metric fields and no secondary_dimension.")
     if request.aggregation == "count": expression = "COUNT(*)"
     else: expression = f"{request.aggregation.upper()}(TRY_CAST(REPLACE({metric}, ',', '') AS DOUBLE))"
+    x_expression = f"{request.aggregation.upper()}(TRY_CAST(REPLACE({x_metric}, ',', '') AS DOUBLE))" if x_metric else None
     filter_clauses = [f"{dimension} IS NOT NULL", f"TRIM({dimension}) <> ''"]
     if secondary:
         filter_clauses.extend([f"{secondary} IS NOT NULL", f"TRIM({secondary}) <> ''"])
@@ -851,14 +869,14 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
         else:
             filter_clauses.append(f"{field} {operator} ?")
             parameters.append(item.value)
-    profile_data = profile_for_run(run_id, headers, rows)
-    dimension_profile = next(item for item in profile_data.columns if item.name == request.dimension)
     chronological = request.chart_type in {"line", "area"} and dimension_profile.kind == "time" and not secondary
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
         where_clause = " AND ".join(filter_clauses)
-        if secondary and request.limit_per_secondary:
+        if request.chart_type == "scatter":
+            query = f"SELECT {dimension} AS label, {x_expression} AS x_value, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
+        elif secondary and request.limit_per_secondary:
             query = f"""WITH aggregates AS (
                 SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value
                 FROM dataset WHERE {where_clause} GROUP BY 1, 2
@@ -882,10 +900,12 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Cần lọc theo đơn vị tương thích trước khi diễn giải tổng quantity." if language == "vi" else "Filter to compatible units before interpreting a total quantity.")
     if request.chart_type in {"line", "area"} and not chronological:
         warnings.append("Trục đang không phải trường thời gian đã xác nhận; kết quả được xếp hạng theo giá trị thay vì diễn giải như xu hướng." if language == "vi" else "The axis is not a confirmed time field; results are ranked by value rather than interpreted as a trend.")
-    if secondary:
-        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "secondary_label": str(second), "value": 0 if value is None else float(value), "formatted_value": compact_number(0 if value is None else float(value))} for label, second, value in records]
+    if request.chart_type == "scatter":
+        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "x_value": 0 if x_value is None else float(x_value), "value": 0 if value is None else float(value), "formatted_value": format_number(0 if value is None else float(value))} for label, x_value, value in records]
+    elif secondary:
+        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "secondary_label": str(second), "value": 0 if value is None else float(value), "formatted_value": format_number(0 if value is None else float(value))} for label, second, value in records]
     else:
-        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "value": 0 if value is None else float(value), "formatted_value": compact_number(0 if value is None else float(value))} for label, value in records]
+        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "value": 0 if value is None else float(value), "formatted_value": format_number(0 if value is None else float(value))} for label, value in records]
     if request.chart_type == "pareto":
         total = sum(float(row["value"]) for row in chart_rows)
         running = 0.0
@@ -899,7 +919,7 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
         title = f"{label} {display_label(request.metric)} theo {display_label(request.dimension)} trong mỗi {display_label(request.secondary_dimension or '')}" if language == "vi" else f"{label} {display_label(request.metric)} by {display_label(request.dimension)} per {display_label(request.secondary_dimension or '')}"
     else:
         title = (f"{label} {display_label(request.metric)} theo {display_label(request.dimension)}" if language == "vi" else f"{label} {display_label(request.metric)} by {display_label(request.dimension)}") + (f" × {display_label(request.secondary_dimension or '')}" if secondary else "")
-    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
+    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
 
 
 @app.get("/api/runs/{run_id}/executive-overview", response_model=ExecutiveOverview)
@@ -1116,18 +1136,44 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
 
 
 def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: str) -> ChartRequest | None:
-    """Resolve explicit top-N store/site sales requests from the run's semantic catalog."""
-    normalized = " ".join(re.sub(r"[^a-z0-9]+", " ", message.casefold()).split())
-    match = re.search(r"(?:top|highest)\s+(\d{1,2})\s+(?:stores?|sites?)\s+(?:by|for)?\s*(?:sales|revenue)(?:\s+by\s+(\w+))?", normalized)
-    if not match:
+    """Resolve explicit ranked store/site + sales + optional region roles together.
+
+    Returning None is deliberately not permission to substitute a date or first field:
+    callers detect explicit-but-incomplete ranking language and ask for clarification.
+    """
+    normalized = canonical_field_name(message).replace("_", " ")
+    top = re.search(r"(?:top|highest|cao nhat)\s+(\d{1,2})", normalized)
+    wants_store = bool(re.search(r"\b(?:store|stores|site|sites|cua hang)\b", normalized))
+    wants_sales = bool(re.search(r"\b(?:sales?|revenue|doanh thu)\b", normalized))
+    wants_region = bool(re.search(r"\b(?:region|regions|vung|mien)\b", normalized))
+    if not top or not wants_store or not wants_sales:
         return None
     catalog = business_semantic_catalog(columns)
     metric, store = catalog.metric("sales"), catalog.location()
-    group_word = match.group(2)
-    secondary = next((item for item in columns if group_word and item.kind == "cat" and canonical_field_name(item.name) == canonical_field_name(group_word)), None)
-    if not metric or not store:
+    region = next((item for item in columns if item.kind == "cat" and canonical_field_name(item.name) in {"region", "sales_region", "area", "territory", "vung", "mien"}), None)
+    if not metric or not store or (wants_region and not region):
         return None
-    return ChartRequest(dimension=store.name, secondary_dimension=secondary.name if secondary else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=int(match.group(1)), limit_per_secondary=bool(secondary))
+    return ChartRequest(dimension=store.name, secondary_dimension=region.name if wants_region else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=int(top.group(1)), limit_per_secondary=wants_region)
+
+
+def _has_explicit_unresolved_ranking(message: str) -> bool:
+    normalized = canonical_field_name(message).replace("_", " ")
+    return bool(re.search(r"(?:top|highest|cao nhat)\s+\d", normalized) and re.search(r"\b(?:store|stores|site|sites|cua hang|region|regions|vung|mien|sales?|revenue|doanh thu)\b", normalized))
+
+
+def _ranking_clarification(language: Literal["en", "vi"]) -> ChatResponse:
+    if language == "vi":
+        return ChatResponse(answer="Chưa thể xác thực đủ cửa hàng, vùng và chỉ tiêu doanh số trong schema này. Hãy chọn các cột tương ứng.", insight="Chưa chạy aggregate để tránh thay thế yêu cầu xếp hạng bằng xu hướng ngày.", scope="Chờ xác nhận semantic", caveats=[], mode="clarification")
+    return ChatResponse(answer="I could not verify every requested store, region, and sales role in this schema. Please select the matching columns.", insight="No aggregate ran, so the requested ranking is not replaced by a date trend.", scope="Awaiting semantic confirmation", caveats=[], mode="clarification")
+
+
+def _validate_explicit_roles(message: str, chart: ChartRequest) -> bool:
+    """Prevent LLM/deterministic plans from downgrading named ranking roles."""
+    normalized = canonical_field_name(message).replace("_", " ")
+    if re.search(r"(?:top|highest|cao nhat)\s+\d", normalized):
+        if chart.chart_type != "bar" or chart.limit_per_secondary != bool(re.search(r"\b(?:region|regions|vung|mien)\b", normalized)):
+            return False
+    return True
 
 
 def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]]) -> ColumnProfile | None:
@@ -1239,6 +1285,8 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     state = _selection_artifact(run_id)
     selections = cast(list[dict[str, object]], state["selections"])
     exact_request = _top_stores_sales_by_region_request(profile_data.columns, request.message)
+    if _has_explicit_unresolved_ranking(request.message) and exact_request is None:
+        return _ranking_clarification(request.language)
     clarification_options = [] if exact_request else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})

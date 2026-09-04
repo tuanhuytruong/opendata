@@ -137,7 +137,9 @@ def test_values_and_validated_chart() -> None:
     assert chart.status_code == 200, chart.text
     assert chart.json()["rows"][0]["label"] == "Online"
     assert chart.json()["rows"][0]["value"] == 120.0
-    assert chart.json()["rows"][0]["formatted_value"] == "120.0"
+    assert chart.json()["rows"][0]["formatted_value"] == "120"
+    assert chart.json()["metric_display_name"] == "Net Sales"
+    assert chart.json()["value_format"]["style"] == "number"
     filtered = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "channel", "metric": "net_sales", "filters": [{"column": "channel", "operator": "equals", "value": "Retail"}]})
     assert filtered.status_code == 200, filtered.text
     assert filtered.json()["rows"][0]["label"] == "Retail"
@@ -300,6 +302,32 @@ def test_time_charts_are_chronological_and_format_dates() -> None:
     assert "cuối kỳ" in body["insight_headline"]
 
 
+def test_top_store_region_roles_are_preserved_or_clarified() -> None:
+    data = upload_csv("sale_date,store,region,net_sales\n2026-01-01,A,North,100\n2026-01-02,B,North,90\n2026-01-03,C,North,80\n2026-01-04,D,North,70\n")
+    body = client.post(f"/api/runs/{data['run_id']}/chat", json={"message": "top 3 store by region by sales", "language": "en"}).json()
+    assert body["mode"] == "analysis"
+    assert body["chart"]["dimension"] == "store"
+    assert body["chart"]["secondary_dimension"] == "region"
+    assert body["chart"]["metric"] == "net_sales"
+    assert body["chart"]["sort_mode"] == "ranking"
+    assert body["chart"]["result_count"] == 3
+    missing = upload_csv("sale_date,region,net_sales\n2026-01-01,North,100\n")
+    clarification = client.post(f"/api/runs/{missing['run_id']}/chat", json={"message": "top 3 stores by region by sales", "language": "en"}).json()
+    assert clarification["mode"] == "clarification"
+    assert clarification["chart"] is None and clarification["table"] == []
+
+
+def test_pie_donut_and_scatter_contracts_are_validated() -> None:
+    data = upload_csv("store,net_sales,cost\nA,100,60\nB,40,20\n")
+    run_id = data["run_id"]
+    for chart_type in ("pie", "donut"):
+        assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "net_sales", "chart_type": chart_type}).status_code == 200
+    scatter = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "net_sales", "x_metric": "cost", "chart_type": "scatter"})
+    assert scatter.status_code == 200, scatter.text
+    assert scatter.json()["rows"][0]["x_value"] == 60.0
+    assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "net_sales", "chart_type": "scatter"}).status_code == 422
+
+
 def test_builds_pareto_and_two_dimension_chart_contracts() -> None:
     data = upload_csv("channel,city,net_sales\nOnline,HCM,100\nOnline,Hanoi,20\nRetail,HCM,40\n")
     run_id = data["run_id"]
@@ -377,7 +405,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     assert body["table"]
     assert body["title"] == "Top 2 Net Sales by Channel"
     assert body["answer"] == "I prepared a table of net_sales by channel."
-    assert body["insight"] == "Online leads at 100.0."
+    assert body["insight"] == "Online leads at 100."
     assert body["scope"] == "SUM net_sales by channel; 2 results, sorted ranking"
     assert all("Không" not in value and "theo" not in value for value in [body["answer"], body["insight"], body["scope"], *body["caveats"]])
 
@@ -386,7 +414,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     chart_body = chart.json()
     assert chart_body["chart"] is not None
     assert chart_body["chart"]["title"] == "Top 2 Net Sales by Channel"
-    assert chart_body["chart"]["insight_headline"] == "Online leads at 100.0."
+    assert chart_body["chart"]["insight_headline"] == "Online leads at 100."
 
 
 def test_vietnamese_table_intent_omits_chart() -> None:
