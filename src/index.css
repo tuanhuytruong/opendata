@@ -1,8 +1,9 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
 @import "tailwindcss";
-@theme { --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif; --font-display: "Space Grotesk", sans-serif; }
+@theme { --font-sans: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif; --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
 body { background:#f1f5f9; color:#0f172a; font-family:var(--font-sans); }
 .font-display { font-family:var(--font-display); }
+.font-mono, .tabular-nums, .kpi-card b, .result-count, .data-table td, .validated-chart { font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
 ::-webkit-scrollbar { width:6px; height:6px; } ::-webkit-scrollbar-thumb { background:#cbd5e1; border-radius:4px; }
 .app-header { height:66px; background:rgb(255 255 255 / .94); border-bottom:1px solid #e2e8f0; position:sticky; top:0; z-index:20; backdrop-filter:blur(12px); }
 .app-header-inner, .workspace-shell { width:min(100%, 1920px); margin-inline:auto; }
@@ -27,8 +28,7 @@ body { background:#f1f5f9; color:#0f172a; font-family:var(--font-sans); }
 @media (max-width:1023px) { .workspace-grid { display:block; }.executive-mobile-actions { display:flex; justify-content:flex-end; }.mobile-chat-toggle { display:inline-flex; align-items:center; gap:6px; border:1px solid #c7d2fe; border-radius:9px; background:#eef2ff; color:#4338ca; padding:8px 10px; font-size:12px; font-weight:600; }.chat-panel { display:none; position:fixed; z-index:30; inset:70px 12px 12px; height:auto; min-height:0; }.chat-panel.is-open { display:flex; }.chat-close { display:grid; place-items:center; padding:6px; color:#64748b; }.kpi-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media (max-width:640px) { .app-header { height:auto; }.app-header-inner { padding:9px 12px; flex-wrap:wrap; gap:8px; }.app-tabs { order:3; width:100%; overflow:auto; }.app-tabs button { flex:1; padding:7px 8px; }.dataset-bar { flex-wrap:wrap; }.dataset-meta { width:100%; }.dataset-meta > span { white-space:normal; }.status-pill { margin-inline-start:auto; }.kpi-grid { gap:8px; }.kpi-card { padding:12px; }.kpi-card b { font-size:18px; } }
 
-.chart-planner { border:1px solid #e2e8f0; border-radius:16px; background:#fff; padding:18px; box-shadow:0 1px 2px rgb(15 23 42 / .04); }
-.planner-field { display:block; font-size:10px; font-weight:700; letter-spacing:.08em; text-transform:uppercase; color:#64748b; }.planner-field > span { display:block; margin-top:6px; }.chart-planner select, .chart-planner input { width:100%; border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#334155; padding:8px; font-size:12px; outline:none; }.chart-planner select:focus, .chart-planner input:focus { border-color:#818cf8; box-shadow:0 0 0 2px #e0e7ff; }.planner-secondary { border:1px solid #c7d2fe; border-radius:8px; background:#eef2ff; color:#4338ca; padding:8px 12px; font-size:12px; font-weight:600; }.filter-chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #e2e8f0; border-radius:999px; background:#f8fafc; padding:4px 8px; font-size:11px; color:#475569; }
+.planner-secondary { border:1px solid #c7d2fe; border-radius:8px; background:#eef2ff; color:#4338ca; padding:8px 12px; font-size:12px; font-weight:600; }.filter-chip { display:inline-flex; align-items:center; gap:6px; border:1px solid #e2e8f0; border-radius:999px; background:#f8fafc; padding:4px 8px; font-size:11px; color:#475569; }
 
 /* Deep Dive Lab */
 .data-explorer, .health-context { border:1px solid #e2e8f0; border-radius:16px; background:#fff; box-shadow:0 1px 2px rgb(15 23 42 / .04); overflow:hidden; }

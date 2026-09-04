@@ -1237,7 +1237,7 @@ def _semantic_clarification(columns: list[ColumnProfile], message: str, selectio
     return []
 
 
-def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: str) -> ChartRequest | None:
+def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]] | None = None) -> ChartRequest | None:
     """Resolve explicit ranked store/site + sales + optional region roles together.
 
     Returning None is deliberately not permission to substitute a date or first field:
@@ -1253,9 +1253,11 @@ def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: s
     catalog = business_semantic_catalog(columns)
     metric, store = catalog.metric("sales"), catalog.location()
     region = next((item for item in columns if item.kind == "cat" and canonical_field_name(item.name) in {"region", "sales_region", "area", "territory", "vung", "mien"}), None)
-    if not metric or not store or (wants_region and not region):
+    selected_group = next((item for item in columns if item.kind == "cat" and any(selection.get("column") == item.name and selection.get("role") == "dimension" for selection in (selections or []))), None)
+    grouping = region or selected_group
+    if not metric or not store or (wants_region and not grouping):
         return None
-    return ChartRequest(dimension=store.name, secondary_dimension=region.name if wants_region else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=int(top.group(1)), limit_per_secondary=wants_region)
+    return ChartRequest(dimension=store.name, secondary_dimension=grouping.name if wants_region else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=int(top.group(1)), limit_per_secondary=wants_region)
 
 
 def _has_explicit_unresolved_ranking(message: str) -> bool:
@@ -1384,10 +1386,24 @@ def select_semantic_column(run_id: str, request: SemanticSelectionRequest) -> Ch
     state = _selection_artifact(run_id)
     selections = [item for item in cast(list[dict[str, object]], state["selections"]) if item.get("role") != request.role]
     selections.append({"column": column.name, "role": request.role, "provenance": "User"})
+    continuation = state.get("continuation")
     pending_message = state.get("pending_message")
-    RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections})
+    if isinstance(continuation, dict):
+        allowed_options = continuation.get("allowed_options")
+        if not isinstance(allowed_options, list) or {"column": request.column, "role": request.role} not in allowed_options:
+            raise HTTPException(422, "Selected option is not available for this question.")
+        pending_message = continuation.get("message")
     if not isinstance(pending_message, str) or not pending_message:
-        raise HTTPException(409, "No pending question is available to resume.")
+        language = "vi" if request.language == "vi" else "en"
+        return ChatResponse(
+            answer="Phiên câu hỏi này đã kết thúc. Hãy gửi lại câu hỏi để tiếp tục." if language == "vi" else "This question session has ended. Please submit the question again to continue.",
+            insight="Không có aggregate nào được chạy." if language == "vi" else "No aggregate has run.",
+            scope="Cần gửi lại câu hỏi" if language == "vi" else "Question resubmission required",
+            caveats=[],
+            mode="clarification",
+            planner="deterministic",
+        )
+    RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections})
     return chat_about_run(run_id, ChatRequest(message=pending_message, language=cast(Literal["en", "vi"], request.language)), allow_llm=False)
 
 
@@ -1399,10 +1415,28 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     if is_starter_analysis_request(request.message):
         return _starter_analysis_response(profile_data.columns, request.message, request.language)
     state = _selection_artifact(run_id)
+    continuation = state.get("continuation")
+    if isinstance(continuation, dict) and continuation.get("message") != request.message:
+        # A new question must not inherit an old pending continuation, but retains
+        # explicit run-scoped selections that the user has already confirmed.
+        RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": state["selections"]})
+        state = _selection_artifact(run_id)
     selections = cast(list[dict[str, object]], state["selections"])
-    exact_request = _top_stores_sales_by_region_request(profile_data.columns, request.message)
+    exact_request = _top_stores_sales_by_region_request(profile_data.columns, request.message, selections)
     if _has_explicit_unresolved_ranking(request.message) and exact_request is None:
-        return _ranking_clarification(profile_data.columns, request.message, request.language)
+        clarification = _ranking_clarification(profile_data.columns, request.message, request.language)
+        RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {
+            "version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "selections": selections,
+            "continuation": {
+                "message": request.message,
+                "language": request.language,
+                "requested_roles": ["store", "sales", "grouping"],
+                "allowed_options": [{"column": option.column, "role": option.role} for option in clarification.clarification_options],
+            },
+        })
+        return clarification
     clarification_options = [] if exact_request else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})

@@ -7,6 +7,8 @@ export const formatNumber = (value: number, language: Language, compact = false)
 }).format(Number(value));
 /** One compact format contract for axes, labels, and chart tooltips. */
 export const formatChartValue = (value: number, language: Language) => formatNumber(value, language, true);
+/** Visual labels stay bounded; the chart exposes the full value through its tooltip and aria-label. */
+export const truncateChartLabel = (value: string, maxLength: number) => value.length > maxLength ? `${value.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…` : value;
 
 export const formatDataCell = (value: unknown, kind: ColumnKind, language: Language) => {
   const text = String(value ?? '');

@@ -286,7 +286,10 @@ def test_semantic_selection_is_run_scoped_user_provenance_and_resumes_pending_qu
     state = RUN_STORE.artifact_json(first["run_id"], "semantic-selection.json")
     assert state["selections"] == [{"column": option["column"], "role": "metric", "provenance": "User"}]
     assert not (RUN_STORE._dir(second["run_id"]) / "semantic-selection.json").exists()
-    assert client.post(f"/api/runs/{second['run_id']}/semantic-selection", json={"column": "net_sales", "role": "metric"}).status_code == 409
+    expired = client.post(f"/api/runs/{second['run_id']}/semantic-selection", json={"column": "net_sales", "role": "metric"})
+    assert expired.status_code == 200
+    assert expired.json()["mode"] == "clarification"
+    assert "No pending question" not in expired.json()["answer"]
     assert client.post(f"/api/runs/{first['run_id']}/semantic-selection", json={"column": "missing", "role": "metric"}).status_code == 422
 
 
@@ -315,6 +318,46 @@ def test_top_store_region_roles_are_preserved_or_clarified() -> None:
     clarification = client.post(f"/api/runs/{missing['run_id']}/chat", json={"message": "top 3 stores by region by sales", "language": "en"}).json()
     assert clarification["mode"] == "clarification"
     assert clarification["chart"] is None and clarification["table"] == []
+
+
+def test_ranking_group_selection_resumes_original_question_per_selected_group() -> None:
+    data = upload_csv(
+        "STORE,DIVISION,NET_SALES\n"
+        "North A,North,100\nNorth B,North,90\nNorth C,North,80\nNorth D,North,70\n"
+        "South A,South,10\nSouth B,South,50\nSouth C,South,40\nSouth D,South,30\n"
+    )
+    run_id = data["run_id"]
+    clarification = client.post(f"/api/runs/{run_id}/chat", json={"message": "top 3 stores sales by region", "language": "en"})
+    assert clarification.status_code == 200, clarification.text
+    body = clarification.json()
+    assert body["mode"] == "clarification"
+    division = next(option for option in body["clarification_options"] if option["column"] == "DIVISION")
+    from main import RUN_STORE
+    pending_state = RUN_STORE.artifact_json(run_id, "semantic-selection.json")
+    assert pending_state["continuation"]["message"] == "top 3 stores sales by region"
+    assert {"column": "DIVISION", "role": "dimension"} in pending_state["continuation"]["allowed_options"]
+
+    resumed = client.post(f"/api/runs/{run_id}/semantic-selection", json={"column": division["column"], "role": division["role"], "language": "en"})
+    assert resumed.status_code == 200, resumed.text
+    chart = resumed.json()["chart"]
+    assert chart["dimension"] == "STORE"
+    assert chart["secondary_dimension"] == "DIVISION"
+    assert chart["metric"] == "NET_SALES"
+    assert [(row["secondary_label"], row["label"]) for row in chart["rows"]] == [
+        ("North", "North A"), ("North", "North B"), ("North", "North C"),
+        ("South", "South B"), ("South", "South C"), ("South", "South D"),
+    ]
+    assert RUN_STORE.artifact_json(run_id, "semantic-selection.json") == {"selections": [{"column": "DIVISION", "role": "dimension", "provenance": "User"}]}
+
+
+def test_new_question_supersedes_ranking_continuation() -> None:
+    data = upload_csv("STORE,DIVISION,NET_SALES\nA,North,100\nB,South,50\n")
+    run_id = data["run_id"]
+    assert client.post(f"/api/runs/{run_id}/chat", json={"message": "top 3 stores sales by region", "language": "en"}).json()["mode"] == "clarification"
+    replacement = client.post(f"/api/runs/{run_id}/chat", json={"message": "Show net sales by DIVISION", "language": "en"})
+    assert replacement.status_code == 200, replacement.text
+    from main import RUN_STORE
+    assert "continuation" not in RUN_STORE.artifact_json(run_id, "semantic-selection.json")
 
 
 def test_pie_donut_and_scatter_contracts_are_validated() -> None:
