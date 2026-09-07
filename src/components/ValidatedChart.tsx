@@ -56,10 +56,16 @@ export default function ValidatedChart({ result, language, report = false }: { r
   const valueLabel = (props: { value?: number; index?: number; x?: number; y?: number; width?: number | string; height?: number | string }) => {
     const index = props.index ?? -1;
     if (trend && !selectedLabels.has(index)) return null;
-    const x = Number(props.x ?? 0) + Number(props.width ?? 0) / 2;
-    const y = Number(props.y ?? 0) - 6;
+    const left = Number(props.x ?? 0);
+    const top = Number(props.y ?? 0);
+    const width = Number(props.width ?? 0);
+    const height = Number(props.height ?? 0);
+    // Ranking values belong immediately after their horizontal bar, in reserved right-side space.
+    if (horizontal && !grouped) return <text x={left + width + 7} y={top + height / 2 + 3} textAnchor="start" className="validated-chart-label">{compact(Number(props.value ?? 0))}</text>;
+    const x = left + width / 2;
+    const y = top - 6;
     // The final trend label is intentionally reserved for the right-side endpoint position.
-    if (trend && index === result.rows.length - 1) return <text x={x + 9} y={Number(props.y ?? 0) + 4} textAnchor="start" className="validated-chart-label">{compact(Number(props.value ?? 0))}</text>;
+    if (trend && index === result.rows.length - 1) return <text x={x + 9} y={top + 4} textAnchor="start" className="validated-chart-label">{compact(Number(props.value ?? 0))}</text>;
     return <text x={x} y={Math.max(12, y)} textAnchor="middle" className="validated-chart-label">{compact(Number(props.value ?? 0))}</text>;
   };
   const accessibleLabel = `${result.title}. ${result.rows.map(row => `${labelFor(row)}: ${compact(row.value)}`).join('; ')}`;
