@@ -158,11 +158,15 @@ def presentation_title(metric: str, dimension: str, chart_type: str, *, language
         if chart_type in {"line", "area"}: return f"Hiệu suất {metric_label} theo thời gian"
         if chart_type in {"pie", "donut"}: return f"Cơ cấu {metric_label} theo {dimension_label}"
         if secondary_dimension: return f"So sánh {metric_label} theo {dimension_label} và {display_label(secondary_dimension)}"
-        return f"Top {limit or ''} {dimension_label} theo {metric_label}".replace("Top  ", "")
+        return f"Hàng đầu {limit or ''} {dimension_label} theo {metric_label}".replace("Hàng đầu  ", "")
     noun = "Sales" if sales else metric_label
     if chart_type in {"line", "area"}: return f"{noun} Performance Over Time"
     if chart_type in {"pie", "donut"}: return f"{noun} Contribution by {dimension_label}"
-    if secondary_dimension: return f"{noun} by {dimension_label} and {display_label(secondary_dimension)}"
+    if secondary_dimension:
+        secondary_label = display_label(secondary_dimension)
+        if canonical_field_name(dimension) in {"department", "dept"} and canonical_field_name(secondary_dimension) == "division":
+            return f"Top {limit or ''} {dimension_label} per {secondary_label} by {noun}".replace("Top  ", "")
+        return f"{noun} by {dimension_label} and {secondary_label}"
     return f"Top {limit or ''} {dimension_label} by {noun}".replace("Top  ", "")
 
 

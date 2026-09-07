@@ -403,7 +403,9 @@ def test_exports_persisted_authored_report_and_escapes_hostile_input() -> None:
     assert "text/html" in response.headers["content-type"]
     assert "Executive conclusion" in response.text
     assert "Findings" in response.text and "Review retail mix" in response.text
-    assert "Validated artifacts and evidence" in response.text and "Provenance" in response.text
+    assert "Evidence" in response.text
+    assert "Authored briefing from validated report run" not in response.text
+    assert "Dataset checksum" not in response.text and "Provenance" not in response.text
     assert "<svg" in response.text and "class='report-chart'" in response.text
     assert "Accessible data table for" in response.text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in response.text
@@ -737,7 +739,7 @@ def test_report_artifact_persists_validated_chart_snapshot() -> None:
     artifact = doc["pinned_artifacts"][0]
     assert artifact["result"]["rows"][0]["label"] == "Online"
     exported = client.get(f"/api/runs/{data['run_id']}/report").text
-    assert "Validated evidence" in exported and "Online" in exported
+    assert "Evidence" in exported and "Online" in exported
 
 
 def test_b2b_b2c_comparison_uses_schema_category_or_clarifies() -> None:
@@ -780,6 +782,65 @@ def test_presentation_titles_and_data_handoff_filters_and_type_sorting() -> None
     assert [row["net_sales"] for row in numeric.json()["rows"]][:3] == ["2", "10", "100"]
     descending = client.get(f"/api/runs/{run_id}/data?page_size=10&sort_by=net_sales&sort_direction=desc")
     assert [row["net_sales"] for row in descending.json()["rows"]][:3] == ["100", "10", "2"]
+
+
+def test_custom_report_persists_locale_and_exports_clean_localized_html() -> None:
+    data = upload_csv("sale_date,channel,net_sales\n2026-01-01,Online,100\n2026-01-02,Retail,40\n")
+    run_id = data["run_id"]
+    saved = client.put(f"/api/runs/{run_id}/custom-report", json={
+        "title": "Báo cáo doanh số", "locale": "vi", "layout_blueprint": {"template": "executive", "sections": ["summary", "artifacts"]},
+        "pinned_artifacts": [{"artifact_id": "sales", "chart": {"dimension": "channel", "metric": "net_sales"}}],
+    })
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["locale"] == "vi"
+    assert saved.json()["layout_blueprint"]["template"] == "executive"
+    artifact = saved.json()["pinned_artifacts"][0]
+    assert "theo" in artifact["scope"]
+    assert "Hàng đầu" in artifact["title"] or "Doanh số" in artifact["title"]
+
+    exported = client.get(f"/api/runs/{run_id}/report")
+    assert exported.status_code == 200, exported.text
+    assert "<html lang='vi'>" in exported.text
+    assert "Tóm tắt điều hành" in exported.text
+    assert "run_id" not in exported.text
+    assert "Dataset checksum" not in exported.text
+    assert "report.manifest" not in exported.text
+    assert "Author note" not in exported.text
+
+
+def test_top_department_per_division_retains_every_explicit_role() -> None:
+    data = upload_csv(
+        "division,department,sale_excl_vat\n"
+        "North,A,100\nNorth,B,90\nNorth,C,80\nNorth,D,70\n"
+        "South,A,60\nSouth,B,50\nSouth,C,40\nSouth,D,30\n"
+    )
+    response = client.post(f"/api/runs/{data['run_id']}/chat", json={"message": "top 3 department by division by sales", "language": "en"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["mode"] == "analysis"
+    chart = body["chart"]
+    assert chart["dimension"] == "department"
+    assert chart["secondary_dimension"] == "division"
+    assert len(chart["rows"]) == 6
+    assert {row["secondary_label"] for row in chart["rows"]} == {"North", "South"}
+    assert all(sum(row["secondary_label"] == division for row in chart["rows"]) == 3 for division in {"North", "South"})
+    assert "per Division" in chart["title"]
+
+
+def test_executive_scorecards_include_compact_values_and_only_safe_time_comparisons() -> None:
+    timed = upload_csv("sale_date,net_sales\n2026-01-01,100\n2026-01-02,150\n")
+    timed_cards = client.get(f"/api/runs/{timed['run_id']}/executive-overview?language=en").json()["scorecards"]
+    card = next(item for item in timed_cards if item["metric"] == "net_sales")
+    assert card["compact_formatted_value"] == "250"
+    assert card["prior_period_value"] == 100.0
+    assert card["change_pct"] == 50.0
+    assert card["sparkline"] == [100.0, 150.0]
+
+    untimed = upload_csv("channel,net_sales\nOnline,100\nRetail,150\n")
+    untimed_card = next(item for item in client.get(f"/api/runs/{untimed['run_id']}/executive-overview?language=en").json()["scorecards"] if item["metric"] == "net_sales")
+    assert untimed_card["prior_period_value"] is None
+    assert untimed_card["change_pct"] is None
+    assert untimed_card["sparkline"] is None
 
 
 def test_executive_overview_has_four_real_scorecards_and_eligible_visual_mix() -> None:

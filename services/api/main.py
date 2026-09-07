@@ -215,6 +215,10 @@ class CustomReportDocument(BaseModel):
     """Durable, run-scoped authored briefing; evidence is always server-derived."""
     run_id: str
     title: str = Field(default="Custom Report", min_length=1, max_length=120)
+    locale: Literal["en", "vi"] = "en"
+    # A presentation-only blueprint from the editor.  It never changes validated
+    # artifacts and remains optional so documents saved by older clients still load.
+    layout_blueprint: dict[str, object] = Field(default_factory=dict)
     executive_summary: str = Field(default="", max_length=8_000)
     sections: list[ReportSection] = Field(default_factory=list, max_length=20)
     pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
@@ -225,6 +229,8 @@ class CustomReportDocument(BaseModel):
 
 class CustomReportUpdate(BaseModel):
     title: str = Field(default="Custom Report", min_length=1, max_length=120)
+    locale: Literal["en", "vi"] = "en"
+    layout_blueprint: dict[str, object] = Field(default_factory=dict)
     executive_summary: str = Field(default="", max_length=8_000)
     sections: list[ReportSection] = Field(default_factory=list, max_length=20)
     pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
@@ -306,9 +312,17 @@ class ExecutiveScorecard(BaseModel):
     label: str
     value: float
     formatted_value: str
+    # Compact display is optional for clients that need a dense scorecard view.
+    compact_formatted_value: str | None = None
     metric: str
     aggregation: Literal['sum', 'avg', 'count']
     scope: str
+    # Comparison and sparkline evidence is emitted only when the schema has a
+    # confirmed time field and at least two valid aggregate periods.
+    prior_period_value: float | None = None
+    prior_period_formatted_value: str | None = None
+    change_pct: float | None = None
+    sparkline: list[float] | None = None
 
 
 class ExecutiveOverview(BaseModel):
@@ -995,6 +1009,7 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
     all_metrics = [item for item in [*catalog.sales_metrics, *catalog.quantity_metrics, *catalog.cost_metrics, *catalog.profit_metrics] if item is not None]
     all_metrics.extend(item for item in profile_data.columns if item.kind == "num" and item not in all_metrics and not any(token in canonical_field_name(item.name) for token in ("id", "code", "key")))
     scorecards: list[ExecutiveScorecard] = []
+    safe_time: ColumnProfile | None = next((item for item in profile_data.columns if item.kind == "time"), None)
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
@@ -1007,7 +1022,24 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
                 continue
             label = display_label(metric.name)
             scope = (f"Tổng {label} trên toàn bộ dataset" if language == "vi" else f"Full-dataset sum of {label}")
-            scorecards.append(ExecutiveScorecard(label=label, value=float(value), formatted_value=format_number(float(value)), metric=metric.name, aggregation="sum", scope=scope))
+            comparison: dict[str, object] = {}
+            if safe_time:
+                time_identifier = quote_identifier(safe_time.name, headers)
+                periods = connection.execute(
+                    f"SELECT {time_identifier}, SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) "
+                    f"FROM dataset WHERE TRY_CAST({time_identifier} AS TIMESTAMP) IS NOT NULL "
+                    f"GROUP BY 1 ORDER BY TRY_CAST({time_identifier} AS TIMESTAMP) ASC"
+                ).fetchall()
+                if len(periods) >= 2:
+                    values = [float(period_value or 0) for _, period_value in periods]
+                    previous, current = values[-2], values[-1]
+                    comparison = {
+                        "prior_period_value": previous,
+                        "prior_period_formatted_value": format_number(previous),
+                        "change_pct": None if previous == 0 else round((current - previous) / abs(previous) * 100, 2),
+                        "sparkline": values,
+                    }
+            scorecards.append(ExecutiveScorecard(label=label, value=float(value), formatted_value=format_number(float(value)), compact_formatted_value=compact_number(float(value)), metric=metric.name, aggregation="sum", scope=scope, **comparison))
     finally:
         connection.close()
     if len(scorecards) < 4:
@@ -1023,19 +1055,27 @@ def _custom_report_glossary(run_id: str, artifacts: list[CustomReportArtifact]) 
     return [{"name": name, "label": display_label(name), "description": profile[name].description, "kind": profile[name].kind} for name in sorted(used) if name in profile and not is_sensitive_column(name)]
 
 
-def _report_artifact(run_id: str, artifact: CustomReportArtifact) -> CustomReportArtifact:
+def _report_artifact(run_id: str, artifact: CustomReportArtifact, language: Literal["en", "vi"] = "en") -> CustomReportArtifact:
     """Rebuild the immutable report snapshot; client artifact metadata is never trusted."""
     # CustomReportUpdate accepts the complete document for editor convenience.  Only
     # the chart specification and author annotation are client-authored, however:
     # title, scope, evidence, warnings, and result must always be derived from this
     # run's data at write time.
-    chart = build_chart(run_id, artifact.chart)
-    scope = f"{chart.aggregation} of {display_label(chart.metric)} by {display_label(chart.dimension)}"
-    if chart.secondary_dimension:
-        scope += f"; grouped by {display_label(chart.secondary_dimension)}"
-    if chart.filters:
-        scope += "; filtered to " + "; ".join(f"{display_label(item.column)} {item.operator.replace('_', ' ')} {item.value}" for item in chart.filters)
-    scope += f"; top {chart.result_count or len(chart.rows)} {chart.sort_mode or 'results'}."
+    chart = build_chart(run_id, artifact.chart, language)
+    if language == "vi":
+        scope = f"{chart.aggregation} của {display_label(chart.metric)} theo {display_label(chart.dimension)}"
+        if chart.secondary_dimension:
+            scope += f"; nhóm theo {display_label(chart.secondary_dimension)}"
+        if chart.filters:
+            scope += "; lọc theo " + "; ".join(f"{display_label(item.column)} {item.operator.replace('_', ' ')} {item.value}" for item in chart.filters)
+        scope += f"; {chart.result_count or len(chart.rows)} kết quả {chart.sort_mode or 'results'}"
+    else:
+        scope = f"{chart.aggregation} of {display_label(chart.metric)} by {display_label(chart.dimension)}"
+        if chart.secondary_dimension:
+            scope += f"; grouped by {display_label(chart.secondary_dimension)}"
+        if chart.filters:
+            scope += "; filtered to " + "; ".join(f"{display_label(item.column)} {item.operator.replace('_', ' ')} {item.value}" for item in chart.filters)
+        scope += f"; top {chart.result_count or len(chart.rows)} {chart.sort_mode or 'results'}."
     return CustomReportArtifact(artifact_id=artifact.artifact_id, chart=artifact.chart, annotation=artifact.annotation, title=chart.title, scope=scope, evidence=chart.evidence, warnings=chart.warnings, result=chart)
 
 
@@ -1047,8 +1087,8 @@ def _custom_report_document(run_id: str, update: CustomReportUpdate | None = Non
         except HTTPException as error:
             if error.status_code != 404: raise
             return CustomReportDocument(run_id=run_id, glossary=[])
-    artifacts = list({item.artifact_id: _report_artifact(run_id, item) for item in update.pinned_artifacts}.values())
-    document = CustomReportDocument(run_id=run_id, title=update.title, executive_summary=update.executive_summary, sections=update.sections, pinned_artifacts=artifacts, manual_glossary_notes=update.manual_glossary_notes, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat())
+    artifacts = list({item.artifact_id: _report_artifact(run_id, item, update.locale) for item in update.pinned_artifacts}.values())
+    document = CustomReportDocument(run_id=run_id, title=update.title, locale=update.locale, layout_blueprint=update.layout_blueprint, executive_summary=update.executive_summary, sections=update.sections, pinned_artifacts=artifacts, manual_glossary_notes=update.manual_glossary_notes, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat())
     RUN_STORE.save_artifact_json(run_id, path, document.model_dump())
     return document
 
@@ -1068,14 +1108,14 @@ def update_custom_report(run_id: str, request: CustomReportUpdate) -> CustomRepo
 def pin_custom_report_artifact(run_id: str, request: PinArtifactRequest) -> CustomReportDocument:
     current = _custom_report_document(run_id)
     artifacts = [item for item in current.pinned_artifacts if item.artifact_id != request.artifact_id] + [CustomReportArtifact(artifact_id=request.artifact_id, chart=request.chart, annotation=request.annotation)]
-    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
+    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, locale=current.locale, layout_blueprint=current.layout_blueprint, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
 
 
 @app.delete("/api/runs/{run_id}/custom-report/artifacts/{artifact_id}", response_model=CustomReportDocument)
 def unpin_custom_report_artifact(run_id: str, artifact_id: str) -> CustomReportDocument:
     current = _custom_report_document(run_id)
     artifacts = [item for item in current.pinned_artifacts if item.artifact_id != artifact_id]
-    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
+    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, locale=current.locale, layout_blueprint=current.layout_blueprint, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
 
 
 @app.get("/api/runs/{run_id}/manifest")
@@ -1202,6 +1242,20 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     glossary = "".join("<li><strong>{}</strong> ({}) — {}</li>".format(esc(item["label"]), esc(item["kind"]), esc(item["description"])) for item in document.glossary) or "<li>No validated glossary entries yet.</li>"
     notes = "".join("<li class='manual'><strong>Manual note:</strong> {}</li>".format(esc(note.text)) for note in document.manual_glossary_notes) or "<li class='manual'>No manual glossary notes.</li>"
     artifact = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}.scope{{font-size:13px;color:#475569}}.manual{{color:#5b21b6}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p>Authored briefing from validated report run <code>{}</code>. Use your browser’s Print command to save as PDF.</p><section class='meta'><h2>Executive summary</h2><p>{}</p></section>{}<section class='meta'><h2>Validated artifacts and evidence</h2>{}</section><section class='meta'><h2>Glossary</h2><ul>{}</ul><h3>Author notes (not validated evidence)</h3><ul>{}</ul></section><section class='meta'><h2>Provenance</h2><p>Dataset checksum: <code>{}</code>. Source: {} / {}. Generated: {}. Artifact specifications and evidence are retained in the run manifest.</p></section></main></body></html>""".format(esc(document.title), esc(document.title), esc(run_id[:8]), esc(document.executive_summary) or "No executive summary supplied.", sections, "".join(artifact_parts) or "<section class='card'><p>No validated artifacts have been pinned.</p></section>", glossary, notes, esc(manifest["dataset_sha256"]), esc(metadata["source_type"]), esc(metadata["source_label"]), esc(manifest["generated_at"]))
+    # Replace legacy technical metadata with a business-facing export.  The manifest
+    # remains a server artifact, but its identifiers/checksum are never shown here.
+    labels = {
+        "en": {"summary": "Executive summary", "evidence": "Evidence", "glossary": "Glossary", "actions": "Recommended actions", "note": "Author note", "table": "Accessible data table for", "source": "Source", "print": "Use your browser’s Print command to save as PDF.", "empty": "No executive summary supplied.", "no_artifacts": "No validated artifacts have been pinned.", "no_glossary": "No glossary entries are needed for this report."},
+        "vi": {"summary": "Tóm tắt điều hành", "evidence": "Bằng chứng", "glossary": "Thuật ngữ", "actions": "Hành động đề xuất", "note": "Ghi chú tác giả", "table": "Bảng dữ liệu có thể truy cập cho", "source": "Nguồn", "print": "Dùng lệnh In của trình duyệt để lưu PDF.", "empty": "Chưa có tóm tắt điều hành.", "no_artifacts": "Chưa có biểu đồ đã xác thực được ghim.", "no_glossary": "Báo cáo này chưa cần mục thuật ngữ."},
+    }[document.locale]
+    artifact_parts = []
+    for saved, chart in zip(document.pinned_artifacts, charts):
+        rows = "".join("<tr><td>{}</td>{}<td>{}</td></tr>".format(esc(row.get("display_label") or row["label"]), "<td>{}</td>".format(esc(row.get("secondary_label") or "")) if chart.secondary_dimension else "", esc(row.get("formatted_value", row["value"]))) for row in chart.rows)
+        note = "<p><strong>{}:</strong> {}</p>".format(esc(labels["note"]), esc(saved.annotation)) if saved.annotation.strip() else ""
+        artifact_parts.append("<section class='card'><h2>{}</h2><p class='scope'>{}</p>{}<div class='chart-visual'>{}</div><h3>{}</h3><ul>{}</ul><table><caption>{} {}</caption><thead><tr><th>{}</th>{}<th>{} {}</th></tr></thead><tbody>{}</tbody></table></section>".format(esc(saved.title or chart.title), esc(saved.scope), note, _report_chart_svg(chart), esc(labels["evidence"]), "".join("<li>{}</li>".format(esc(item)) for item in saved.evidence), esc(labels["table"]), esc(saved.title or chart.title), esc(display_label(chart.dimension)), "<th>{}</th>".format(esc(display_label(chart.secondary_dimension))) if chart.secondary_dimension else "", esc(chart.aggregation), esc(display_label(chart.metric)), rows))
+    sections = "".join("<section class='card'><h2>{}</h2>{}<p>{}</p>{}</section>".format(esc(section.heading), "<h3>{}</h3><ul>{}</ul>".format(esc(labels["actions"]), "".join("<li>{}</li>".format(esc(action)) for action in section.recommended_actions)) if section.recommended_actions else "", esc(section.commentary), "") for section in document.sections)
+    glossary = "".join("<li><strong>{}</strong> — {}</li>".format(esc(item["label"]), esc(item["description"])) for item in document.glossary) or f"<li>{esc(labels['no_glossary'])}</li>"
+    artifact = """<!doctype html><html lang='{}'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.scope{{font-size:13px;color:#475569}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p class='scope'>{}: {} · {}</p><section class='meta'><h2>{}</h2><p>{}</p></section>{}{}<section class='meta'><h2>{}</h2><ul>{}</ul></section></main></body></html>""".format(document.locale, esc(document.title), esc(document.title), esc(labels["source"]), esc(metadata["source_label"]), esc(labels["print"]), esc(labels["summary"]), esc(document.executive_summary) or esc(labels["empty"]), sections, "".join(artifact_parts) or f"<section class='card'><p>{esc(labels['no_artifacts'])}</p></section>", esc(labels["glossary"]), glossary)
     compatibility_payload = json.dumps([chart.model_dump() for chart in charts]).replace("</", "<\\/")
     artifact += f"<!-- validated-artifact-json: {compatibility_payload} -->"
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-authored-report.html"'})
@@ -1331,6 +1385,23 @@ def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: s
     if not metric or not store or (wants_region and not grouping):
         return None
     return ChartRequest(dimension=store.name, secondary_dimension=grouping.name if wants_region else None, metric=metric.name, aggregation="sum", chart_type="bar", limit=int(top.group(1)), limit_per_secondary=wants_region)
+
+
+def _top_department_sales_by_division_request(columns: list[ColumnProfile], message: str) -> ChartRequest | None:
+    """Retain Department, Division partition, Sales metric, and Top-N in one plan."""
+    normalized = canonical_field_name(message).replace("_", " ")
+    top = re.search(r"(?:top|highest|cao nhat)\s+(\d{1,2})", normalized)
+    wants_department = bool(re.search(r"\b(?:department|departments|dept|phong ban)\b", normalized))
+    wants_division = bool(re.search(r"\b(?:division|divisions|khoi)\b", normalized))
+    wants_sales = bool(re.search(r"\b(?:sales?|sale|revenue|doanh thu|excl vat|vat excluded)\b", normalized))
+    if not top or not wants_department or not wants_division or not wants_sales:
+        return None
+    department = next((item for item in columns if item.kind == "cat" and canonical_field_name(item.name) in {"department", "dept"}), None)
+    division = next((item for item in columns if item.kind == "cat" and canonical_field_name(item.name) == "division"), None)
+    metric = cast(ColumnProfile | None, business_semantic_catalog(columns).metric("sales"))
+    if not department or not division or not metric:
+        return None
+    return ChartRequest(dimension=department.name, secondary_dimension=division.name, metric=metric.name, aggregation="sum", chart_type="bar", limit=int(top.group(1)), limit_per_secondary=True)
 
 
 def _has_explicit_unresolved_ranking(message: str) -> bool:
@@ -1495,7 +1566,7 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": state["selections"]})
         state = _selection_artifact(run_id)
     selections = cast(list[dict[str, object]], state["selections"])
-    exact_request = _top_stores_sales_by_region_request(profile_data.columns, request.message, selections)
+    exact_request = _top_department_sales_by_division_request(profile_data.columns, request.message) or _top_stores_sales_by_region_request(profile_data.columns, request.message, selections)
     comparison = comparison_target(profile_data.columns, request.message)
     explicit_b2b_b2c = bool(re.search(r"\b(?:compare|comparison|vs|versus|so sánh)\b", canonical_field_name(request.message).replace("_", " ")) and re.search(r"\bb2b\b", request.message, re.I) and re.search(r"\bb2c\b", request.message, re.I))
     if explicit_b2b_b2c and comparison is None:
