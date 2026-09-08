@@ -204,7 +204,7 @@ def analyst_proposals(columns: Iterable[object], max_charts: int = 5, language: 
 def evidence_for_chart(chart: object) -> list[dict[str, str | float]]:
     rows=getattr(chart,"rows",[]); title=getattr(chart,"title","chart")
     if not rows:return [{"chart":title,"kind":"no_data","text":"No matching values were available for this chart."}]
-    total=sum(float(row["value"]) for row in rows); top=rows[0]; share=0 if total==0 else round(float(top["value"])/total*100,1)
+    total=sum(float(row["value"]) for row in rows); top=max(rows, key=lambda row: float(row["value"])); share=0 if total==0 else round(float(top["value"])/total*100,1)
     return [{"chart":title,"kind":"top_segment","label":str(top["label"]),"value":float(top["value"]),"share_pct":share,"text":f"{top['label']} is the leading segment at {float(top['value']):,.2f} ({share}% of displayed total)."}]
 
 def narrative_from_evidence(evidence: list[dict[str, str | float]]) -> list[str]: return [str(item["text"]) for item in evidence]

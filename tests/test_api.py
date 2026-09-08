@@ -453,7 +453,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     assert body["title"] == "Top 2 Channel by Sales"
     assert body["answer"] == "I prepared a table of net_sales by channel."
     assert body["insight"] == "Online leads at 100."
-    assert body["scope"] == "SUM net_sales by channel; 2 results, sorted ranking"
+    assert body["scope"] == "SUM net_sales by channel; 2 results, sorted ranking; all data (no filters)"
     assert all("Không" not in value and "theo" not in value for value in [body["answer"], body["insight"], body["scope"], *body["caveats"]])
 
     chart = client.post(f"/api/runs/{run_id}/chat", json={"message": "Show a chart of net sales by channel", "language": "en"})

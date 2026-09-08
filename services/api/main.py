@@ -291,6 +291,9 @@ class ChatResponse(BaseModel):
 
 
 class ChartResult(BaseModel):
+    # Echo the server-validated request so client follow-ups (pin/report/Deep Dive)
+    # retain the exact chart contract instead of reconstructing it from display rows.
+    request: ChartRequest | None = None
     dimension: str
     metric: str
     aggregation: str
@@ -984,7 +987,7 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     insight_headline, evidence = chart_insight(chart_rows, chronological, language)
     per_secondary = bool(secondary and request.limit_per_secondary)
     title = presentation_title(request.metric, request.dimension, request.chart_type, language=language, limit=request.limit if per_secondary else len(chart_rows), secondary_dimension=request.secondary_dimension)
-    return ChartResult(dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
+    return ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
 
 
 @app.get("/api/runs/{run_id}/executive-overview", response_model=ExecutiveOverview)
@@ -1265,7 +1268,7 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
     base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
     api_key = os.getenv("LLM_API_KEY", "")
     model = os.getenv("LLM_MODEL", "")
-    safe_columns = [{"name": item.name, "kind": item.kind, "description": item.description, "distinct_count": item.distinct_count} for item in columns if item.kind != "id"]
+    safe_columns = [{"name": item.name, "kind": item.kind, "description": item.description, "distinct_count": item.distinct_count} for item in columns if item.kind != "id" and not is_sensitive_column(item.name)]
     if not base_url or not api_key or not model or not safe_columns:
         return None, None
     prompt = {"role": "system", "content": "You are a read-only data intent parser. Return ONLY JSON: {dimension,metric,aggregation,chart_type,limit,clarification}. Select dimension and metric only from schema. Never return SQL. chart_type must be bar or line; aggregation must be sum, avg, or count. If ambiguous, set clarification."}
@@ -1303,7 +1306,7 @@ def _llm_chart_request(columns: list[ColumnProfile], request: ChatRequest) -> tu
         if aggregation not in {"sum", "avg", "count"} or chart_type not in {"bar", "line"}:
             return None, None
         chart = ChartRequest(dimension=str(parsed["dimension"]), metric=str(parsed["metric"]), aggregation=cast(Literal["sum", "avg", "count"], aggregation), chart_type=cast(Literal["bar", "line"], chart_type), limit=min(30, max(1, int(parsed.get("limit", 12)))), filters=[])
-        known = {item.name: item for item in columns}
+        known = {item.name: item for item in columns if item.kind != "id" and not is_sensitive_column(item.name)}
         if chart.dimension not in known or chart.metric not in known or known[chart.dimension].kind not in {"time", "cat"} or known[chart.metric].kind != "num":
             return None, None
         if any(token in chart.metric.lower() for token in {"_id", "code", "key"}):
@@ -1330,10 +1333,13 @@ def _selection_artifact(run_id: str) -> dict[str, object]:
 def _named_columns(columns: list[ColumnProfile], message: str) -> set[str]:
     """Find explicit schema names, treating underscore/hyphen/space as equivalent."""
     normalized = re.sub(r"[^a-z0-9]+", " ", message.casefold()).strip()
-    return {
+    matches = {
         item.name for item in columns
         if re.search(rf"(?<![a-z0-9]){re.escape(re.sub(r'[^a-z0-9]+', ' ', item.name.casefold()).strip())}(?![a-z0-9])", normalized)
     }
+    # A shorter overlapping name (EXCL_VAT) is not a second requested metric
+    # when the user explicitly names SALE_EXCL_VAT.
+    return {name for name in matches if not any(name != other and canonical_field_name(name) in canonical_field_name(other) for other in matches)}
 
 
 def _semantic_clarification(columns: list[ColumnProfile], message: str, selections: list[dict[str, object]], language: Literal["en", "vi"] = "en") -> list[ClarificationOption]:
@@ -1371,11 +1377,11 @@ def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: s
     callers detect explicit-but-incomplete ranking language and ask for clarification.
     """
     normalized = canonical_field_name(message).replace("_", " ")
-    top = re.search(r"(?:top|highest|cao nhat)\s+(\d{1,2})", normalized)
+    top = re.search(r"(?:top|highest|cao nhat)\s+(\d+)\b", normalized)
     wants_store = bool(re.search(r"\b(?:store|stores|site|sites|cua hang)\b", normalized))
     wants_sales = bool(re.search(r"\b(?:sales?|sale|revenue|doanh thu|excl vat|vat excluded)\b", normalized))
     wants_region = bool(re.search(r"\b(?:region|regions|vung|mien)\b", normalized))
-    if not top or not wants_store or not wants_sales:
+    if not top or not 1 <= int(top.group(1)) <= 30 or not wants_store or not wants_sales:
         return None
     catalog = business_semantic_catalog(columns)
     metric, store = catalog.metric("sales"), catalog.location()
@@ -1390,11 +1396,11 @@ def _top_stores_sales_by_region_request(columns: list[ColumnProfile], message: s
 def _top_department_sales_by_division_request(columns: list[ColumnProfile], message: str) -> ChartRequest | None:
     """Retain Department, Division partition, Sales metric, and Top-N in one plan."""
     normalized = canonical_field_name(message).replace("_", " ")
-    top = re.search(r"(?:top|highest|cao nhat)\s+(\d{1,2})", normalized)
+    top = re.search(r"(?:top|highest|cao nhat)\s+(\d+)\b", normalized)
     wants_department = bool(re.search(r"\b(?:department|departments|dept|phong ban)\b", normalized))
     wants_division = bool(re.search(r"\b(?:division|divisions|khoi)\b", normalized))
     wants_sales = bool(re.search(r"\b(?:sales?|sale|revenue|doanh thu|excl vat|vat excluded)\b", normalized))
-    if not top or not wants_department or not wants_division or not wants_sales:
+    if not top or not 1 <= int(top.group(1)) <= 30 or not wants_department or not wants_division or not wants_sales:
         return None
     department = next((item for item in columns if item.kind == "cat" and canonical_field_name(item.name) in {"department", "dept"}), None)
     division = next((item for item in columns if item.kind == "cat" and canonical_field_name(item.name) == "division"), None)
@@ -1443,7 +1449,7 @@ def _chat_metric(columns: list[ColumnProfile], message: str, selections: list[di
     metrics = [item for item in columns if item.kind == "num" and not any(token in item.name.lower() for token in {"_id", "code", "key"})]
     selected = {str(item.get("column")) for item in selections if item.get("role") == "metric"}
     named = _named_columns(columns, message)
-    direct = next((item for item in metrics if item.name in named or item.name in selected), None)
+    direct = next((item for item in metrics if item.name in named), None) or next((item for item in metrics if item.name in selected), None)
     if direct:
         return direct
     catalog = business_semantic_catalog(columns)
@@ -1459,7 +1465,7 @@ def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list
     fields = [item for item in columns if item.kind in {"time", "cat"}]
     selected = {str(item.get("column")) for item in selections if item.get("role") == "dimension"}
     named = _named_columns(columns, message)
-    direct = next((item for item in fields if item.name in named or item.name in selected), None)
+    direct = next((item for item in fields if item.name in named), None) or next((item for item in fields if item.name in selected), None)
     if direct:
         return direct
     if any(word in normalized for word in {"thang", "month", "ngay", "day", "trend", "xu huong", "6 thang", "nam"}):
@@ -1469,6 +1475,67 @@ def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list
         if any(word in normalized for word in words if len(word) > 2):
             return item
     return fields[0] if len(fields) == 1 else None
+
+
+def _complete_chat_intent(columns: list[ColumnProfile], message: str, chart: ChartRequest) -> ChartRequest:
+    """Fail closed on unsupported explicit scope; never silently drop predicates.
+
+    This validates deterministic and LLM plans alike before server-side execution.
+    The supported textual predicate syntax is deliberately the existing safe parser.
+    """
+    analysis, *predicate = re.split(r"\b(?:where|with filter|filter by)\b", message, maxsplit=1, flags=re.I)
+    normalized = canonical_field_name(analysis).replace("_", " ")
+    named = _named_columns(columns, analysis)
+    metrics = [item.name for item in columns if item.kind == "num" and item.name in named]
+    dimensions = [item.name for item in columns if item.kind in {"cat", "time"} and item.name in named]
+    if len(metrics) > 1:
+        raise ValueError("Choose one numeric measure per analysis.")
+    if metrics and chart.metric != metrics[0]:
+        chart = chart.model_copy(update={"metric": metrics[0]})
+    if any(name not in {chart.dimension, chart.secondary_dimension} for name in dimensions):
+        raise ValueError("Every named grouping must be retained; choose the grouping and partition explicitly.")
+    # Relative periods, comparisons and time bucketing need an execution contract,
+    # not an unfiltered trend that merely mentions the missing scope in a caveat.
+    if re.search(r"\b(last|previous|this|next)\s+(\d+\s+)?(day|week|month|quarter|year)s?\b|\b(yoy|year over year|cung ky|nam ngoai)\b", normalized):
+        raise ValueError("Use explicit date filters; relative periods and period comparisons are not supported.")
+    if re.search(r"\b(for|only|excluding|except|during)\b", normalized):
+        raise ValueError("Express the requested restriction as 'where column = value'.")
+    if re.search(r"\b(departments?|dept|division)\b", normalized) and not chart.secondary_dimension and re.search(r"\b(top|per|each)\b", normalized):
+        raise ValueError("The requested ranked dimension and partition are unavailable.")
+    if re.search(r"\b(per|each|within)\b", normalized) and re.search(r"\btop\s+\d+", normalized) and not chart.limit_per_secondary:
+        raise ValueError("The requested per-group ranking could not be resolved.")
+    top = re.search(r"\b(?:top|highest|cao nhat)\s+(\d+)\b", normalized)
+    updates: dict[str, object] = {}
+    if top:
+        limit = int(top.group(1))
+        if not 1 <= limit <= 30:
+            raise ValueError("Top N must be between 1 and 30.")
+        updates.update(limit=limit, chart_type="bar")
+    if re.search(r"\b(avg|average|mean|trung binh)\b", normalized):
+        updates["aggregation"] = "avg"
+    elif re.search(r"\b(count|dem)\b", normalized):
+        updates["aggregation"] = "count"
+    elif re.search(r"\b(sum|total|tong)\b", normalized):
+        updates["aggregation"] = "sum"
+    requested_type = next((kind for kind in ("scatter", "heatmap", "stacked_bar", "donut", "pie", "area", "line", "bar", "pareto") if re.search(rf"\b{kind.replace('_', ' ')}\b", normalized)), None)
+    if requested_type:
+        if requested_type == "scatter" or (requested_type in {"heatmap", "stacked_bar"} and not chart.secondary_dimension):
+            raise ValueError("This visual needs additional explicit fields; choose a supported single-measure chart.")
+        dimension = next(item for item in columns if item.name == chart.dimension)
+        if requested_type in {"pie", "donut"} and (chart.secondary_dimension or dimension.kind != "cat"):
+            raise ValueError("Pie/donut requires one categorical grouping.")
+        if requested_type in {"line", "area"} and dimension.kind != "time":
+            raise ValueError("Line/area requires a time grouping.")
+        updates["chart_type"] = requested_type
+    if predicate:
+        filters = []
+        for text in re.split(r"\s+and\s+", predicate[0], flags=re.I):
+            if re.search(r"\s+or\s+", text, re.I):
+                raise ValueError("OR predicates are not supported.")
+            parsed = parse_filter(text, [item.name for item in columns if item.kind != "id" and not is_sensitive_column(item.name)])
+            filters.append(FilterSpec.model_validate({"column": parsed.column, "operator": parsed.operator, "value": parsed.value}))
+        updates["filters"] = [*chart.filters, *filters]
+    return ChartRequest.model_validate({**chart.model_dump(), **updates})
 
 
 def _output_intent(message: str) -> Literal["table", "chart"]:
@@ -1500,12 +1567,16 @@ def chart_insight(rows: list[dict[str, str | float | int]], chronological: bool,
     values = [float(row["value"]) for row in rows]
     if chronological and len(rows) >= 2:
         first, last = values[0], values[-1]; delta = last - first; change = 0 if first == 0 else delta / abs(first) * 100; peak_index, trough_index = values.index(max(values)), values.index(min(values))
+        if first == 0:
+            headline = "Tỷ lệ thay đổi không xác định vì đầu kỳ bằng 0." if language == "vi" else "Percentage change is undefined because the first period is zero."
+            return headline, [f"{rows[0]['display_label']}: {compact_number(first)} → {rows[-1]['display_label']}: {compact_number(last)}; Δ {compact_number(delta)}."]
         if language == "vi":
             direction = "tăng" if delta >= 0 else "giảm"
             return (f"Giá trị cuối kỳ {direction} {percent(abs(change))} so với đầu kỳ.", [f"Từ {rows[0]['display_label']}: {compact_number(first)} đến {rows[-1]['display_label']}: {compact_number(last)} ({direction} {compact_number(abs(delta))}).", f"Đỉnh: {rows[peak_index]['display_label']} với {compact_number(values[peak_index])}; thấp nhất: {rows[trough_index]['display_label']} với {compact_number(values[trough_index])}."])
         direction = "increased" if delta >= 0 else "decreased"
         return (f"The final period {direction} by {percent(abs(change))} from the first period.", [f"From {rows[0]['display_label']}: {compact_number(first)} to {rows[-1]['display_label']}: {compact_number(last)} ({direction} by {compact_number(abs(delta))}).", f"Peak: {rows[peak_index]['display_label']} at {compact_number(values[peak_index])}; low: {rows[trough_index]['display_label']} at {compact_number(values[trough_index])}."])
-    total = sum(values); top = rows[0]; share = 0 if total == 0 else float(top["value"]) / total * 100; second = values[1] if len(values) > 1 else None
+    ranked = sorted(rows, key=lambda row: float(row["value"]), reverse=True)
+    total = sum(values); top = ranked[0]; share = 0 if total == 0 else float(top["value"]) / total * 100; second = float(ranked[1]["value"]) if len(ranked) > 1 else None
     if language == "vi":
         bullets = [f"Dẫn đầu: {top['display_label']} với {compact_number(float(top['value']))}, chiếm {percent(share)} trong phần kết quả hiển thị."]
         if second is not None: bullets.append(f"Chênh lệch với hạng hai: {compact_number(float(top['value']) - second)}.")
@@ -1548,7 +1619,7 @@ def select_semantic_column(run_id: str, request: SemanticSelectionRequest) -> Ch
             planner="deterministic",
         )
     RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections})
-    return chat_about_run(run_id, ChatRequest(message=pending_message, language=cast(Literal["en", "vi"], request.language)), allow_llm=False)
+    return chat_about_run(run_id, ChatRequest(message=pending_message, language=cast(Literal["en", "vi"], continuation.get("language", request.language) if isinstance(continuation, dict) else request.language)), allow_llm=False)
 
 
 @app.post("/api/runs/{run_id}/chat", response_model=ChatResponse)
@@ -1556,19 +1627,19 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     """Constrained data conversation: natural language maps only to a validated aggregate."""
     headers, rows = load_run(run_id)
     profile_data = profile_for_run(run_id, headers, rows)
-    if is_starter_analysis_request(request.message):
-        return _starter_analysis_response(profile_data.columns, request.message, request.language)
     state = _selection_artifact(run_id)
     continuation = state.get("continuation")
-    if isinstance(continuation, dict) and continuation.get("message") != request.message:
+    if (isinstance(continuation, dict) and continuation.get("message") != request.message) or (state.get("pending_message") and state.get("pending_message") != request.message):
         # A new question must not inherit an old pending continuation, but retains
         # explicit run-scoped selections that the user has already confirmed.
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": state["selections"]})
         state = _selection_artifact(run_id)
+    if is_starter_analysis_request(request.message):
+        return _starter_analysis_response(profile_data.columns, request.message, request.language)
     selections = cast(list[dict[str, object]], state["selections"])
     exact_request = _top_department_sales_by_division_request(profile_data.columns, request.message) or _top_stores_sales_by_region_request(profile_data.columns, request.message, selections)
     comparison = comparison_target(profile_data.columns, request.message)
-    explicit_b2b_b2c = bool(re.search(r"\b(?:compare|comparison|vs|versus|so sánh)\b", canonical_field_name(request.message).replace("_", " ")) and re.search(r"\bb2b\b", request.message, re.I) and re.search(r"\bb2c\b", request.message, re.I))
+    explicit_b2b_b2c = bool(re.search(r"\b(?:compare|comparison|vs|versus|so sanh)\b", canonical_field_name(request.message).replace("_", " ")) and re.search(r"\bb2b\b", request.message, re.I) and re.search(r"\bb2c\b", request.message, re.I))
     if explicit_b2b_b2c and comparison is None:
         answer = "I could not find a validated business-model or channel field to compare B2B and B2C, so no unrelated trend was run." if request.language == "en" else "Không tìm thấy trường mô hình kinh doanh hoặc kênh đã xác thực để so sánh B2B và B2C; chưa chạy xu hướng thay thế."
         return ChatResponse(answer=answer, insight="No aggregate ran." if request.language == "en" else "Chưa chạy aggregate.", scope="Awaiting a comparison field" if request.language == "en" else "Chờ trường so sánh", caveats=[], clarification_options=[ClarificationOption(column=item.name, label=display_label(item.name), reason="Categorical comparison candidate.", role="dimension") for item in profile_data.columns if item.kind == "cat" and not is_sensitive_column(item.name)][:4], mode="clarification")
@@ -1588,11 +1659,11 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         return clarification
     clarification_options = [] if (exact_request or comparison) else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
-        RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "pending_message": request.message})
+        RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "continuation": {"message": request.message, "language": request.language, "allowed_options": [{"column": option.column, "role": option.role} for option in clarification_options]}})
         if request.language == "vi":
             return ChatResponse(answer="Có hơn một cột phù hợp nhưng chưa đủ chắc về ý nghĩa nghiệp vụ hoặc phạm vi. Hãy xác nhận cột muốn dùng.", insight="Chưa chạy aggregate để tránh tự suy diễn chỉ tiêu hoặc phạm vi.", scope="Chờ xác nhận semantic", caveats=["Lựa chọn chỉ áp dụng cho dataset/run hiện tại và được gắn provenance User."], clarification_options=clarification_options, mode="clarification")
         return ChatResponse(answer="More than one column could fit, but its business meaning or scope is not yet certain. Please confirm the column to use.", insight="No aggregate has run, to avoid inferring a metric or scope.", scope="Awaiting semantic confirmation", caveats=["Your selection applies only to this dataset/run and is recorded with User provenance."], clarification_options=clarification_options, mode="clarification")
-    llm_request, clarification = _llm_chart_request(profile_data.columns, request) if allow_llm else (None, None)
+    llm_request, clarification = _llm_chart_request(profile_data.columns, request) if allow_llm and not (exact_request or comparison) else (None, None)
     if clarification:
         return ChatResponse(answer=clarification, insight="AI cần xác nhận phạm vi trước khi chạy aggregate." if request.language == "vi" else "AI needs scope confirmation before running an aggregate.", scope="Chưa chạy phân tích" if request.language == "vi" else "No analysis has run", caveats=[], mode="clarification", planner="llm")
     planner = "llm" if llm_request else "deterministic"
@@ -1611,11 +1682,18 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         if metric is None or dimension is None:
             return ChatResponse(answer="Cần một metric số và một trường thời gian hoặc dimension để phân tích. Có thể hỏi ‘Doanh thu theo tháng’ hoặc ‘Doanh thu theo kênh’." if request.language == "vi" else "I need a numeric metric and a time or categorical dimension to analyze. Try a question such as ‘Revenue by month’ or ‘Revenue by channel’.", insight="Chưa tìm được cặp metric/dimension an toàn trong dataset này." if request.language == "vi" else "No safe metric/dimension pair was found in this dataset.", scope="Chưa chạy phân tích" if request.language == "vi" else "No analysis has run", caveats=[], mode="clarification")
         chart_request = ChartRequest(dimension=dimension.name, metric=metric.name, aggregation="sum", chart_type="line" if dimension.kind == "time" else "bar", limit=12)
+    try:
+        chart_request = _complete_chat_intent(profile_data.columns, request.message, chart_request)
+    except ValueError as error:
+        return ChatResponse(answer=(f"Please clarify the requested scope: {error}" if request.language == "en" else f"Hãy xác nhận phạm vi yêu cầu: {error}"), insight="No aggregate ran." if request.language == "en" else "Chưa chạy aggregate.", scope="Awaiting complete intent", caveats=[], mode="clarification")
     output_intent = _output_intent(request.message)
     chart = build_chart(run_id, chart_request, request.language)
     metric = next(item for item in profile_data.columns if item.name == chart_request.metric)
     dimension = next(item for item in profile_data.columns if item.name == chart_request.dimension)
     scope = (f"{chart.aggregation.upper()} {metric.name} theo {dimension.name}; {chart.result_count} kết quả, xếp {chart.sort_mode}" if request.language == "vi" else f"{chart.aggregation.upper()} {metric.name} by {dimension.name}; {chart.result_count} results, sorted {chart.sort_mode}")
+    if chart_request.secondary_dimension:
+        scope += f"; per {chart_request.secondary_dimension}; top {chart_request.limit} per group" if chart_request.limit_per_secondary else f"; {chart_request.secondary_dimension}"
+    scope += "; " + (json.dumps([item.model_dump() for item in chart_request.filters], ensure_ascii=False) if chart_request.filters else "all data (no filters)")
     insight = chart.insight_headline
     caveats = list(chart.warnings)
     if any(word in request.message.lower() for word in {"cùng kỳ", "year over year", "yoy", "năm ngoái"}):
