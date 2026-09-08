@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 import re
 import secrets
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from openpyxl import load_workbook
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_serializer
 
 from database_adapters import read_registered_source
 from formatting import compact_number, format_display_date, format_number, parse_date_value, percent, value_format_descriptor
@@ -155,6 +155,19 @@ class FilterSpec(BaseModel):
             raise ValueError("A filter value is required.")
 
 
+class DateScope(BaseModel):
+    """A run-scoped, inclusive date range; validated against the active profile."""
+    column: str = Field(min_length=1, max_length=160)
+    start: date | None = None
+    end: date | None = None
+
+    def model_post_init(self, __context: object) -> None:
+        if self.start is None and self.end is None:
+            raise ValueError("Date scope requires a start or end date.")
+        if self.start is not None and self.end is not None and self.start > self.end:
+            raise ValueError("Date scope start must not be after end.")
+
+
 class DataQuery(BaseModel):
     """Validated raw-data query; filters are schema fields, never client SQL."""
     page: int = Field(default=1, ge=1)
@@ -179,6 +192,15 @@ class ChartRequest(BaseModel):
     limit_per_secondary: bool = False
     limit: int = Field(default=12, ge=1, le=30)
     filters: list[FilterSpec] = Field(default_factory=list, max_length=10)
+    # Applied in addition to chart-local filters. Values never become SQL fragments.
+    date_scope: DateScope | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_compatibly(self, handler):  # type: ignore[no-untyped-def]
+        payload = handler(self)
+        if self.date_scope is None:
+            payload.pop("date_scope", None)
+        return payload
 
 
 class ReportRequest(BaseModel):
@@ -197,6 +219,26 @@ class ReportSection(BaseModel):
 class ManualGlossaryNote(BaseModel):
     note_id: str = Field(min_length=1, max_length=80)
     text: str = Field(min_length=1, max_length=1_000)
+
+
+REPORT_LAYOUTS = {
+    "executive_briefing",
+    "sales_performance_review",
+    "category_division_deep_dive",
+    "weekly_monthly_business_review",
+    # Retain the legacy persisted value on read/write for old clients.
+    "executive",
+}
+LEGACY_REPORT_LAYOUTS = {"executive": "executive_briefing"}
+
+
+class ReportLayoutBlueprint(BaseModel):
+    """Presentation-only durable layout choice; artifacts remain server validated."""
+    template: str = "executive_briefing"
+
+    def model_post_init(self, __context: object) -> None:
+        if self.template not in REPORT_LAYOUTS:
+            raise ValueError("Unknown report layout blueprint.")
 
 
 class CustomReportArtifact(BaseModel):
@@ -218,7 +260,7 @@ class CustomReportDocument(BaseModel):
     locale: Literal["en", "vi"] = "en"
     # A presentation-only blueprint from the editor.  It never changes validated
     # artifacts and remains optional so documents saved by older clients still load.
-    layout_blueprint: dict[str, object] = Field(default_factory=dict)
+    layout_blueprint: ReportLayoutBlueprint = Field(default_factory=ReportLayoutBlueprint)
     executive_summary: str = Field(default="", max_length=8_000)
     sections: list[ReportSection] = Field(default_factory=list, max_length=20)
     pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
@@ -230,7 +272,7 @@ class CustomReportDocument(BaseModel):
 class CustomReportUpdate(BaseModel):
     title: str = Field(default="Custom Report", min_length=1, max_length=120)
     locale: Literal["en", "vi"] = "en"
-    layout_blueprint: dict[str, object] = Field(default_factory=dict)
+    layout_blueprint: ReportLayoutBlueprint = Field(default_factory=ReportLayoutBlueprint)
     executive_summary: str = Field(default="", max_length=8_000)
     sections: list[ReportSection] = Field(default_factory=list, max_length=20)
     pinned_artifacts: list[CustomReportArtifact] = Field(default_factory=list, max_length=24)
@@ -255,6 +297,7 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=2, max_length=1000)
     context: str = Field(default="", max_length=1000)
     language: Literal["en", "vi"] = "en"
+    date_scope: DateScope | None = None
 
 
 class ClarificationOption(BaseModel):
@@ -331,6 +374,7 @@ class ExecutiveScorecard(BaseModel):
 class ExecutiveOverview(BaseModel):
     run_id: str
     summary: str
+    applied_date_scope: DateScope | None = None
     scorecards: list[ExecutiveScorecard] = Field(default_factory=list)
     charts: list[ChartResult]
     warnings: list[str] = Field(default_factory=list)
@@ -885,6 +929,31 @@ def values(run_id: str, column: str) -> dict[str, str | list[str]]:
     return {"column": column, "values": result}
 
 
+def _date_scope_clause(scope: DateScope | None, headers: list[str], profiles: dict[str, ColumnProfile]) -> tuple[str | None, list[str]]:
+    """Compile the sole global range contract after profile validation.
+
+    DuckDB receives ISO parameters only; casting the source value to DATE makes both
+    boundaries inclusive even when a source time column includes a time-of-day.
+    """
+    if scope is None:
+        return None, []
+    profile = profiles.get(scope.column)
+    if profile is None:
+        raise HTTPException(422, f"Unknown date scope column: {scope.column}")
+    if profile.kind != "time":
+        raise HTTPException(422, "Date scope column must be a confirmed time field.")
+    field = quote_identifier(scope.column, headers)
+    clauses: list[str] = [f"TRY_CAST({field} AS TIMESTAMP) IS NOT NULL"]
+    parameters: list[str] = []
+    if scope.start is not None:
+        clauses.append(f"CAST(TRY_CAST({field} AS TIMESTAMP) AS DATE) >= CAST(? AS DATE)")
+        parameters.append(scope.start.isoformat())
+    if scope.end is not None:
+        clauses.append(f"CAST(TRY_CAST({field} AS TIMESTAMP) AS DATE) <= CAST(? AS DATE)")
+        parameters.append(scope.end.isoformat())
+    return " AND ".join(clauses), parameters
+
+
 @app.post("/api/runs/{run_id}/chart", response_model=ChartResult)
 def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"] = "vi") -> ChartResult:
     headers, rows = load_run(run_id)
@@ -941,6 +1010,10 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
         else:
             filter_clauses.append(f"{field} {operator} ?")
             parameters.append(item.value)
+    date_scope_clause, date_scope_parameters = _date_scope_clause(request.date_scope, headers, profiles)
+    if date_scope_clause:
+        filter_clauses.append(date_scope_clause)
+        parameters.extend(date_scope_parameters)
     chronological = request.chart_type in {"line", "area"} and dimension_profile.kind == "time" and not secondary
     connection = duckdb.connect(":memory:")
     try:
@@ -991,7 +1064,16 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
 
 
 @app.get("/api/runs/{run_id}/executive-overview", response_model=ExecutiveOverview)
-def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> ExecutiveOverview:
+def executive_overview(
+    run_id: str,
+    language: Literal["en", "vi"] = "en",
+    date_column: str | None = None,
+    start: date | None = None,
+    end: date | None = None,
+) -> ExecutiveOverview:
+    if (start is not None or end is not None) and not date_column:
+        raise HTTPException(422, "date_column is required when a date range is supplied.")
+    date_scope = DateScope(column=date_column, start=start, end=end) if date_column else None
     """Generate only schema-derived, server-validated executive aggregates."""
     headers, rows = load_run(run_id)
     profile_data = profile_for_run(run_id, headers, rows)
@@ -1001,6 +1083,7 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
     for proposal in proposals:
         try:
             request = ChartRequest.model_validate(cast(dict[str, object], proposal["request"]))
+            request = request.model_copy(update={"date_scope": date_scope})
             chart = build_chart(run_id, request, language)
             if chart.rows:
                 charts.append(chart)
@@ -1012,6 +1095,9 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
     all_metrics = [item for item in [*catalog.sales_metrics, *catalog.quantity_metrics, *catalog.cost_metrics, *catalog.profit_metrics] if item is not None]
     all_metrics.extend(item for item in profile_data.columns if item.kind == "num" and item not in all_metrics and not any(token in canonical_field_name(item.name) for token in ("id", "code", "key")))
     scorecards: list[ExecutiveScorecard] = []
+    profile_columns = {item.name: item for item in profile_data.columns}
+    scorecard_scope_clause, scorecard_scope_parameters = _date_scope_clause(date_scope, headers, profile_columns)
+    scorecard_where = f" WHERE {scorecard_scope_clause}" if scorecard_scope_clause else ""
     safe_time: ColumnProfile | None = next((item for item in profile_data.columns if item.kind == "time"), None)
     connection = duckdb.connect(":memory:")
     try:
@@ -1020,18 +1106,23 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
             if len(scorecards) == 4:
                 break
             identifier = quote_identifier(metric.name, headers)
-            value = connection.execute(f"SELECT SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) FROM dataset").fetchone()[0]
+            value = connection.execute(
+                f"SELECT SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) FROM dataset{scorecard_where}",
+                scorecard_scope_parameters,
+            ).fetchone()[0]
             if value is None:
                 continue
             label = display_label(metric.name)
-            scope = (f"Tổng {label} trên toàn bộ dataset" if language == "vi" else f"Full-dataset sum of {label}")
+            scope = (f"Tổng {label} trong phạm vi ngày đã chọn" if date_scope and language == "vi" else f"Sum of {label} in the selected date scope" if date_scope else f"Tổng {label} trên toàn bộ dataset" if language == "vi" else f"Full-dataset sum of {label}")
             comparison: dict[str, object] = {}
             if safe_time:
                 time_identifier = quote_identifier(safe_time.name, headers)
                 periods = connection.execute(
                     f"SELECT {time_identifier}, SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) "
-                    f"FROM dataset WHERE TRY_CAST({time_identifier} AS TIMESTAMP) IS NOT NULL "
-                    f"GROUP BY 1 ORDER BY TRY_CAST({time_identifier} AS TIMESTAMP) ASC"
+                    f"FROM dataset WHERE TRY_CAST({time_identifier} AS TIMESTAMP) IS NOT NULL"
+                    f"{' AND ' + scorecard_scope_clause if scorecard_scope_clause else ''} "
+                    f"GROUP BY 1 ORDER BY TRY_CAST({time_identifier} AS TIMESTAMP) ASC",
+                    scorecard_scope_parameters,
                 ).fetchall()
                 if len(periods) >= 2:
                     values = [float(period_value or 0) for _, period_value in periods]
@@ -1049,7 +1140,7 @@ def executive_overview(run_id: str, language: Literal["en", "vi"] = "en") -> Exe
         warnings.append((f"Chỉ có {len(scorecards)} scorecard vì schema không có đủ bốn metric số an toàn." if language == "vi" else f"Only {len(scorecards)} scorecards are available because the schema has fewer than four safe numeric metrics."))
     summary = (f"Bộ tổng quan gồm {len(scorecards)} scorecard và {len(charts)} biểu đồ aggregate đã xác thực từ {profile_data.row_count:,} dòng." if language == "vi" else f"This executive overview contains {len(scorecards)} validated scorecards and {len(charts)} validated aggregate charts from {profile_data.row_count:,} rows.")
     guardrail = ("Scorecard và biểu đồ chỉ dùng aggregate run-scoped đã xác thực trên server; không dùng raw rows hoặc trường nhạy cảm." if language == "vi" else "Scorecards and charts use only validated, run-scoped server aggregates; no raw rows or sensitive fields are used.")
-    return ExecutiveOverview(run_id=run_id, summary=summary, scorecards=scorecards, charts=charts, warnings=warnings, guardrail=guardrail)
+    return ExecutiveOverview(run_id=run_id, summary=summary, applied_date_scope=date_scope, scorecards=scorecards, charts=charts, warnings=warnings, guardrail=guardrail)
 
 def _custom_report_glossary(run_id: str, artifacts: list[CustomReportArtifact]) -> list[dict[str, str]]:
     headers, rows = load_run(run_id)
@@ -1080,6 +1171,26 @@ def _report_artifact(run_id: str, artifact: CustomReportArtifact, language: Lite
             scope += "; filtered to " + "; ".join(f"{display_label(item.column)} {item.operator.replace('_', ' ')} {item.value}" for item in chart.filters)
         scope += f"; top {chart.result_count or len(chart.rows)} {chart.sort_mode or 'results'}."
     return CustomReportArtifact(artifact_id=artifact.artifact_id, chart=artifact.chart, annotation=artifact.annotation, title=chart.title, scope=scope, evidence=chart.evidence, warnings=chart.warnings, result=chart)
+
+
+def _report_layout_slots(template: str, artifacts: list[CustomReportArtifact]) -> dict[str, list[CustomReportArtifact]]:
+    """Deterministically allocate immutable evidence to semantic report slots."""
+    slots: dict[str, list[CustomReportArtifact]] = {"trend": [], "ranking": [], "share": [], "evidence": [], "overflow": []}
+    for artifact in artifacts:
+        chart = artifact.result
+        role = "evidence"
+        if chart:
+            if chart.chart_type in {"line", "area"} or chart.sort_mode == "chronological":
+                role = "trend"
+            elif chart.chart_type in {"pie", "donut"}:
+                role = "share"
+            elif chart.chart_type in {"bar", "pareto", "stacked_bar"}:
+                role = "ranking"
+        if slots[role]:
+            slots["overflow"].append(artifact)
+        else:
+            slots[role].append(artifact)
+    return slots
 
 
 def _custom_report_document(run_id: str, update: CustomReportUpdate | None = None) -> CustomReportDocument:
@@ -1259,6 +1370,35 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     sections = "".join("<section class='card'><h2>{}</h2>{}<p>{}</p>{}</section>".format(esc(section.heading), "<h3>{}</h3><ul>{}</ul>".format(esc(labels["actions"]), "".join("<li>{}</li>".format(esc(action)) for action in section.recommended_actions)) if section.recommended_actions else "", esc(section.commentary), "") for section in document.sections)
     glossary = "".join("<li><strong>{}</strong> — {}</li>".format(esc(item["label"]), esc(item["description"])) for item in document.glossary) or f"<li>{esc(labels['no_glossary'])}</li>"
     artifact = """<!doctype html><html lang='{}'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.scope{{font-size:13px;color:#475569}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p class='scope'>{}: {} · {}</p><section class='meta'><h2>{}</h2><p>{}</p></section>{}{}<section class='meta'><h2>{}</h2><ul>{}</ul></section></main></body></html>""".format(document.locale, esc(document.title), esc(document.title), esc(labels["source"]), esc(metadata["source_label"]), esc(labels["print"]), esc(labels["summary"]), esc(document.executive_summary) or esc(labels["empty"]), sections, "".join(artifact_parts) or f"<section class='card'><p>{esc(labels['no_artifacts'])}</p></section>", esc(labels["glossary"]), glossary)
+    # The export advertises the persisted blueprint with stable structural regions.
+    # The editor can use the same role names without inferring facts from titles.
+    layout_template = LEGACY_REPORT_LAYOUTS.get(document.layout_blueprint.template, document.layout_blueprint.template)
+    layout_regions = {
+        "executive_briefing": ("cover", "kpi-evidence", "synthesis", "growth", "drivers", "risks", "actions", "notes"),
+        "sales_performance_review": ("period", "sales-kpis", "hero-trend", "ranking-share", "risks-opportunities", "actions"),
+        "category_division_deep_dive": ("scope", "segment-summary", "contribution-ranking", "comparison", "evidence", "segment-actions"),
+        "weekly_monthly_business_review": ("period-snapshot", "previous-comparison", "wins-watchouts", "trend-grid", "decisions", "action-tracker"),
+    }[layout_template]
+    slots = _report_layout_slots(layout_template, document.pinned_artifacts)
+    slot_roles = {
+        "executive_briefing": {"kpi-evidence": "evidence", "growth": "trend", "drivers": "ranking", "risks": "share"},
+        "sales_performance_review": {"sales-kpis": "evidence", "hero-trend": "trend", "ranking-share": "ranking", "risks-opportunities": "share"},
+        "category_division_deep_dive": {"segment-summary": "evidence", "contribution-ranking": "ranking", "comparison": "share", "evidence": "trend"},
+        "weekly_monthly_business_review": {"period-snapshot": "evidence", "previous-comparison": "trend", "trend-grid": "ranking", "wins-watchouts": "share"},
+    }[layout_template]
+    def layout_slot(name: str) -> str:
+        role = slot_roles.get(name)
+        items = slots.get(role, []) if role else []
+        if items:
+            content = "".join("<p class='slot-artifact'>{}</p>".format(esc(item.title or item.artifact_id)) for item in items)
+        else:
+            content = "<p class='slot-empty'>Pin a matching validated artifact to populate this slot.</p>"
+        return f"<section class='layout-slot layout-slot--{name}' data-slot='{name}'><h2>{esc(name.replace('-', ' ').title())}</h2>{content}</section>"
+    layout_markup = "".join(layout_slot(name) for name in layout_regions)
+    artifact = artifact.replace("<main>", f"<main class='report-layout report-layout--{layout_template}' data-layout-blueprint='{layout_template}'>{layout_markup}", 1)
+    artifact += "<!-- report-layout-slots: {} -->".format(
+        json.dumps({role: [item.artifact_id for item in items] for role, items in slots.items()}, separators=(",", ":"))
+    )
     compatibility_payload = json.dumps([chart.model_dump() for chart in charts]).replace("</", "<\\/")
     artifact += f"<!-- validated-artifact-json: {compatibility_payload} -->"
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-authored-report.html"'})
@@ -1687,6 +1827,7 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     except ValueError as error:
         return ChatResponse(answer=(f"Please clarify the requested scope: {error}" if request.language == "en" else f"Hãy xác nhận phạm vi yêu cầu: {error}"), insight="No aggregate ran." if request.language == "en" else "Chưa chạy aggregate.", scope="Awaiting complete intent", caveats=[], mode="clarification")
     output_intent = _output_intent(request.message)
+    chart_request = chart_request.model_copy(update={"date_scope": request.date_scope})
     chart = build_chart(run_id, chart_request, request.language)
     metric = next(item for item in profile_data.columns if item.name == chart_request.metric)
     dimension = next(item for item in profile_data.columns if item.name == chart_request.dimension)

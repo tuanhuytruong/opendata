@@ -4,94 +4,17 @@ import { ChartResult, ChartRow } from '../types';
 import { Language } from '../i18n';
 import { chartCategoryLabel, formatChartValue } from '../formatting';
 
-/** Ordered for adjacent contrast and stable by category row order. */
 export const CATEGORY_PALETTE = ['#4f46e5', '#0f766e', '#c2410c', '#be185d', '#0284c7', '#65a30d', '#9333ea', '#ea580c', '#475569', '#db2777'];
 const PRIMARY_COLOR = CATEGORY_PALETTE[0];
-const CHART_TYPE = { axis: 10, legend: 10, label: 9, tooltip: 12 };
-
-export function numericDomainWithHeadroom(values: number[]): [number, number] {
-  const finite = values.filter(Number.isFinite);
-  if (!finite.length) return [0, 1];
-  const min = Math.min(...finite);
-  const max = Math.max(...finite);
-  if (min >= 0) return [0, max > 0 ? max * 1.2 : 1];
-  if (max <= 0) return [min * 1.2, 0];
-  return [min * 1.2, max * 1.2];
-}
-
-/** Dense trend labels retain endpoints, extrema, plus evenly distributed context. */
-export function visibleLabelIndexes(rows: ChartRow[], chartWidth: number): Set<number> {
-  const count = rows.length;
-  if (count <= Math.max(4, Math.floor(chartWidth / 70))) return new Set(rows.map((_, index) => index));
-  const indexes = new Set<number>([0, count - 1]);
-  let min = 0; let max = 0;
-  rows.forEach((row, index) => { if (row.value < rows[min].value) min = index; if (row.value > rows[max].value) max = index; });
-  indexes.add(min); indexes.add(max);
-  const target = Math.min(7, Math.max(4, Math.floor(chartWidth / 120)));
-  for (let step = 1; step < target - 1; step += 1) indexes.add(Math.round((step * (count - 1)) / (target - 1)));
-  return indexes;
-}
-
-function labelFor(row?: ChartRow) { return row?.display_label ?? row?.label ?? ""; }
-function useChartWidth() {
-  const ref = useRef<HTMLDivElement>(null); const [width, setWidth] = useState(640);
-  useEffect(() => { const node = ref.current; if (!node) return; const observer = new ResizeObserver(entries => setWidth(Math.max(1, Math.round(entries[0].contentRect.width)))); observer.observe(node); return () => observer.disconnect(); }, []);
-  return [ref, width] as const;
-}
-
-export default function ValidatedChart({ result, language, report = false }: { result: ChartResult; language: Language; report?: boolean }) {
-  // Per-group top-N is a set of independent rankings, not a dense matrix of zeroes.
-  if (result.secondary_dimension && result.sort_mode === 'ranking') {
-    const groups = [...new Set(result.rows.map(row => row.secondary_label ?? ''))];
-    return <div className="grouped-ranking" role="group" aria-label={result.title}>{groups.map(group => {
-      const rows = result.rows.filter(row => (row.secondary_label ?? '') === group);
-      return <section className="grouped-ranking-section" key={group}><h4>{group || '—'}</h4><div style={{ height: Math.max(220, rows.length * 32 + 48) }}><SingleChart result={{ ...result, title: `${result.title} · ${group}`, secondary_dimension: undefined, chart_type: 'bar', rows }} language={language} report={report} forceHorizontal /></div></section>;
-    })}</div>;
-  }
-  return <SingleChart result={result} language={language} report={report} />;
-}
-
-function SingleChart({ result, language, report = false, forceHorizontal = false }: { result: ChartResult; language: Language; report?: boolean; forceHorizontal?: boolean }) {
-  const [containerRef, chartWidth] = useChartWidth();
-  const metric = result.metric_display_name ?? result.metric;
-  const compact = (value: number) => formatChartValue(value, language);
-  const tooltip = (value: number) => [compact(Number(value)), metric];
-  result = { ...result, rows: result.rows.map(row => ({ ...row, display_label: labelFor(row) })) };
-  const labels = result.rows.map(labelFor);
-  const values = result.rows.map(row => Number(row.value));
-  const domain = numericDomainWithHeadroom(values);
-  const longCategories = result.sort_mode === 'ranking' && labels.some(item => item.length > 16);
-  const horizontal = result.chart_type === 'bar' && (forceHorizontal || longCategories);
-  const chartHeight = horizontal ? Math.max(report ? 220 : 300, result.rows.length * 32 + 48) : undefined;
-  const trend = result.chart_type === 'line' || result.chart_type === 'area';
-  const selectedLabels = visibleLabelIndexes(result.rows, chartWidth);
-  const tickLabel = (value: unknown) => chartCategoryLabel(String(value ?? ''), chartWidth - (horizontal ? 180 : 70), result.rows.length, horizontal);
-  const valueLabel = (props: { value?: number; index?: number; x?: number; y?: number; width?: number | string; height?: number | string }) => {
-    const index = props.index ?? -1;
-    if (trend && !selectedLabels.has(index)) return null;
-    const left = Number(props.x ?? 0);
-    const top = Number(props.y ?? 0);
-    const width = Number(props.width ?? 0);
-    const height = Number(props.height ?? 0);
-    // Ranking values belong immediately after their horizontal bar, in reserved right-side space.
-    if (horizontal && !grouped) return <text x={left + width + 7} y={top + height / 2 + 3} textAnchor="start" className="validated-chart-label">{compact(Number(props.value ?? 0))}</text>;
-    const x = left + width / 2;
-    const y = top - 6;
-    // The final trend label is intentionally reserved for the right-side endpoint position.
-    if (trend && index === result.rows.length - 1) return <text x={x + 9} y={top + 4} textAnchor="start" className="validated-chart-label">{compact(Number(props.value ?? 0))}</text>;
-    return <text x={x} y={Math.max(12, y)} textAnchor="middle" className="validated-chart-label">{compact(Number(props.value ?? 0))}</text>;
-  };
-  const accessibleLabel = `${result.title}. ${result.rows.map(row => `${labelFor(row)}: ${compact(row.value)}`).join('; ')}`;
-  const grouped = Boolean(result.secondary_dimension) && result.rows.some(row => row.secondary_label);
-  const seriesLabels = [...new Set(result.rows.map(row => String(row.secondary_label ?? '')))].filter(Boolean);
-  const pivot = new Map<string, { display_label: string; values: Array<number | null> }>();
-  result.rows.forEach(row => {
-    const entry = pivot.get(row.label) ?? { display_label: labelFor(row), values: seriesLabels.map(() => null) };
-    entry.values[seriesLabels.indexOf(row.secondary_label ?? '')] = row.value;
-    pivot.set(row.label, entry);
-  });
-  const pivotData = [...pivot.values()];
-  const common = <><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="display_label" interval={result.rows.length > Math.max(6, Math.floor(chartWidth / 72)) ? 'preserveStartEnd' : 0} angle={result.sort_mode === 'chronological' || result.rows.length > 7 ? -35 : 0} textAnchor={result.sort_mode === 'chronological' || result.rows.length > 7 ? 'end' : 'middle'} height={result.sort_mode === 'chronological' || result.rows.length > 7 ? 58 : 34} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} tickFormatter={tickLabel} /><YAxis domain={domain} tickFormatter={compact} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} width={58} /><Tooltip formatter={tooltip} labelFormatter={(_, payload) => labelFor(payload[0]?.payload as ChartRow)} contentStyle={{ fontSize: CHART_TYPE.tooltip, fontFamily: 'var(--font-sans)' }} /></>;
-  const content = result.chart_type === 'pie' || result.chart_type === 'donut' ? <PieChart><Tooltip formatter={tooltip} contentStyle={{ fontSize: CHART_TYPE.tooltip, fontFamily: 'var(--font-sans)' }} /><Legend verticalAlign="bottom" wrapperStyle={{ fontSize: CHART_TYPE.legend, fontFamily: 'var(--font-sans)' }} /><Pie data={result.rows} dataKey="value" nameKey="display_label" outerRadius="72%" label={valueLabel} labelLine={false} innerRadius={result.chart_type === 'donut' ? '42%' : 0}>{result.rows.map((_, i) => <Cell key={i} fill={CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]} />)}</Pie></PieChart> : result.chart_type === 'scatter' ? <ScatterChart><CartesianGrid /><XAxis dataKey="x_value" tickFormatter={compact} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} /><YAxis dataKey="value" domain={domain} tickFormatter={compact} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} /><Tooltip formatter={tooltip} contentStyle={{ fontSize: CHART_TYPE.tooltip, fontFamily: 'var(--font-sans)' }} /><Scatter data={result.rows} fill={PRIMARY_COLOR}><LabelList dataKey="value" content={valueLabel} /></Scatter></ScatterChart> : result.chart_type === 'line' ? <LineChart data={result.rows} margin={{ right: 54 }}>{common}<Line type="monotone" dataKey="value" stroke={PRIMARY_COLOR} strokeWidth={2} dot={{ r: 3 }}><LabelList dataKey="value" content={valueLabel} /></Line></LineChart> : result.chart_type === 'area' ? <AreaChart data={result.rows} margin={{ right: 54 }}>{common}<Area type="monotone" dataKey="value" stroke={PRIMARY_COLOR} fill="#c7d2fe"><LabelList dataKey="value" content={valueLabel} /></Area></AreaChart> : horizontal && !grouped ? <BarChart data={result.rows} layout="vertical" margin={{ left: 8, right: 42 }}><CartesianGrid strokeDasharray="3 3" horizontal={false} /><XAxis type="number" domain={domain} tickFormatter={compact} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} /><YAxis type="category" dataKey="display_label" width={Math.min(220, Math.max(110, Math.floor(chartWidth * .3)))} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} tickFormatter={tickLabel} /><Tooltip formatter={tooltip} labelFormatter={(_, payload) => labelFor(payload[0]?.payload as ChartRow)} contentStyle={{ fontSize: CHART_TYPE.tooltip, fontFamily: 'var(--font-sans)' }} /><Bar dataKey="value" radius={[0, 4, 4, 0]}>{result.rows.map((_, i) => <Cell key={i} fill={CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]} />)}<LabelList dataKey="value" position="right" content={valueLabel} /></Bar></BarChart> : grouped ? <BarChart data={pivotData} margin={{ top: 12, right: 16 }}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="display_label" interval={0} angle={-30} textAnchor="end" height={56} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} tickFormatter={(value: string) => chartCategoryLabel(String(value ?? ''), chartWidth - 70, pivotData.length)} /><YAxis domain={domain} tickFormatter={compact} tick={{ fontSize: CHART_TYPE.axis, fontFamily: 'var(--font-sans)' }} width={58} /><Tooltip formatter={(value, name) => [compact(Number(value)), `${name} · ${metric}`]} labelFormatter={(_, payload) => String(payload?.[0]?.payload?.display_label ?? '')} contentStyle={{ fontSize: CHART_TYPE.tooltip, fontFamily: 'var(--font-sans)' }} /><Legend wrapperStyle={{ fontSize: CHART_TYPE.legend, fontFamily: 'var(--font-sans)' }} />{seriesLabels.map((name, i) => <Bar key={name} name={name} dataKey={`values.${i}`} stackId={result.chart_type === 'stacked_bar' ? 'stack' : undefined} fill={CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]} radius={[4, 4, 0, 0]} />)}</BarChart> : <BarChart data={result.rows}>{common}<Bar dataKey="value" radius={[4, 4, 0, 0]}>{result.rows.map((_, i) => <Cell key={i} fill={CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]} />)}<LabelList dataKey="value" position="top" content={valueLabel} /></Bar></BarChart>;
-  return <div ref={containerRef} className={horizontal ? 'validated-chart horizontal-ranking' : 'validated-chart'} style={chartHeight ? { height: chartHeight } : undefined} role="img" aria-label={accessibleLabel}><ResponsiveContainer width="100%" height="100%">{content}</ResponsiveContainer></div>;
-}
+export function numericDomainWithHeadroom(values: number[]): [number, number] { const finite = values.filter(Number.isFinite); if (!finite.length) return [0, 1]; const min = Math.min(...finite); const max = Math.max(...finite); if (min >= 0) return [0, max > 0 ? max * 1.2 : 1]; if (max <= 0) return [min * 1.2, 0]; return [min * 1.2, max * 1.2]; }
+export function visibleLabelIndexes(rows: ChartRow[], chartWidth: number): Set<number> { const count = rows.length; if (count <= Math.max(4, Math.floor(chartWidth / 70))) return new Set(rows.map((_, index) => index)); const indexes = new Set<number>([0, count - 1]); let min = 0; let max = 0; rows.forEach((row, index) => { if (row.value < rows[min].value) min = index; if (row.value > rows[max].value) max = index; }); indexes.add(min); indexes.add(max); const target = Math.min(7, Math.max(4, Math.floor(chartWidth / 120))); for (let step = 1; step < target - 1; step += 1) indexes.add(Math.round((step * (count - 1)) / (target - 1))); return indexes; }
+export function chartDensity(rowCount: number, width: number) { const band = rowCount <= 5 && width >= 300 ? 'sparse' : rowCount <= 10 ? 'medium' : 'dense'; return { band, axis: band === 'sparse' ? 11 : band === 'medium' ? 10 : 9, label: band === 'sparse' ? 12 : band === 'medium' ? 10 : 9, barGap: band === 'sparse' ? 12 : band === 'medium' ? 7 : 3 }; }
+function labelFor(row?: ChartRow) { return row?.display_label ?? row?.label ?? ''; }
+function useChartWidth() { const ref = useRef<HTMLDivElement>(null); const [width, setWidth] = useState(640); useEffect(() => { const node = ref.current; if (!node) return; const observer = new ResizeObserver(entries => setWidth(Math.max(1, Math.round(entries[0].contentRect.width)))); observer.observe(node); return () => observer.disconnect(); }, []); return [ref, width] as const; }
+function ShareTooltip({ active, payload, metric, compact, total }: { active?: boolean; payload?: Array<{ payload?: ChartRow; value?: number }>; metric: string; compact: (value: number) => string; total: number }) { if (!active || !payload?.[0]) return null; const row = payload[0].payload; const value = Number(payload[0].value ?? row?.value ?? 0); return <div className="share-tooltip"><b>{labelFor(row)}</b><span>{metric}: {compact(value)}</span>{total > 0 && value >= 0 && <span>Contribution: {((value / total) * 100).toFixed(1)}%</span>}</div>; }
+export default function ValidatedChart({ result, language, report = false, compact = false }: { result: ChartResult; language: Language; report?: boolean; compact?: boolean }) { if (result.secondary_dimension && result.sort_mode === 'ranking') { const groups = [...new Set(result.rows.map(row => row.secondary_label ?? ''))]; return <div className={`grouped-ranking ${compact ? 'grouped-ranking-compact' : ''}`} role="group" aria-label={result.title}>{groups.map(group => { const rows = result.rows.filter(row => (row.secondary_label ?? '') === group); return <section className="grouped-ranking-section" key={group}><h4>{group || '—'}</h4><div style={{ height: Math.max(compact ? 124 : 180, rows.length * (compact ? 28 : 32) + 40) }}><SingleChart result={{ ...result, title: `${result.title} · ${group}`, secondary_dimension: undefined, chart_type: 'bar', rows }} language={language} report={report} forceHorizontal /></div></section>; })}</div>; } return <SingleChart result={result} language={language} report={report} />; }
+function SingleChart({ result: input, language, report = false, forceHorizontal = false }: { result: ChartResult; language: Language; report?: boolean; forceHorizontal?: boolean }) { const [containerRef, chartWidth] = useChartWidth(); const result = { ...input, rows: input.rows.map(row => ({ ...row, display_label: labelFor(row) })) }; const metric = result.metric_display_name ?? result.metric; const compact = (value: number) => formatChartValue(value, language); const density = chartDensity(result.rows.length, chartWidth); const values = result.rows.map(row => Number(row.value)); const domain = numericDomainWithHeadroom(values); const horizontal = result.chart_type === 'bar' && (forceHorizontal || (result.sort_mode === 'ranking' && result.rows.some(row => labelFor(row).length > 16))); const trend = result.chart_type === 'line' || result.chart_type === 'area'; const selectedLabels = visibleLabelIndexes(result.rows, chartWidth); const height = horizontal ? Math.max(report ? 220 : 300, result.rows.length * (density.band === 'sparse' ? 42 : 32) + 48) : undefined; const tickLabel = (value: unknown) => chartCategoryLabel(String(value ?? ''), chartWidth - (horizontal ? 180 : 70), result.rows.length, horizontal); const valueLabel = (props: { value?: number; index?: number; x?: number; y?: number; width?: number | string; height?: number | string }) => { const index = props.index ?? -1; if (trend && !selectedLabels.has(index)) return null; const x = Number(props.x ?? 0); const y = Number(props.y ?? 0); const width = Number(props.width ?? 0); const heightValue = Number(props.height ?? 0); if (horizontal) return <text x={x + width + 7} y={y + heightValue / 2 + 3} className="validated-chart-label" style={{ fontSize: density.label }}>{compact(Number(props.value ?? 0))}</text>; return <text x={x + width / 2} y={Math.max(12, y - 6)} textAnchor="middle" className="validated-chart-label" style={{ fontSize: density.label }}>{compact(Number(props.value ?? 0))}</text>; };
+ const common = <><CartesianGrid strokeDasharray="3 3" vertical={false}/><XAxis dataKey="display_label" interval={result.rows.length > Math.max(6, Math.floor(chartWidth / 72)) ? 'preserveStartEnd' : 0} angle={trend || result.rows.length > 7 ? -35 : 0} textAnchor={trend || result.rows.length > 7 ? 'end' : 'middle'} height={trend || result.rows.length > 7 ? 58 : 34} tick={{ fontSize: density.axis, fontFamily: 'var(--font-sans)' }} tickFormatter={tickLabel}/><YAxis domain={domain} tickFormatter={compact} tick={{ fontSize: density.axis, fontFamily: 'var(--font-sans)' }} width={58}/><Tooltip formatter={(value: number) => [compact(value), metric]} labelFormatter={(_, payload) => labelFor(payload[0]?.payload as ChartRow)}/></>;
+ const shareTotal = result.rows.reduce((sum, row) => sum + Math.max(0, Number(row.value)), 0);
+ const content = result.chart_type === 'pie' || result.chart_type === 'donut' ? <PieChart><Tooltip content={<ShareTooltip metric={metric} compact={compact} total={shareTotal}/>}/><Legend verticalAlign="bottom" wrapperStyle={{ fontSize: density.axis }}/><Pie data={result.rows} dataKey="value" nameKey="display_label" outerRadius="72%" innerRadius={result.chart_type === 'donut' ? '42%' : 0}>{result.rows.map((_, i) => <Cell key={i} fill={CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]}/>)}</Pie></PieChart> : result.chart_type === 'scatter' ? <ScatterChart><CartesianGrid/><XAxis dataKey="x_value" tickFormatter={compact}/><YAxis dataKey="value" domain={domain} tickFormatter={compact}/><Tooltip formatter={(value: number) => [compact(value), metric]}/><Scatter data={result.rows} fill={PRIMARY_COLOR}/></ScatterChart> : result.chart_type === 'line' ? <LineChart data={result.rows} margin={{ right: 54 }}>{common}<Line type="monotone" dataKey="value" stroke={PRIMARY_COLOR} strokeWidth={2} dot={{ r: 3 }}><LabelList dataKey="value" content={valueLabel}/></Line></LineChart> : result.chart_type === 'area' ? <AreaChart data={result.rows} margin={{ right: 54 }}>{common}<Area type="monotone" dataKey="value" stroke={PRIMARY_COLOR} fill="#c7d2fe"><LabelList dataKey="value" content={valueLabel}/></Area></AreaChart> : horizontal ? <BarChart data={result.rows} layout="vertical" barCategoryGap={density.barGap} margin={{ left: 8, right: 48 }}><CartesianGrid strokeDasharray="3 3" horizontal={false}/><XAxis type="number" domain={domain} tickFormatter={compact}/><YAxis type="category" dataKey="display_label" width={Math.min(220, Math.max(110, Math.floor(chartWidth * .3)))} tick={{ fontSize: density.axis }} tickFormatter={tickLabel}/><Tooltip formatter={(value: number) => [compact(value), metric]}/><Bar dataKey="value" radius={[0,4,4,0]}><LabelList dataKey="value" content={valueLabel}/>{result.rows.map((_, i) => <Cell key={i} fill={CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]}/>)}</Bar></BarChart> : <BarChart data={result.rows} barCategoryGap={density.barGap}>{common}<Bar dataKey="value" radius={[4,4,0,0]}><LabelList dataKey="value" content={valueLabel}/>{result.rows.map((_, i) => <Cell key={i} fill={CATEGORY_PALETTE[i % CATEGORY_PALETTE.length]}/>)}</Bar></BarChart>;
+ return <div ref={containerRef} className={horizontal ? 'validated-chart horizontal-ranking' : 'validated-chart'} style={height ? { height } : undefined} role="img" aria-label={`${result.title}. ${result.rows.map(row => `${labelFor(row)}: ${compact(row.value)}`).join('; ')}`}><ResponsiveContainer width="100%" height="100%">{content}</ResponsiveContainer></div>; }
