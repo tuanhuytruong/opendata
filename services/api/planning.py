@@ -107,7 +107,7 @@ def display_label(name: str) -> str:
     aliases = {"net_sales":"Net Sales", "gross_sales":"Gross Sales", "gross_profit":"Gross Profit", "sale_date":"Sale Date", "cogs":"Cost of Goods Sold", "uom":"Unit of Measure"}
     normalized = canonical_field_name(name)
     if normalized in aliases: return aliases[normalized]
-    return " ".join(part.upper() if len(part) <= 4 and part.isalpha() else part.capitalize() for part in re.split(r"[_\s-]+", name) if part)
+    return " ".join(part.upper() if len(part) <= 4 and part.isalpha() and part.casefold() in {"vat", "cogs", "uom", "sku", "id"} else part.capitalize() for part in re.split(r"[_\s-]+", name) if part)
 
 
 def executive_overview_proposals(columns: Iterable[object]) -> tuple[list[dict[str, object]], list[str]]:

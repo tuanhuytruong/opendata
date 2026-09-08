@@ -371,6 +371,31 @@ def test_pie_donut_and_scatter_contracts_are_validated() -> None:
     assert client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "net_sales", "chart_type": "scatter"}).status_code == 422
 
 
+def test_combo_contract_aggregates_distinct_numeric_metrics_and_persists() -> None:
+    data = upload_csv("channel,net_sales,cost\nOnline,100,60\nOnline,20,10\nRetail,40,25\n")
+    run_id = data["run_id"]
+    request = {"dimension": "channel", "metric": "net_sales", "secondary_metric": "cost", "aggregation": "sum", "chart_type": "combo", "filters": [{"column": "channel", "operator": "equals", "value": "Online"}]}
+    combo = client.post(f"/api/runs/{run_id}/chart?language=en", json=request)
+    assert combo.status_code == 200, combo.text
+    body = combo.json()
+    assert body["request"]["secondary_metric"] == "cost"
+    assert body["secondary_metric"] == "cost"
+    assert body["secondary_metric_display_name"] == "Cost"
+    assert body["rows"] == [{"label": "Online", "display_label": "Online", "value": 120.0, "secondary_value": 70.0, "formatted_value": "120", "secondary_formatted_value": "70"}]
+    saved = client.post(f"/api/runs/{run_id}/custom-report/artifacts", json={"artifact_id": "combo", "chart": request})
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["pinned_artifacts"][0]["result"]["request"]["secondary_metric"] == "cost"
+    exported = client.get(f"/api/runs/{run_id}/report").text
+    assert "Cost (line, right axis)" in exported and "Net Sales (bars, left axis)" in exported
+    for invalid in (
+        {"dimension": "channel", "metric": "net_sales", "chart_type": "combo"},
+        {"dimension": "channel", "metric": "net_sales", "secondary_metric": "net_sales", "chart_type": "combo"},
+        {"dimension": "channel", "metric": "net_sales", "secondary_metric": "channel", "chart_type": "combo"},
+        {"dimension": "channel", "metric": "net_sales", "secondary_metric": "cost", "aggregation": "count", "chart_type": "combo"},
+    ):
+        assert client.post(f"/api/runs/{run_id}/chart", json=invalid).status_code == 422
+
+
 def test_builds_pareto_and_two_dimension_chart_contracts() -> None:
     data = upload_csv("channel,city,net_sales\nOnline,HCM,100\nOnline,Hanoi,20\nRetail,HCM,40\n")
     run_id = data["run_id"]
@@ -569,7 +594,7 @@ def test_unclear_chat_never_defaults_to_first_metric_or_date_and_top_sites_alias
     assert sites.status_code == 200
     chart = sites.json()["chart"]
     assert chart["metric"] == "revenue" and chart["dimension"] == "site" and chart["secondary_dimension"] == "region"
-    assert chart["title"] == "Sales by SITE and Region"
+    assert chart["title"] == "Sales by Site and Region"
 
 
 def test_data_explorer_paginates_searches_sorts_and_suppresses_sensitive_values() -> None:
@@ -788,12 +813,12 @@ def test_custom_report_persists_locale_and_exports_clean_localized_html() -> Non
     data = upload_csv("sale_date,channel,net_sales\n2026-01-01,Online,100\n2026-01-02,Retail,40\n")
     run_id = data["run_id"]
     saved = client.put(f"/api/runs/{run_id}/custom-report", json={
-        "title": "Báo cáo doanh số", "locale": "vi", "layout_blueprint": {"template": "executive", "sections": ["summary", "artifacts"]},
+        "title": "Báo cáo doanh số", "locale": "vi", "layout_blueprint": {"template": "executive_briefing", "sections": ["summary", "artifacts"]},
         "pinned_artifacts": [{"artifact_id": "sales", "chart": {"dimension": "channel", "metric": "net_sales"}}],
     })
     assert saved.status_code == 200, saved.text
     assert saved.json()["locale"] == "vi"
-    assert saved.json()["layout_blueprint"]["template"] == "executive"
+    assert saved.json()["layout_blueprint"]["template"] == "executive_briefing"
     artifact = saved.json()["pinned_artifacts"][0]
     assert "theo" in artifact["scope"]
     assert "Hàng đầu" in artifact["title"] or "Doanh số" in artifact["title"]
@@ -832,9 +857,12 @@ def test_executive_scorecards_include_compact_values_and_only_safe_time_comparis
     timed_cards = client.get(f"/api/runs/{timed['run_id']}/executive-overview?language=en").json()["scorecards"]
     card = next(item for item in timed_cards if item["metric"] == "net_sales")
     assert card["compact_formatted_value"] == "250"
-    assert card["prior_period_value"] == 100.0
-    assert card["change_pct"] == 50.0
-    assert card["sparkline"] == [100.0, 150.0]
+    # Full-data scorecards do not imply a comparison from the final two rows.
+    assert card["prior_period_value"] is None
+    assert card["change_pct"] is None
+    assert card["sparkline"] is None
+    assert card["current_period_label"] is None
+    assert card["prior_period_label"] is None
 
     untimed = upload_csv("channel,net_sales\nOnline,100\nRetail,150\n")
     untimed_card = next(item for item in client.get(f"/api/runs/{untimed['run_id']}/executive-overview?language=en").json()["scorecards"] if item["metric"] == "net_sales")

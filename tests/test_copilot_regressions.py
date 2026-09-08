@@ -37,7 +37,7 @@ def test_average_and_top_limit_are_preserved(run):
     assert result["chart"]["result_count"] == 1
     assert result["chart"]["request"] == {
         "dimension": "channel", "metric": "net_sales", "aggregation": "avg",
-        "chart_type": "bar", "x_metric": None, "secondary_dimension": None,
+        "chart_type": "bar", "x_metric": None, "secondary_metric": None, "secondary_dimension": None,
         "limit_per_secondary": False, "limit": 1, "filters": [],
     }
 
@@ -81,3 +81,37 @@ def test_zero_baseline_does_not_claim_zero_percent_growth():
     headline, _ = main.chart_insight([{"display_label": "Jan", "value": 0}, {"display_label": "Feb", "value": 100}], True, "en")
     assert "0%" not in headline
     assert "undefined" in headline
+
+
+def test_top_date_lookup_returns_direct_kpi_not_a_trend_chart(run):
+    result = chat(run, "Which date has top sales?")
+    assert result["mode"] == "analysis"
+    assert result["output_mode"] == "kpi"
+    assert result["chart"] is None
+    assert len(result["table"]) == 1
+    assert result["table"][0]["label"] == "2026-01-04"
+    assert result["table"][0]["value"] == 200
+    assert "04-Jan-26 has the highest Net Sales at 200." == result["answer"]
+
+
+def test_top_n_title_reports_actual_available_count_and_requested_limit(run):
+    response = client.post(
+        f"/api/runs/{run}/chart?language=en",
+        json={"dimension": "store", "metric": "net_sales", "chart_type": "bar", "limit": 12},
+    )
+    assert response.status_code == 200, response.text
+    chart = response.json()
+    assert chart["requested_limit"] == 12
+    assert chart["result_count"] == 4
+    assert chart["title"] == "Top 4 Store by Sales"
+    assert any("Only 4 valid categories are available (requested Top 12)." == warning for warning in chart["warnings"])
+
+
+def test_cost_display_label_preserves_business_capitalization(run):
+    second = client.post(
+        "/api/runs/upload",
+        files={"file": ("cost.csv", "store,cost\nA,10\nB,5\n", "text/csv")},
+    ).json()["run_id"]
+    chart = client.post(f"/api/runs/{second}/chart?language=en", json={"dimension": "store", "metric": "cost", "limit": 12}).json()
+    assert chart["metric_display_name"] == "Cost"
+    assert chart["title"] == "Top 2 Store by Cost"

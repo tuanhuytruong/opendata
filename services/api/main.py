@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 import re
 import secrets
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
 from uuid import uuid4
@@ -28,7 +28,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from openpyxl import load_workbook
-from pydantic import BaseModel, Field, ValidationError, model_serializer
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
 from database_adapters import read_registered_source
 from formatting import compact_number, format_display_date, format_number, parse_date_value, percent, value_format_descriptor
@@ -126,6 +126,13 @@ class ColumnProfile(BaseModel):
     description: str
 
 
+class TimeFieldBounds(BaseModel):
+    """Full-run inclusive date coverage for a confirmed time field."""
+    column: str
+    min_date: date
+    max_date: date
+
+
 class DatasetProfile(BaseModel):
     run_id: str
     file_name: str
@@ -133,6 +140,7 @@ class DatasetProfile(BaseModel):
     column_count: int
     usable_column_count: int
     columns: list[ColumnProfile]
+    time_field_bounds: list[TimeFieldBounds] = Field(default_factory=list)
     warnings: list[str]
     preview: list[dict[str, str]]
     # "sampled" is safe to render immediately after attach; "complete" means the
@@ -182,10 +190,12 @@ class ChartRequest(BaseModel):
     dimension: str
     metric: str
     aggregation: Literal["sum", "avg", "count"] = "sum"
-    chart_type: Literal["bar", "line", "area", "pie", "donut", "scatter", "pareto", "stacked_bar", "heatmap"] = "bar"
+    chart_type: Literal["bar", "line", "area", "pie", "donut", "scatter", "pareto", "stacked_bar", "heatmap", "combo"] = "bar"
     # Scatter is a genuine two-measure aggregate: dimension supplies safe labels,
     # metric is Y and x_metric is X. Other charts ignore x_metric.
     x_metric: str | None = None
+    # Combo charts aggregate this distinct numeric measure on a right-hand axis.
+    secondary_metric: str | None = None
     secondary_dimension: str | None = None
     # When grouping by a secondary dimension, retain the ranked limit inside each
     # group rather than applying one global limit to all groups.
@@ -226,19 +236,25 @@ REPORT_LAYOUTS = {
     "sales_performance_review",
     "category_division_deep_dive",
     "weekly_monthly_business_review",
-    # Retain the legacy persisted value on read/write for old clients.
-    "executive",
 }
 LEGACY_REPORT_LAYOUTS = {"executive": "executive_briefing"}
 
 
 class ReportLayoutBlueprint(BaseModel):
-    """Presentation-only durable layout choice; artifacts remain server validated."""
-    template: str = "executive_briefing"
+    """The single durable editor/export layout contract."""
+    template: Literal[
+        "executive_briefing",
+        "sales_performance_review",
+        "category_division_deep_dive",
+        "weekly_monthly_business_review",
+    ] = "executive_briefing"
 
-    def model_post_init(self, __context: object) -> None:
-        if self.template not in REPORT_LAYOUTS:
-            raise ValueError("Unknown report layout blueprint.")
+    @field_validator("template", mode="before")
+    @classmethod
+    def _canonicalize_legacy_template(cls, value: object) -> object:
+        # Compatibility is isolated at the API read/input boundary. Persisted and
+        # returned documents always expose the canonical server/client enum.
+        return LEGACY_REPORT_LAYOUTS.get(value, value) if isinstance(value, str) else value
 
 
 class CustomReportArtifact(BaseModel):
@@ -330,6 +346,7 @@ class ChatResponse(BaseModel):
     clarification_options: list[ClarificationOption] = Field(default_factory=list)
     proposals: list[dict[str, object]] = Field(default_factory=list)
     mode: Literal["analysis", "clarification"]
+    output_mode: Literal["chart", "table", "kpi"] = "chart"
     planner: Literal["llm", "deterministic"] = "deterministic"
 
 
@@ -343,6 +360,8 @@ class ChartResult(BaseModel):
     chart_type: str
     title: str
     metric_display_name: str = ""
+    secondary_metric: str | None = None
+    secondary_metric_display_name: str = ""
     value_format: dict[str, object] = Field(default_factory=dict)
     secondary_dimension: str | None = None
     filters: list[FilterSpec] = Field(default_factory=list)
@@ -350,6 +369,7 @@ class ChartResult(BaseModel):
     warnings: list[str]
     sort_mode: Literal["chronological", "ranking"] = "ranking"
     result_count: int = 0
+    requested_limit: int = 0
     insight_headline: str = ""
     evidence: list[str] = Field(default_factory=list)
 
@@ -369,6 +389,8 @@ class ExecutiveScorecard(BaseModel):
     prior_period_formatted_value: str | None = None
     change_pct: float | None = None
     sparkline: list[float] | None = None
+    current_period_label: str | None = None
+    prior_period_label: str | None = None
 
 
 class ExecutiveOverview(BaseModel):
@@ -506,10 +528,18 @@ def build_profile(file_name: str, headers: list[str], rows: list[dict[str, str]]
     quantity = next((item for item in profiles if item.name.lower() == "quantity"), None)
     if units and quantity and units.distinct_count > 1:
         warnings.append("Quantity has multiple units of measure; do not sum it until a compatible unit filter is applied.")
+    # Bounds always come from the retained run, not its attach-time sample: the date
+    # controls must never default to a partial range.
+    time_field_bounds = [
+        TimeFieldBounds(column=item.name, min_date=min(parsed), max_date=max(parsed))
+        for item in profiles
+        if item.kind == "time"
+        if (parsed := [value.date() for row in rows if (value := parse_date_value((row.get(item.name) or "").strip())) is not None])
+    ]
     sampled = len(profiled_rows) < len(rows)
     if sampled:
         warnings.append(f"Column metadata is sampled from the first {len(profiled_rows):,} rows; request full analysis for complete statistics.")
-    return DatasetProfile(run_id=run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, warnings=warnings, preview=safe_preview(rows), profile_status="sampled" if sampled else "complete", profiled_row_count=len(profiled_rows))
+    return DatasetProfile(run_id=run_id, file_name=file_name, row_count=len(rows), column_count=len(headers), usable_column_count=sum(item.kind != "unknown" for item in profiles), columns=profiles, time_field_bounds=time_field_bounds, warnings=warnings, preview=safe_preview(rows), profile_status="sampled" if sampled else "complete", profiled_row_count=len(profiled_rows))
 
 
 def profile_for_run(run_id: str, headers: list[str], rows: list[dict[str, str]]) -> DatasetProfile:
@@ -929,6 +959,19 @@ def values(run_id: str, column: str) -> dict[str, str | list[str]]:
     return {"column": column, "values": result}
 
 
+def _validate_date_scope_bounds(scope: DateScope | None, rows: list[dict[str, str]]) -> None:
+    """Reject ranges outside the selected field's actual retained coverage."""
+    if scope is None:
+        return
+    values = [value.date() for row in rows if (value := parse_date_value((row.get(scope.column) or "").strip())) is not None]
+    if not values:
+        raise HTTPException(422, f"Date scope column has no valid dates: {scope.column}")
+    if scope.start is not None and scope.start < min(values):
+        raise HTTPException(422, "Date scope start is before the selected field's dataset minimum.")
+    if scope.end is not None and scope.end > max(values):
+        raise HTTPException(422, "Date scope end is after the selected field's dataset maximum.")
+
+
 def _date_scope_clause(scope: DateScope | None, headers: list[str], profiles: dict[str, ColumnProfile]) -> tuple[str | None, list[str]]:
     """Compile the sole global range contract after profile validation.
 
@@ -959,7 +1002,7 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     headers, rows = load_run(run_id)
     profile_guard = profile_for_run(run_id, headers, rows)
     guard_profiles = {item.name: item for item in profile_guard.columns}
-    for role, column in (("dimension", request.dimension), ("secondary_dimension", request.secondary_dimension), ("x_metric", request.x_metric)):
+    for role, column in (("dimension", request.dimension), ("secondary_dimension", request.secondary_dimension), ("x_metric", request.x_metric), ("secondary_metric", request.secondary_metric)):
         if column and guard_profiles.get(column) and guard_profiles[column].kind == "id":
             raise HTTPException(422, f"Identifier fields cannot be used as chart {role}.")
     for item in request.filters:
@@ -969,8 +1012,10 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     metric = quote_identifier(request.metric, headers)
     secondary = quote_identifier(request.secondary_dimension, headers) if request.secondary_dimension else None
     x_metric = quote_identifier(request.x_metric, headers) if request.x_metric else None
+    secondary_metric = quote_identifier(request.secondary_metric, headers) if request.secondary_metric else None
     profile_data = profile_for_run(run_id, headers, rows)
     profiles = {item.name: item for item in profile_data.columns}
+    _validate_date_scope_bounds(request.date_scope, rows)
     dimension_profile = profiles[request.dimension]
     metric_profile = profiles[request.metric]
     if metric_profile.kind != "num" and request.aggregation != "count":
@@ -982,9 +1027,13 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     if request.chart_type == "scatter":
         if secondary or not request.x_metric or request.x_metric == request.metric or profiles[request.x_metric].kind != "num":
             raise HTTPException(422, "scatter requires distinct numeric metric and x_metric fields and no secondary_dimension.")
+    if request.chart_type == "combo":
+        if secondary or request.aggregation == "count" or not request.secondary_metric or request.secondary_metric == request.metric or profiles[request.secondary_metric].kind != "num":
+            raise HTTPException(422, "combo requires distinct numeric metric and secondary_metric fields, a non-count aggregation, and no secondary_dimension.")
     if request.aggregation == "count": expression = "COUNT(*)"
     else: expression = f"{request.aggregation.upper()}(TRY_CAST(REPLACE({metric}, ',', '') AS DOUBLE))"
     x_expression = f"{request.aggregation.upper()}(TRY_CAST(REPLACE({x_metric}, ',', '') AS DOUBLE))" if x_metric else None
+    secondary_expression = f"{request.aggregation.upper()}(TRY_CAST(REPLACE({secondary_metric}, ',', '') AS DOUBLE))" if secondary_metric else None
     filter_clauses = [f"{dimension} IS NOT NULL", f"TRIM({dimension}) <> ''"]
     if secondary:
         filter_clauses.extend([f"{secondary} IS NOT NULL", f"TRIM({secondary}) <> ''"])
@@ -1021,6 +1070,8 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
         where_clause = " AND ".join(filter_clauses)
         if request.chart_type == "scatter":
             query = f"SELECT {dimension} AS label, {x_expression} AS x_value, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
+        elif request.chart_type == "combo":
+            query = f"SELECT {dimension} AS label, {expression} AS value, {secondary_expression} AS secondary_value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
         elif secondary and request.limit_per_secondary:
             query = f"""WITH aggregates AS (
                 SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value
@@ -1042,11 +1093,18 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
         connection.close()
     warnings: list[str] = []
     if not records: warnings.append("Không có giá trị phù hợp với phạm vi hiện tại." if language == "vi" else "No values match the current scope.")
+    if records and len(records) < request.limit and not (secondary and request.limit_per_secondary):
+        warnings.append(
+            f"Only {len(records)} valid categories are available (requested Top {request.limit})."
+            if language == "en" else f"Chỉ có {len(records)} category hợp lệ (đã yêu cầu Top {request.limit})."
+        )
     if request.metric.lower() == "quantity" and request.aggregation == "sum": warnings.append("Cần lọc theo đơn vị tương thích trước khi diễn giải tổng quantity." if language == "vi" else "Filter to compatible units before interpreting a total quantity.")
     if request.chart_type in {"line", "area"} and not chronological:
         warnings.append("Trục đang không phải trường thời gian đã xác nhận; kết quả được xếp hạng theo giá trị thay vì diễn giải như xu hướng." if language == "vi" else "The axis is not a confirmed time field; results are ranked by value rather than interpreted as a trend.")
     if request.chart_type == "scatter":
         chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "x_value": 0 if x_value is None else float(x_value), "value": 0 if value is None else float(value), "formatted_value": format_number(0 if value is None else float(value))} for label, x_value, value in records]
+    elif request.chart_type == "combo":
+        chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "value": 0 if value is None else float(value), "secondary_value": 0 if secondary_value is None else float(secondary_value), "formatted_value": format_number(0 if value is None else float(value)), "secondary_formatted_value": format_number(0 if secondary_value is None else float(secondary_value))} for label, value, secondary_value in records]
     elif secondary:
         chart_rows = [{"label": str(label), "display_label": format_display_date(str(label)) if dimension_profile.kind == "time" else str(label), "secondary_label": str(second), "value": 0 if value is None else float(value), "formatted_value": format_number(0 if value is None else float(value))} for label, second, value in records]
     else:
@@ -1060,7 +1118,7 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     insight_headline, evidence = chart_insight(chart_rows, chronological, language)
     per_secondary = bool(secondary and request.limit_per_secondary)
     title = presentation_title(request.metric, request.dimension, request.chart_type, language=language, limit=request.limit if per_secondary else len(chart_rows), secondary_dimension=request.secondary_dimension)
-    return ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), insight_headline=insight_headline, evidence=evidence)
+    return ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), secondary_metric=request.secondary_metric, secondary_metric_display_name=display_label(request.secondary_metric) if request.secondary_metric else "", value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), requested_limit=request.limit, insight_headline=insight_headline, evidence=evidence)
 
 
 @app.get("/api/runs/{run_id}/executive-overview", response_model=ExecutiveOverview)
@@ -1115,24 +1173,48 @@ def executive_overview(
             label = display_label(metric.name)
             scope = (f"Tổng {label} trong phạm vi ngày đã chọn" if date_scope and language == "vi" else f"Sum of {label} in the selected date scope" if date_scope else f"Tổng {label} trên toàn bộ dataset" if language == "vi" else f"Full-dataset sum of {label}")
             comparison: dict[str, object] = {}
-            if safe_time:
-                time_identifier = quote_identifier(safe_time.name, headers)
-                periods = connection.execute(
-                    f"SELECT {time_identifier}, SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) "
-                    f"FROM dataset WHERE TRY_CAST({time_identifier} AS TIMESTAMP) IS NOT NULL"
-                    f"{' AND ' + scorecard_scope_clause if scorecard_scope_clause else ''} "
-                    f"GROUP BY 1 ORDER BY TRY_CAST({time_identifier} AS TIMESTAMP) ASC",
-                    scorecard_scope_parameters,
-                ).fetchall()
-                if len(periods) >= 2:
-                    values = [float(period_value or 0) for _, period_value in periods]
-                    previous, current = values[-2], values[-1]
-                    comparison = {
-                        "prior_period_value": previous,
-                        "prior_period_formatted_value": format_number(previous),
-                        "change_pct": None if previous == 0 else round((current - previous) / abs(previous) * 100, 2),
-                        "sparkline": values,
-                    }
+            # Full-data scorecards deliberately make no implied "previous period"
+            # comparison. A comparison exists only for an explicit, complete selected
+            # range on its selected time field.
+            if date_scope and date_scope.start and date_scope.end:
+                time_identifier = quote_identifier(date_scope.column, headers)
+                global_bounds = [
+                    parsed_date.date() for row in rows
+                    if (parsed_date := parse_date_value((row.get(date_scope.column) or "").strip())) is not None
+                ]
+                duration_days = (date_scope.end - date_scope.start).days + 1
+                prior_end = date_scope.start - timedelta(days=1)
+                prior_start = prior_end - timedelta(days=duration_days - 1)
+                if global_bounds and prior_start >= min(global_bounds):
+                    current_clause, current_params = _date_scope_clause(date_scope, headers, profile_columns)
+                    prior_clause, prior_params = _date_scope_clause(
+                        DateScope(column=date_scope.column, start=prior_start, end=prior_end), headers, profile_columns
+                    )
+                    current_value = connection.execute(
+                        f"SELECT SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) FROM dataset WHERE {current_clause}",
+                        current_params,
+                    ).fetchone()[0]
+                    prior_value = connection.execute(
+                        f"SELECT SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) FROM dataset WHERE {prior_clause}",
+                        prior_params,
+                    ).fetchone()[0]
+                    # A window with no observations is not a truthful comparison.
+                    if current_value is not None and prior_value is not None:
+                        current, previous = float(current_value), float(prior_value)
+                        periods = connection.execute(
+                            f"SELECT CAST(TRY_CAST({time_identifier} AS TIMESTAMP) AS DATE), "
+                            f"SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) FROM dataset "
+                            f"WHERE {current_clause} GROUP BY 1 ORDER BY 1",
+                            current_params,
+                        ).fetchall()
+                        comparison = {
+                            "prior_period_value": previous,
+                            "prior_period_formatted_value": format_number(previous),
+                            "change_pct": None if previous == 0 else round((current - previous) / abs(previous) * 100, 2),
+                            "sparkline": [float(period_value or 0) for _, period_value in periods],
+                            "current_period_label": f"{date_scope.start.isoformat()} to {date_scope.end.isoformat()}",
+                            "prior_period_label": f"{prior_start.isoformat()} to {prior_end.isoformat()}",
+                        }
             scorecards.append(ExecutiveScorecard(label=label, value=float(value), formatted_value=format_number(float(value)), compact_formatted_value=compact_number(float(value)), metric=metric.name, aggregation="sum", scope=scope, **comparison))
     finally:
         connection.close()
@@ -1197,7 +1279,13 @@ def _custom_report_document(run_id: str, update: CustomReportUpdate | None = Non
     path = "custom-report.json"
     if update is None:
         try:
-            return CustomReportDocument.model_validate(RUN_STORE.artifact_json(run_id, path))
+            stored = RUN_STORE.artifact_json(run_id, path)
+            # Migrate the one former alias only at the read boundary; every response
+            # and subsequent save uses the canonical template enum.
+            blueprint = stored.get("layout_blueprint") if isinstance(stored, dict) else None
+            if isinstance(blueprint, dict) and blueprint.get("template") in LEGACY_REPORT_LAYOUTS:
+                stored = {**stored, "layout_blueprint": {"template": LEGACY_REPORT_LAYOUTS[blueprint["template"]]}}
+            return CustomReportDocument.model_validate(stored)
         except HTTPException as error:
             if error.status_code != 404: raise
             return CustomReportDocument(run_id=run_id, glossary=[])
@@ -1303,6 +1391,19 @@ def _report_chart_svg(chart: ChartResult) -> str:
             y = top + (y_max - value) / y_span * plot_height
             svg.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='5' fill='{colors[index % len(colors)]}'><title>{esc(label(row))}: {esc(row.get('formatted_value', value))}</title></circle>")
         svg.append(f"<text x='{left}' y='{height - 18}' font-size='12'>{esc(format_number(x_min))}</text><text x='{width - right}' y='{height - 18}' text-anchor='end' font-size='12'>{esc(format_number(x_max))}</text>")
+    elif chart.chart_type == "combo":
+        secondary_values = [numeric(row, "secondary_value") for row in rows]
+        primary_max, secondary_max = max(1.0, max(values)), max(1.0, max(secondary_values))
+        step = plot_width / max(1, len(rows))
+        points: list[tuple[float, float]] = []
+        svg.append(f"<path d='M {left} {top} V {height - bottom} H {width - right}' stroke='#64748b' fill='none'/>")
+        for index, (row, value, secondary_value) in enumerate(zip(rows, values, secondary_values)):
+            x = left + step * (index + .5); y = top + (primary_max - value) / primary_max * plot_height; line_y = top + (secondary_max - secondary_value) / secondary_max * plot_height
+            points.append((x, line_y))
+            svg.append(f"<rect x='{x - step * .34:.1f}' y='{y:.1f}' width='{max(5, step * .68):.1f}' height='{max(1, height - bottom - y):.1f}' rx='2' fill='#2563eb'><title>{esc(label(row))}: {esc(row.get('formatted_value', value))}</title></rect><text x='{x:.1f}' y='{height - bottom + 18}' text-anchor='middle' font-size='11'>{esc(label(row)[:14])}</text>")
+        svg.append(f"<polyline points='{' '.join(f'{x:.1f},{y:.1f}' for x, y in points)}' fill='none' stroke='#0d9488' stroke-width='3'/>")
+        for row, (x, y), value in zip(rows, points, secondary_values): svg.append(f"<circle cx='{x:.1f}' cy='{y:.1f}' r='4' fill='#0d9488'><title>{esc(label(row))}: {esc(row.get('secondary_formatted_value', value))}</title></circle>")
+        svg.append(f"<text x='{left - 8}' y='{top + 4}' text-anchor='end' font-size='12'>{esc(format_number(primary_max))}</text><text x='{width - right + 8}' y='{top + 4}' font-size='12'>{esc(format_number(secondary_max))}</text><text x='{left}' y='20' font-size='12' fill='#2563eb'>{esc(chart.metric_display_name or chart.metric)} (bars, left axis)</text><text x='{width - right}' y='20' text-anchor='end' font-size='12' fill='#0d9488'>{esc(chart.secondary_metric_display_name or chart.secondary_metric or '')} (line, right axis)</text>")
     else:
         minimum, maximum = min(0.0, min(values)), max(0.0, max(values))
         span = max(1.0, maximum - minimum)
@@ -1355,7 +1456,7 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     sections = "".join("<section class='card'><h2>{}</h2><p>{}</p>{}</section>".format(esc(section.heading), esc(section.commentary), "<h3>Recommended actions</h3><ul>{}</ul>".format("".join("<li>{}</li>".format(esc(action)) for action in section.recommended_actions)) if section.recommended_actions else "") for section in document.sections)
     glossary = "".join("<li><strong>{}</strong> ({}) — {}</li>".format(esc(item["label"]), esc(item["kind"]), esc(item["description"])) for item in document.glossary) or "<li>No validated glossary entries yet.</li>"
     notes = "".join("<li class='manual'><strong>Manual note:</strong> {}</li>".format(esc(note.text)) for note in document.manual_glossary_notes) or "<li class='manual'>No manual glossary notes.</li>"
-    artifact = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}.scope{{font-size:13px;color:#475569}}.manual{{color:#5b21b6}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p>Authored briefing from validated report run <code>{}</code>. Use your browser’s Print command to save as PDF.</p><section class='meta'><h2>Executive summary</h2><p>{}</p></section>{}<section class='meta'><h2>Validated artifacts and evidence</h2>{}</section><section class='meta'><h2>Glossary</h2><ul>{}</ul><h3>Author notes (not validated evidence)</h3><ul>{}</ul></section><section class='meta'><h2>Provenance</h2><p>Dataset checksum: <code>{}</code>. Source: {} / {}. Generated: {}. Artifact specifications and evidence are retained in the run manifest.</p></section></main></body></html>""".format(esc(document.title), esc(document.title), esc(run_id[:8]), esc(document.executive_summary) or "No executive summary supplied.", sections, "".join(artifact_parts) or "<section class='card'><p>No validated artifacts have been pinned.</p></section>", glossary, notes, esc(manifest["dataset_sha256"]), esc(metadata["source_type"]), esc(metadata["source_label"]), esc(manifest["generated_at"]))
+    artifact = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.warning{{color:#92400e;background:#fffbeb;padding:10px;border-radius:8px}}.scope{{font-size:13px;color:#475569}}.manual{{color:#5b21b6}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}.report-layout{{display:grid;gap:18px}}.layout-slot{{min-width:0;background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px}}.layout-slot h2{{margin:0 0 12px;font-size:17px}}.layout-slot--growth,.layout-slot--hero-trend,.layout-slot--contribution-ranking,.layout-slot--trend-grid{{grid-column:1 / -1}}.slot-artifact{{min-width:0;margin:14px 0}}.slot-artifact+.slot-artifact{{border-top:1px solid #e2e8f0;padding-top:16px}}.slot-artifact h3{{margin:0}}.slot-empty{{color:#64748b;overflow-wrap:anywhere}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p>Authored briefing from validated report run <code>{}</code>. Use your browser’s Print command to save as PDF.</p><section class='meta'><h2>Executive summary</h2><p>{}</p></section>{}<section class='meta'><h2>Validated artifacts and evidence</h2>{}</section><section class='meta'><h2>Glossary</h2><ul>{}</ul><h3>Author notes (not validated evidence)</h3><ul>{}</ul></section><section class='meta'><h2>Provenance</h2><p>Dataset checksum: <code>{}</code>. Source: {} / {}. Generated: {}. Artifact specifications and evidence are retained in the run manifest.</p></section></main></body></html>""".format(esc(document.title), esc(document.title), esc(run_id[:8]), esc(document.executive_summary) or "No executive summary supplied.", sections, "".join(artifact_parts) or "<section class='card'><p>No validated artifacts have been pinned.</p></section>", glossary, notes, esc(manifest["dataset_sha256"]), esc(metadata["source_type"]), esc(metadata["source_label"]), esc(manifest["generated_at"]))
     # Replace legacy technical metadata with a business-facing export.  The manifest
     # remains a server artifact, but its identifiers/checksum are never shown here.
     labels = {
@@ -1369,7 +1470,7 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
         artifact_parts.append("<section class='card'><h2>{}</h2><p class='scope'>{}</p>{}<div class='chart-visual'>{}</div><h3>{}</h3><ul>{}</ul><table><caption>{} {}</caption><thead><tr><th>{}</th>{}<th>{} {}</th></tr></thead><tbody>{}</tbody></table></section>".format(esc(saved.title or chart.title), esc(saved.scope), note, _report_chart_svg(chart), esc(labels["evidence"]), "".join("<li>{}</li>".format(esc(item)) for item in saved.evidence), esc(labels["table"]), esc(saved.title or chart.title), esc(display_label(chart.dimension)), "<th>{}</th>".format(esc(display_label(chart.secondary_dimension))) if chart.secondary_dimension else "", esc(chart.aggregation), esc(display_label(chart.metric)), rows))
     sections = "".join("<section class='card'><h2>{}</h2>{}<p>{}</p>{}</section>".format(esc(section.heading), "<h3>{}</h3><ul>{}</ul>".format(esc(labels["actions"]), "".join("<li>{}</li>".format(esc(action)) for action in section.recommended_actions)) if section.recommended_actions else "", esc(section.commentary), "") for section in document.sections)
     glossary = "".join("<li><strong>{}</strong> — {}</li>".format(esc(item["label"]), esc(item["description"])) for item in document.glossary) or f"<li>{esc(labels['no_glossary'])}</li>"
-    artifact = """<!doctype html><html lang='{}'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.scope{{font-size:13px;color:#475569}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p class='scope'>{}: {} · {}</p><section class='meta'><h2>{}</h2><p>{}</p></section>{}{}<section class='meta'><h2>{}</h2><ul>{}</ul></section></main></body></html>""".format(document.locale, esc(document.title), esc(document.title), esc(labels["source"]), esc(metadata["source_label"]), esc(labels["print"]), esc(labels["summary"]), esc(document.executive_summary) or esc(labels["empty"]), sections, "".join(artifact_parts) or f"<section class='card'><p>{esc(labels['no_artifacts'])}</p></section>", esc(labels["glossary"]), glossary)
+    artifact = """<!doctype html><html lang='{}'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{}</title><style>body{{font:15px system-ui;margin:0;background:#f8fafc;color:#172554}}main{{max-width:1100px;margin:auto;padding:36px}}.meta,.card{{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px;margin:16px 0}}table{{width:100%;border-collapse:collapse}}th,td{{padding:9px;border-bottom:1px solid #e2e8f0;text-align:left;vertical-align:top}}.scope{{font-size:13px;color:#475569}}.chart-visual{{overflow-x:auto;margin:16px 0}}.report-chart{{display:block;min-width:620px;width:100%;height:auto}}.report-layout{{display:grid;gap:18px}}.layout-slot{{min-width:0;background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:20px}}.layout-slot h2{{margin:0 0 12px;font-size:17px}}.layout-slot--growth,.layout-slot--hero-trend,.layout-slot--contribution-ranking,.layout-slot--trend-grid{{grid-column:1 / -1}}.slot-artifact{{min-width:0;margin:14px 0}}.slot-artifact+.slot-artifact{{border-top:1px solid #e2e8f0;padding-top:16px}}.slot-artifact h3{{margin:0}}.slot-empty{{color:#64748b;overflow-wrap:anywhere}}caption{{text-align:left;font-weight:600;padding:0 0 8px}}@media print{{body{{background:#fff}}main{{max-width:none;padding:0}}.card,.meta{{break-inside:avoid}}}}</style></head><body><main><h1>{}</h1><p class='scope'>{}: {} · {}</p><section class='meta'><h2>{}</h2><p>{}</p></section>{}{}<section class='meta'><h2>{}</h2><ul>{}</ul></section></main></body></html>""".format(document.locale, esc(document.title), esc(document.title), esc(labels["source"]), esc(metadata["source_label"]), esc(labels["print"]), esc(labels["summary"]), esc(document.executive_summary) or esc(labels["empty"]), sections, "".join(artifact_parts) or f"<section class='card'><p>{esc(labels['no_artifacts'])}</p></section>", esc(labels["glossary"]), glossary)
     # The export advertises the persisted blueprint with stable structural regions.
     # The editor can use the same role names without inferring facts from titles.
     layout_template = LEGACY_REPORT_LAYOUTS.get(document.layout_blueprint.template, document.layout_blueprint.template)
@@ -1381,16 +1482,24 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     }[layout_template]
     slots = _report_layout_slots(layout_template, document.pinned_artifacts)
     slot_roles = {
-        "executive_briefing": {"kpi-evidence": "evidence", "growth": "trend", "drivers": "ranking", "risks": "share"},
-        "sales_performance_review": {"sales-kpis": "evidence", "hero-trend": "trend", "ranking-share": "ranking", "risks-opportunities": "share"},
-        "category_division_deep_dive": {"segment-summary": "evidence", "contribution-ranking": "ranking", "comparison": "share", "evidence": "trend"},
-        "weekly_monthly_business_review": {"period-snapshot": "evidence", "previous-comparison": "trend", "trend-grid": "ranking", "wins-watchouts": "share"},
+        "executive_briefing": {"kpi-evidence": ("evidence",), "growth": ("trend",), "drivers": ("ranking", "share"), "risks": ("share",)},
+        "sales_performance_review": {"sales-kpis": ("evidence",), "hero-trend": ("trend",), "ranking-share": ("ranking", "share"), "risks-opportunities": ("share",)},
+        "category_division_deep_dive": {"segment-summary": ("evidence",), "contribution-ranking": ("ranking",), "comparison": ("share", "trend"), "evidence": ("evidence",)},
+        "weekly_monthly_business_review": {"period-snapshot": ("evidence",), "previous-comparison": ("evidence",), "trend-grid": ("trend", "ranking", "share"), "wins-watchouts": ("share",)},
     }[layout_template]
+    artifacts_by_id = {item.artifact_id: (item, chart) for item, chart in zip(document.pinned_artifacts, charts)}
+    assigned: set[str] = set()
     def layout_slot(name: str) -> str:
-        role = slot_roles.get(name)
-        items = slots.get(role, []) if role else []
+        roles = slot_roles.get(name, ())
+        items = [item for role in roles for item in slots.get(role, []) if item.artifact_id not in assigned]
+        for item in items:
+            assigned.add(item.artifact_id)
         if items:
-            content = "".join("<p class='slot-artifact'>{}</p>".format(esc(item.title or item.artifact_id)) for item in items)
+            content = "".join(
+                "<article class='slot-artifact'><h3>{}</h3><p class='scope'>{}</p><div class='chart-visual'>{}</div></article>".format(
+                    esc(item.title or item.artifact_id), esc(item.scope), _report_chart_svg(artifacts_by_id[item.artifact_id][1])
+                ) for item in items
+            )
         else:
             content = "<p class='slot-empty'>Pin a matching validated artifact to populate this slot.</p>"
         return f"<section class='layout-slot layout-slot--{name}' data-slot='{name}'><h2>{esc(name.replace('-', ' ').title())}</h2>{content}</section>"
@@ -1608,7 +1717,7 @@ def _chat_dimension(columns: list[ColumnProfile], message: str, selections: list
     direct = next((item for item in fields if item.name in named), None) or next((item for item in fields if item.name in selected), None)
     if direct:
         return direct
-    if any(word in normalized for word in {"thang", "month", "ngay", "day", "trend", "xu huong", "6 thang", "nam"}):
+    if any(word in normalized for word in {"thang", "month", "ngay", "day", "date", "trend", "xu huong", "6 thang", "nam"}):
         return cast(ColumnProfile | None, business_semantic_catalog(columns).time())
     for item in fields:
         words = canonical_field_name(item.name).split("_")
@@ -1645,12 +1754,17 @@ def _complete_chat_intent(columns: list[ColumnProfile], message: str, chart: Cha
     if re.search(r"\b(per|each|within)\b", normalized) and re.search(r"\btop\s+\d+", normalized) and not chart.limit_per_secondary:
         raise ValueError("The requested per-group ranking could not be resolved.")
     top = re.search(r"\b(?:top|highest|cao nhat)\s+(\d+)\b", normalized)
+    # A singular superlative is a lookup, not a time trend. Keep the aggregate
+    # request bounded to one row; output intent decides table/KPI presentation.
+    superlative_lookup = bool(re.search(r"\b(?:which|what)\s+(?:date|day)\b.*\b(?:top|highest|lowest)\b|\b(?:highest|lowest)\b.*\b(?:date|day)\b", normalized))
     updates: dict[str, object] = {}
     if top:
         limit = int(top.group(1))
         if not 1 <= limit <= 30:
             raise ValueError("Top N must be between 1 and 30.")
         updates.update(limit=limit, chart_type="bar")
+    elif superlative_lookup:
+        updates.update(limit=1, chart_type="bar")
     if re.search(r"\b(avg|average|mean|trung binh)\b", normalized):
         updates["aggregation"] = "avg"
     elif re.search(r"\b(count|dem)\b", normalized):
@@ -1678,10 +1792,16 @@ def _complete_chat_intent(columns: list[ColumnProfile], message: str, chart: Cha
     return ChartRequest.model_validate({**chart.model_dump(), **updates})
 
 
-def _output_intent(message: str) -> Literal["table", "chart"]:
-    normalized = message.casefold()
-    table_words = ("table", "tabular", "rows", "bảng", "dang bang", "dạng bảng")
-    return "table" if any(word in normalized for word in table_words) else "chart"
+def _output_intent(message: str) -> Literal["table", "chart", "kpi"]:
+    normalized = canonical_field_name(message).replace("_", " ")
+    table_words = ("table", "tabular", "rows", "bang", "dang bang")
+    if any(word in normalized for word in table_words):
+        return "table"
+    # Exact superlative lookups answer with the winning aggregate rather than a
+    # chart-shaped trend. This includes "which date has top sales?".
+    if re.search(r"\b(?:which|what)\s+(?:date|day)\b.*\b(?:top|highest|lowest)\b|\b(?:highest|lowest)\b.*\b(?:date|day)\b", normalized):
+        return "kpi"
+    return "chart"
 
 
 def _starter_analysis_response(columns: list[ColumnProfile], message: str, language: Literal["en", "vi"] = "en") -> ChatResponse:
@@ -1797,7 +1917,8 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
             },
         })
         return clarification
-    clarification_options = [] if (exact_request or comparison) else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
+    is_date_lookup = _output_intent(request.message) == "kpi"
+    clarification_options = [] if (exact_request or comparison or is_date_lookup) else _semantic_clarification(profile_data.columns, request.message, selections, request.language)
     if clarification_options:
         RUN_STORE.save_artifact_json(run_id, "semantic-selection.json", {"selections": selections, "continuation": {"message": request.message, "language": request.language, "allowed_options": [{"column": option.column, "role": option.role} for option in clarification_options]}})
         if request.language == "vi":
@@ -1839,8 +1960,19 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     caveats = list(chart.warnings)
     if any(word in request.message.lower() for word in {"cùng kỳ", "year over year", "yoy", "năm ngoái"}):
         caveats.append("So sánh cùng kỳ cần một trường thời gian được chuẩn hoá theo tháng/năm; bản chat hiện trả xu hướng tổng hợp trước để bạn review phạm vi." if request.language == "vi" else "A year-over-year comparison needs a time field normalized by month/year; this response returns an aggregate trend for you to review the scope first.")
-    answer = f"Đã chuẩn bị bảng {metric.name} theo {dimension.name}." if output_intent == "table" and request.language == "vi" else f"I prepared a table of {metric.name} by {dimension.name}." if output_intent == "table" else f"Đã phân tích {metric.name} theo {dimension.name}." if request.language == "vi" else f"I analyzed {metric.name} by {dimension.name}."
-    return ChatResponse(answer=answer, insight=insight, scope=scope, title=chart.title, chart=None if output_intent == "table" else chart, table=chart.rows, caveats=caveats, mode="analysis", planner=cast(Literal["llm", "deterministic"], planner))
+    if output_intent == "kpi":
+        winner = chart.rows[0] if chart.rows else None
+        if winner is None:
+            answer = "No matching date/value was available in the selected scope." if request.language == "en" else "Không có ngày/giá trị phù hợp trong phạm vi đã chọn."
+        elif request.language == "en":
+            answer = f"{winner['display_label']} has the highest {display_label(metric.name)} at {winner['formatted_value']}."
+        else:
+            answer = f"{winner['display_label']} có {display_label(metric.name)} cao nhất: {winner['formatted_value']}."
+    elif output_intent == "table":
+        answer = f"Đã chuẩn bị bảng {metric.name} theo {dimension.name}." if request.language == "vi" else f"I prepared a table of {metric.name} by {dimension.name}."
+    else:
+        answer = f"Đã phân tích {metric.name} theo {dimension.name}." if request.language == "vi" else f"I analyzed {metric.name} by {dimension.name}."
+    return ChatResponse(answer=answer, insight=insight, scope=scope, title=chart.title, chart=chart if output_intent == "chart" else None, table=chart.rows, caveats=caveats, mode="analysis", output_mode=output_intent, planner=cast(Literal["llm", "deterministic"], planner))
 
 
 @app.post("/api/runs/{run_id}/chat/stream")
