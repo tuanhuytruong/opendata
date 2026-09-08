@@ -1117,7 +1117,10 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
             row["cumulative_pct"] = 0 if total == 0 else round(running / total * 100, 2)
     insight_headline, evidence = chart_insight(chart_rows, chronological, language)
     per_secondary = bool(secondary and request.limit_per_secondary)
-    title = presentation_title(request.metric, request.dimension, request.chart_type, language=language, limit=request.limit if per_secondary else len(chart_rows), secondary_dimension=request.secondary_dimension)
+    # The configured Top N is part of the analytical request. Keep it in the title
+    # even when filtering/null handling leaves fewer categories, and disclose the
+    # availability separately in warnings/result_count.
+    title = presentation_title(request.metric, request.dimension, request.chart_type, language=language, limit=request.limit, secondary_dimension=request.secondary_dimension)
     return ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), secondary_metric=request.secondary_metric, secondary_metric_display_name=display_label(request.secondary_metric) if request.secondary_metric else "", value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), requested_limit=request.limit, insight_headline=insight_headline, evidence=evidence)
 
 

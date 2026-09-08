@@ -65,7 +65,7 @@ function DemoPreview({ language }: { language: Language }) {
     </div>
     <DemoVisual view={view} point={point} onPoint={setPoint} />
     <div className="demo-selection" aria-live="polite"><span>{view.labels[selected]}</span><b>{formatDemoValue(view, value)}</b></div>
-    <div className="demo-preview-stat"><div><small>{view.label}</small><b>{view.metric}</b></div><div><small>{t('demoTrend')}</small><b className="demo-positive">{view.trend}</b></div></div>
+    <div className="demo-preview-stat"><div><small>{view.label}</small><b>{formatDemoValue(view, value)}</b></div><div><small>{t('demoTrend')}</small><b className="demo-positive">{view.trend}</b></div></div>
     <p>{t('demoDisclaimer')}</p>
     <a className="demo-start-link" href="#import-data"><Upload className="w-3.5 h-3.5" />{t('startYourData')}<ChevronRight className="w-3.5 h-3.5" /></a>
   </section>;
@@ -81,9 +81,14 @@ function DemoVisual({ view, point, onPoint }: { view: DemoView; point: number | 
   const selected = point === null ? view.values.length - 1 : point;
   const activate = (index: number) => onPoint(index);
   if (view.id === 'revenue') {
-    const max = Math.max(...view.values); const width = 340; const height = 150; const padding = 22;
-    const coords = view.values.map((value, index) => ({ x: padding + index * ((width - padding * 2) / (view.values.length - 1)), y: height - padding - (value / max) * (height - padding * 2) }));
-    return <div className="demo-chart demo-line-chart" role="group" aria-label={`${view.label} trend`}><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${view.label}: ${view.values.join(', ')}`}><path d={`M ${coords.map(c => `${c.x} ${c.y}`).join(' L ')}`} className="demo-line-path" /><path d={`M ${coords[0].x} ${height - padding} L ${coords.map(c => `${c.x} ${c.y}`).join(' L ')} L ${coords.at(-1)?.x} ${height - padding} Z`} className="demo-area-fill" />{coords.map((coord, index) => <g key={view.labels[index]}><circle cx={coord.x} cy={coord.y} r={selected === index ? 5 : 3} className={selected === index ? 'selected' : ''} /><text x={coord.x} y={coord.y - 10} textAnchor="middle">{formatDemoValue(view, view.values[index])}</text><rect x={coord.x - 18} y="0" width="36" height={height} fill="transparent" tabIndex={0} role="button" aria-label={`${view.labels[index]}: ${formatDemoValue(view, view.values[index])}`} onMouseEnter={() => activate(index)} onFocus={() => activate(index)} onClick={() => activate(index)} /></g>)}</svg><div className="demo-axis-labels">{view.labels.map(label => <span key={label}>{label}</span>)}</div></div>;
+    // The SVG plot and visible x-axis share the same 0–100 coordinate span.
+    // Keep horizontal padding out of the scale; otherwise responsive SVG resizing
+    // makes the curve shorter than the month labels underneath it.
+    const max = Math.max(...view.values); const width = 100; const height = 150; const paddingY = 22;
+    const bandWidth = width / view.values.length;
+    const coords = view.values.map((value, index) => ({ x: bandWidth * (index + .5), y: height - paddingY - (value / max) * (height - paddingY * 2) }));
+    const baseline = height - paddingY;
+    return <div className="demo-chart demo-line-chart" role="group" aria-label={`${view.label} trend`}><svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label={`${view.label}: ${view.values.join(', ')}`}><path d={`M ${coords.map(c => `${c.x} ${c.y}`).join(' L ')}`} className="demo-line-path" /><path d={`M ${coords[0].x} ${baseline} L ${coords.map(c => `${c.x} ${c.y}`).join(' L ')} L ${coords.at(-1)?.x} ${baseline} Z`} className="demo-area-fill" />{coords.map((coord, index) => <g key={view.labels[index]}><circle cx={coord.x} cy={coord.y} r={selected === index ? 2.2 : 1.5} className={selected === index ? 'selected' : ''} /><text x={coord.x} y={coord.y - 10} textAnchor="middle">{formatDemoValue(view, view.values[index])}</text><rect x={coord.x - 9} y="0" width="18" height={height} fill="transparent" tabIndex={0} role="button" aria-label={`${view.labels[index]}: ${formatDemoValue(view, view.values[index])}`} onMouseEnter={() => activate(index)} onFocus={() => activate(index)} onClick={() => activate(index)} /></g>)}</svg><div className="demo-axis-labels">{view.labels.map(label => <span key={label}>{label}</span>)}</div></div>;
   }
   if (view.id === 'orders') {
     const max = Math.max(...view.values);

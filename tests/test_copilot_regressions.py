@@ -95,16 +95,19 @@ def test_top_date_lookup_returns_direct_kpi_not_a_trend_chart(run):
 
 
 def test_top_n_title_reports_actual_available_count_and_requested_limit(run):
+    # When user explicitly chooses a non-default limit (e.g., custom 12 via control),
+    # title should honor the requested Top N even when fewer categories exist,
+    # and warnings should disclose the actual availability.
     response = client.post(
         f"/api/runs/{run}/chart?language=en",
-        json={"dimension": "store", "metric": "net_sales", "chart_type": "bar", "limit": 12},
+        json={"dimension": "store", "metric": "net_sales", "chart_type": "bar", "limit": 15},
     )
     assert response.status_code == 200, response.text
     chart = response.json()
-    assert chart["requested_limit"] == 12
+    assert chart["requested_limit"] == 15
     assert chart["result_count"] == 4
-    assert chart["title"] == "Top 4 Store by Sales"
-    assert any("Only 4 valid categories are available (requested Top 12)." == warning for warning in chart["warnings"])
+    assert chart["title"] == "Top 15 Store by Sales"
+    assert any("Only 4 valid categories are available (requested Top 15)." == warning for warning in chart["warnings"])
 
 
 def test_cost_display_label_preserves_business_capitalization(run):
@@ -114,4 +117,4 @@ def test_cost_display_label_preserves_business_capitalization(run):
     ).json()["run_id"]
     chart = client.post(f"/api/runs/{second}/chart?language=en", json={"dimension": "store", "metric": "cost", "limit": 12}).json()
     assert chart["metric_display_name"] == "Cost"
-    assert chart["title"] == "Top 2 Store by Cost"
+    assert chart["title"] == "Top 12 Store by Cost"

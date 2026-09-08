@@ -475,7 +475,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     body = table.json()
     assert body["chart"] is None
     assert body["table"]
-    assert body["title"] == "Top 2 Channel by Sales"
+    assert body["title"] == "Top 12 Channel by Sales"
     assert body["answer"] == "I prepared a table of net_sales by channel."
     assert body["insight"] == "Online leads at 100."
     assert body["scope"] == "SUM net_sales by channel; 2 results, sorted ranking; all data (no filters)"
@@ -485,7 +485,7 @@ def test_english_chat_response_is_localized_and_table_intent_omits_chart() -> No
     assert chart.status_code == 200, chart.text
     chart_body = chart.json()
     assert chart_body["chart"] is not None
-    assert chart_body["chart"]["title"] == "Top 2 Channel by Sales"
+    assert chart_body["chart"]["title"] == "Top 12 Channel by Sales"
     assert chart_body["chart"]["insight_headline"] == "Online leads at 100."
 
 
@@ -791,7 +791,7 @@ def test_presentation_titles_and_data_handoff_filters_and_type_sorting() -> None
     assert chart.status_code == 200
     assert chart.json()["title"] == "Sales Performance Over Time"
     ranked = client.post(f"/api/runs/{run_id}/chart?language=en", json={"dimension": "channel", "metric": "net_sales", "chart_type": "bar"})
-    assert ranked.json()["title"] == "Top 3 Channel by Sales"
+    assert ranked.json()["title"] == "Top 12 Channel by Sales"
 
     category_filters = '[{"column":"channel","operator":"in","values":["Alpha","Gamma"]}]'
     scoped = client.get(f"/api/runs/{run_id}/data?page_size=10&filters={category_filters}")
