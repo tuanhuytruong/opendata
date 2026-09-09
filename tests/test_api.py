@@ -860,7 +860,8 @@ def test_executive_scorecards_include_compact_values_and_only_safe_time_comparis
     # Full-data scorecards do not imply a comparison from the final two rows.
     assert card["prior_period_value"] is None
     assert card["change_pct"] is None
-    assert card["sparkline"] is None
+    # Full-data cards may show a factual time-series sparkline, but no implied comparison.
+    assert card["sparkline"] == [100.0, 150.0]
     assert card["current_period_label"] is None
     assert card["prior_period_label"] is None
 

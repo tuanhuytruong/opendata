@@ -111,3 +111,15 @@ body { background:#f1f5f9; color:#0f172a; font-family:var(--font-sans); }
 .chart-companion-table h3{margin-top:3px;font-size:14px;font-weight:700;line-height:1.3}.chart-companion-scroll{max-height:282px;margin-top:12px;overflow:auto;border:1px solid #e2e8f0;border-radius:9px}.chart-companion-table table{width:100%;border-collapse:collapse;font-size:11px}.chart-companion-table th{position:sticky;top:0;background:#f8fafc;color:#64748b;font-weight:700;text-align:left}.chart-companion-table th,.chart-companion-table td{padding:8px;border-bottom:1px solid #eef2f7}.chart-companion-table th:nth-child(1),.chart-companion-table td:nth-child(1),.chart-companion-table th:nth-child(3),.chart-companion-table td:nth-child(3),.chart-companion-table th:nth-child(4),.chart-companion-table td:nth-child(4){text-align:right;font-variant-numeric:tabular-nums}.chart-companion-table td:nth-child(2){max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.chart-availability{margin-top:8px;color:#64748b;font-size:11px}
 .demo-line-chart{height:204px;padding:0;overflow:hidden}.demo-line-chart svg{display:block;width:100%;height:100%;overflow:visible}.demo-line-chart .demo-baseline{stroke:#cbd5e1;stroke-width:1}.demo-line-chart .demo-selected-value{fill:#334155;font:700 12px var(--font-sans);paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}.demo-line-chart .demo-axis-label{fill:#64748b;font:600 10px var(--font-sans)}.demo-line-chart circle{fill:#4f46e5;stroke:#fff;stroke-width:2}.demo-line-chart circle.selected{fill:#0f766e}.demo-line-chart rect{cursor:pointer}.demo-line-chart .demo-area-fill{fill:#c7d2fe;opacity:.45}.demo-line-chart .demo-line-path{fill:none;stroke:#4f46e5;stroke-width:3;stroke-linecap:round;stroke-linejoin:round}
 @media (max-width:900px){.executive-chart-pair{grid-template-columns:1fr;grid-column:auto}.chart-companion-scroll{max-height:260px}}
+
+
+/* Executive Hub density: six peer artifacts form a balanced desktop 3 × 2 grid. */
+.executive-chart-grid { grid-template-columns:repeat(3,minmax(0,1fr)); grid-auto-flow:row dense; align-items:stretch; }
+.executive-chart-grid.artifact-count-6 > .executive-chart-card.role-trend { grid-column:auto; }
+.executive-chart-grid .chart-companion-table { min-height:0; }
+.executive-chart-grid .chart-visual, .executive-chart-grid .role-trend .chart-visual { height:300px; }
+.executive-scorecard p { text-transform:uppercase; letter-spacing:.08em; font-size:10px; font-weight:750; }
+.executive-scorecard { padding:16px; min-height:104px; }
+.executive-scorecard .scorecard-sparkline { width:45%; min-width:90px; height:42px; }
+@media (max-width:1200px) { .executive-chart-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .executive-chart-grid.artifact-count-6 > .executive-chart-card.role-trend { grid-column:span 2; } }
+@media (max-width:900px) { .executive-chart-grid { grid-template-columns:1fr; } .executive-chart-grid.artifact-count-6 > .executive-chart-card.role-trend { grid-column:auto; } }

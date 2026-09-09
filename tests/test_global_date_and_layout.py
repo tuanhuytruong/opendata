@@ -48,7 +48,7 @@ def test_profile_exposes_each_time_field_full_bounds_and_scorecards_compare_only
     full = next(item for item in client.get(f"/api/runs/{run_id}/executive-overview?language=en").json()["scorecards"] if item["metric"] == "net_sales")
     assert full["prior_period_value"] is None
     assert full["change_pct"] is None
-    assert full["sparkline"] is None
+    assert full["sparkline"] == [10.0, 20.0, 30.0, 40.0]
 
     scoped = next(item for item in client.get(
         f"/api/runs/{run_id}/executive-overview?language=en&date_column=sale_date&start=2026-01-03&end=2026-01-04"

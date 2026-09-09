@@ -6,7 +6,14 @@ import { chartCategoryLabel, formatChartValue } from '../formatting';
 
 export const CATEGORY_PALETTE = ['#4f46e5', '#0f766e', '#c2410c', '#be185d', '#0284c7', '#65a30d', '#9333ea', '#ea580c', '#475569', '#db2777'];
 const PRIMARY_COLOR = CATEGORY_PALETTE[0];
-export function numericDomainWithHeadroom(values: number[]): [number, number] { const finite = values.filter(Number.isFinite); if (!finite.length) return [0, 1]; const min = Math.min(...finite); const max = Math.max(...finite); if (min >= 0) return [0, max > 0 ? max * 1.2 : 1]; if (max <= 0) return [min * 1.2, 0]; return [min * 1.2, max * 1.2]; }
+export function numericDomainWithHeadroom(values: number[]): [number, number] {
+  const finite = values.filter(Number.isFinite); if (!finite.length) return [0, 1];
+  const min = Math.min(...finite); const max = Math.max(...finite);
+  const niceCeiling = (value: number) => { const magnitude = 10 ** Math.floor(Math.log10(Math.max(1, Math.abs(value)))); const normalized = value / magnitude; const step = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 2.5 ? 2.5 : normalized <= 4 ? 4 : normalized <= 5 ? 5 : 10; return step * magnitude; };
+  if (min >= 0) return [0, max > 0 ? niceCeiling(max * 1.08) : 1];
+  if (max <= 0) return [-niceCeiling(Math.abs(min) * 1.08), 0];
+  return [-niceCeiling(Math.abs(min) * 1.08), niceCeiling(max * 1.08)];
+}
 export function visibleLabelIndexes(rows: ChartRow[], chartWidth: number): Set<number> { const count = rows.length; if (count <= Math.max(4, Math.floor(chartWidth / 70))) return new Set(rows.map((_, index) => index)); const indexes = new Set<number>([0, count - 1]); let min = 0; let max = 0; rows.forEach((row, index) => { if (row.value < rows[min].value) min = index; if (row.value > rows[max].value) max = index; }); indexes.add(min); indexes.add(max); const target = Math.min(7, Math.max(4, Math.floor(chartWidth / 120))); for (let step = 1; step < target - 1; step += 1) indexes.add(Math.round((step * (count - 1)) / (target - 1))); return indexes; }
 export function chartDensity(rowCount: number, width: number) { const band = rowCount <= 5 && width >= 300 ? 'sparse' : rowCount <= 10 ? 'medium' : 'dense'; return { band, axis: band === 'sparse' ? 11 : band === 'medium' ? 10 : 9, label: band === 'sparse' ? 12 : band === 'medium' ? 10 : 9, barGap: band === 'sparse' ? 12 : band === 'medium' ? 7 : 3 }; }
 function labelFor(row?: ChartRow) { return row?.display_label ?? row?.label ?? ''; }

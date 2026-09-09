@@ -1179,6 +1179,17 @@ def executive_overview(
             # Full-data scorecards deliberately make no implied "previous period"
             # comparison. A comparison exists only for an explicit, complete selected
             # range on its selected time field.
+            # A factual sparkline is useful even for the full dataset; unlike a delta,
+            # it makes no claim about a prior comparison window.
+            if not date_scope and safe_time is not None:
+                time_identifier = quote_identifier(safe_time.name, headers)
+                periods = connection.execute(
+                    f"SELECT CAST(TRY_CAST({time_identifier} AS TIMESTAMP) AS DATE), "
+                    f"SUM(TRY_CAST(REPLACE({identifier}, ',', '') AS DOUBLE)) FROM dataset "
+                    f"GROUP BY 1 ORDER BY 1"
+                ).fetchall()
+                if len(periods) >= 2:
+                    comparison["sparkline"] = [float(period_value or 0) for _, period_value in periods]
             if date_scope and date_scope.start and date_scope.end:
                 time_identifier = quote_identifier(date_scope.column, headers)
                 global_bounds = [
