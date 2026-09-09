@@ -96,5 +96,8 @@ def test_report_layout_is_validated_persisted_and_exported_structurally() -> Non
         exported = client.get(f"/api/runs/{run_id}/report")
         assert f"report-layout--{template}" in exported.text
         assert "report-chart" in exported.text
+        assert "background:#f4f7fb" in exported.text
+        assert "box-shadow:0 1px 3px" in exported.text
+        assert "background:#172554" not in exported.text
     bad = client.put(f"/api/runs/{run_id}/custom-report", json={"layout_blueprint": {"template": "invented"}})
     assert bad.status_code == 422

@@ -8,7 +8,7 @@ type SlotKind = 'trend' | 'ranking' | 'share' | 'evidence';
 type Slot = { key: string; label: string; accepts: SlotKind[]; size: 'hero' | 'supporting' | 'evidence' };
 type Blueprint = { id: ReportLayoutTemplate; title: string; description: string; sections: string[]; slots: Slot[] };
 
-// Keep these identifiers exactly aligned with ReportLayoutBlueprint.template on the API.
+// These IDs mirror the API's ReportLayoutBlueprint.template enum exactly.
 const blueprints: Blueprint[] = [
   { id: 'executive_briefing', title: 'Executive Briefing', description: 'Cover, KPI evidence strip, synthesis, drivers, risks and actions.', sections: ['Executive synthesis', 'Growth highlights', 'Risks and watchouts', 'Numbered action plan'], slots: [{ key: 'kpi-evidence', label: 'KPI benchmark strip', accepts: ['evidence'], size: 'evidence' }, { key: 'growth', label: 'Growth highlights', accepts: ['trend'], size: 'hero' }, { key: 'drivers', label: 'Value drivers', accepts: ['ranking', 'share'], size: 'supporting' }] },
   { id: 'sales_performance_review', title: 'Sales Performance Review', description: 'Period comparison, hero trend, drivers and channel contribution.', sections: ['Risks and opportunities', 'Sales actions'], slots: [{ key: 'hero-trend', label: 'Hero sales trend', accepts: ['trend'], size: 'hero' }, { key: 'ranking-share', label: 'Drivers and contribution', accepts: ['ranking', 'share'], size: 'supporting' }, { key: 'sales-kpis', label: 'Sales KPI evidence', accepts: ['evidence'], size: 'evidence' }] },
@@ -17,57 +17,34 @@ const blueprints: Blueprint[] = [
 ];
 
 const empty = (runId: string): CustomReportDocument => ({ run_id: runId, title: 'Custom Report', executive_summary: '', sections: [], pinned_artifacts: [], manual_glossary_notes: [], glossary: [], updated_at: '', layout_blueprint: { template: 'executive_briefing' } });
-const artifactKind = (artifact: CustomReportArtifact): SlotKind => {
-  const result = artifact.result;
-  if (!result) return 'evidence';
-  if (result.chart_type === 'line' || result.chart_type === 'area' || result.sort_mode === 'chronological') return 'trend';
-  if (result.chart_type === 'pie' || result.chart_type === 'donut') return 'share';
-  if (result.chart_type === 'bar' || result.chart_type === 'pareto' || result.chart_type === 'stacked_bar') return 'ranking';
-  return 'evidence';
-};
+const artifactKind = (artifact: CustomReportArtifact): SlotKind => { const result = artifact.result; if (!result) return 'evidence'; if (result.chart_type === 'line' || result.chart_type === 'area' || result.sort_mode === 'chronological') return 'trend'; if (result.chart_type === 'pie' || result.chart_type === 'donut') return 'share'; if (result.chart_type === 'bar' || result.chart_type === 'pareto' || result.chart_type === 'stacked_bar') return 'ranking'; return 'evidence'; };
 const localize = (language: Language, en: string, vi: string) => language === 'vi' ? vi : en;
 const isTemplate = (value: string | undefined): value is ReportLayoutTemplate => blueprints.some(item => item.id === value);
-
-function allocateSlots(blueprint: Blueprint, artifacts: CustomReportArtifact[]) {
-  const remaining = [...artifacts];
-  return blueprint.slots.map(slot => {
-    const index = remaining.findIndex(artifact => slot.accepts.includes(artifactKind(artifact)));
-    return { slot, artifacts: index < 0 ? [] : remaining.splice(index, 1) };
-  });
-}
+const blueprintFor = (template: ReportLayoutTemplate) => blueprints.find(item => item.id === template) ?? blueprints[0];
+const defaultSections = (blueprint: Blueprint) => blueprint.sections.map((heading, index) => ({ section_id: `template-section-${index}`, heading, commentary: '', recommended_actions: [] }));
+const templateTitles = new Set(['Custom Report', ...blueprints.map(item => item.title)]);
+const hasAuthoredContent = (draft: CustomReportDocument) => !templateTitles.has(draft.title) || Boolean(draft.executive_summary.trim()) || draft.sections.some(section => Boolean(section.commentary.trim()) || !section.section_id.startsWith('template-section-'));
+const applyTemplateDefaults = (draft: CustomReportDocument, blueprint: Blueprint): CustomReportDocument => {
+  const authored = hasAuthoredContent(draft);
+  return { ...draft, layout_blueprint: { template: blueprint.id }, title: authored ? draft.title : blueprint.title, sections: authored ? draft.sections : defaultSections(blueprint) };
+};
+function allocateSlots(blueprint: Blueprint, artifacts: CustomReportArtifact[]) { const remaining = [...artifacts]; return blueprint.slots.map(slot => { const index = remaining.findIndex(artifact => slot.accepts.includes(artifactKind(artifact))); return { slot, artifacts: index < 0 ? [] : remaining.splice(index, 1) }; }); }
 
 type Props = { runId: string; report: CustomReportDocument | null; language: Language; onChange: (next: CustomReportDocument) => void };
 export default function ReportComposer({ runId, report, language, onChange }: Props) {
   const [draft, setDraft] = useState<CustomReportDocument>(() => report ?? empty(runId));
-  const [template, setTemplate] = useState<ReportLayoutTemplate>('executive_briefing');
   const [status, setStatus] = useState('');
   const ref = useRef(draft); const queue = useRef(Promise.resolve());
-  useEffect(() => {
-    const next = report ?? empty(runId);
-    const chosen = isTemplate(next.layout_blueprint?.template) ? next.layout_blueprint.template : 'executive_briefing';
-    ref.current = { ...next, layout_blueprint: { template: chosen } };
-    setDraft(ref.current); setTemplate(chosen);
-  }, [report, runId]);
-  const save = (next = ref.current, chosen = template) => {
-    const canonical = { ...next, layout_blueprint: { template: chosen } };
-    ref.current = canonical; setDraft(canonical); setStatus(text(language, 'saving'));
-    queue.current = queue.current.then(async () => {
-      const response = await fetch(`/api/runs/${runId}/custom-report`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...canonical, locale: language }) });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.detail || text(language, 'reportSaveFailed'));
-      ref.current = body as CustomReportDocument; setDraft(ref.current); onChange(ref.current); setStatus(text(language, 'saved'));
-    }).catch(error => setStatus(error instanceof Error ? error.message : text(language, 'reportSaveFailed')));
-  };
-  const changeTemplate = (next: Blueprint) => {
-    setTemplate(next.id);
-    void save({ ...ref.current, title: ref.current.title === 'Custom Report' ? next.title : ref.current.title }, next.id);
-  };
+  useEffect(() => { const next = report ?? empty(runId); const template = isTemplate(next.layout_blueprint?.template) ? next.layout_blueprint.template : 'executive_briefing'; ref.current = { ...next, layout_blueprint: { template } }; setDraft(ref.current); }, [report, runId]);
+  const template = isTemplate(draft.layout_blueprint?.template) ? draft.layout_blueprint.template : 'executive_briefing';
+  const blueprint = blueprintFor(template);
+  const save = (next = ref.current) => { const canonical = { ...next, layout_blueprint: { template: isTemplate(next.layout_blueprint?.template) ? next.layout_blueprint.template : 'executive_briefing' } }; ref.current = canonical; setDraft(canonical); setStatus(text(language, 'saving')); queue.current = queue.current.then(async () => { const response = await fetch(`/api/runs/${runId}/custom-report`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...canonical, locale: language }) }); const body = await response.json(); if (!response.ok) throw new Error(body.detail || text(language, 'reportSaveFailed')); ref.current = body as CustomReportDocument; setDraft(ref.current); onChange(ref.current); setStatus(text(language, 'saved')); }).catch(error => setStatus(error instanceof Error ? error.message : text(language, 'reportSaveFailed'))); };
+  const changeTemplate = (nextBlueprint: Blueprint) => { const next = applyTemplateDefaults(ref.current, nextBlueprint); ref.current = next; setDraft(next); void save(next); };
   const update = <K extends keyof CustomReportDocument>(key: K, value: CustomReportDocument[K]) => { const next = { ...ref.current, [key]: value }; ref.current = next; setDraft(next); };
-  const blueprint = blueprints.find(item => item.id === template) ?? blueprints[0];
   return <section className="report-composer"><header className="report-composer-header"><div><p className="section-eyebrow">{text(language, 'reportEyebrow')}</p><h1>{text(language, 'reportTitle')}</h1><p>{text(language, 'reportSub')}</p></div><div className="report-actions"><span aria-live="polite">{status}</span><button onClick={() => save()}>{text(language, 'save')}</button><button onClick={() => window.open(`/api/runs/${runId}/report`, '_blank', 'noopener,noreferrer')}><Download size={15}/>{text(language, 'exportHtml')}</button><button onClick={() => window.print()}><Printer size={15}/>{text(language, 'printPdf')}</button></div></header>
     <section className="report-template-gallery"><div><p className="section-eyebrow">{text(language, 'reportBlueprintEyebrow')}</p><h2><LayoutTemplate size={17}/>{text(language, 'reportBlueprints')}</h2><p>{text(language, 'reportBlueprintHelp')}</p></div><div className="template-cards">{blueprints.map(item => <button type="button" className={item.id === template ? 'active' : ''} key={item.id} onClick={() => changeTemplate(item)}><strong>{item.title}</strong><span>{item.description}</span><em>{text(language, 'applyLayout')}</em></button>)}</div></section>
     <div className="report-layout"><aside className="report-editor"><label>{text(language, 'reportTitleLabel')}<input value={draft.title} maxLength={120} onChange={event => update('title', event.target.value)} onBlur={() => save()}/></label><label>{text(language, 'executiveSummary')}<textarea value={draft.executive_summary} rows={6} onChange={event => update('executive_summary', event.target.value)} onBlur={() => save()}/></label><label>{text(language, 'sectionsRecommendations')}<textarea value={draft.sections.map(section => `${section.heading}: ${section.commentary}`).join('\n')} rows={9} onChange={event => update('sections', event.target.value.split('\n').filter(Boolean).map((line, index) => { const [heading, ...rest] = line.split(':'); return { section_id: `section-${index}`, heading: heading.trim(), commentary: rest.join(':').trim(), recommended_actions: [] }; }))} onBlur={() => save()}/></label></aside>
-      <section className={`report-preview report-preview-${template}`} aria-label={localize(language, `${blueprint.title} preview`, `Xem trước ${blueprint.title}`)}><div className="preview-cover"><p className="section-eyebrow">{blueprint.title}</p><h2>{draft.title}</h2><p>{draft.executive_summary || localize(language, 'Add an evidence-grounded executive synthesis.', 'Thêm phần tổng hợp điều hành dựa trên bằng chứng.')}</p></div><div className="preview-slots">{allocateSlots(blueprint, draft.pinned_artifacts).map(({ slot, artifacts }) => <PreviewSlot key={slot.key} slot={slot} artifacts={artifacts} language={language}/>)}</div><div className="preview-sections">{draft.sections.length ? draft.sections.map(section => <article key={section.section_id}><h3>{section.heading}</h3><p>{section.commentary || localize(language, 'Add grounded commentary or actions.', 'Thêm nhận định hoặc hành động có căn cứ.')}</p></article>) : <article className="slot-empty"><FileText size={16}/>{localize(language, 'Add sections for decisions, actions, or notes.', 'Thêm phần quyết định, hành động hoặc ghi chú.')}</article>}</div></section></div>
+      <section className={`report-preview report-preview-${template}`} data-layout-blueprint={template} aria-label={localize(language, `${blueprint.title} preview`, `Xem trước ${blueprint.title}`)}><div className="preview-cover"><p className="section-eyebrow">{blueprint.title}</p><h2>{draft.title}</h2><p>{draft.executive_summary || localize(language, 'Add an evidence-grounded executive synthesis.', 'Thêm phần tổng hợp điều hành dựa trên bằng chứng.')}</p></div><div className="preview-slots">{allocateSlots(blueprint, draft.pinned_artifacts).map(({ slot, artifacts }) => <PreviewSlot key={slot.key} slot={slot} artifacts={artifacts} language={language}/>)}</div><div className="preview-sections">{draft.sections.length ? draft.sections.map(section => <article key={section.section_id}><h3>{section.heading}</h3><p>{section.commentary || localize(language, 'Add grounded commentary or actions.', 'Thêm nhận định hoặc hành động có căn cứ.')}</p></article>) : <article className="slot-empty"><FileText size={16}/>{localize(language, 'Add sections for decisions, actions, or notes.', 'Thêm phần quyết định, hành động hoặc ghi chú.')}</article>}</div></section></div>
   </section>;
 }
 function PreviewSlot({ slot, artifacts, language }: { slot: Slot; artifacts: CustomReportArtifact[]; language: Language }) { return <article className={`preview-slot preview-slot-${slot.size}`} data-slot={slot.key}><h3>{slot.label}</h3>{artifacts.length ? artifacts.map(artifact => <div className="preview-artifact" key={artifact.artifact_id}>{artifact.result ? <ValidatedChart result={artifact.result} language={language} report/> : <p>{artifact.title}</p>}</div>) : <div className="slot-empty"><FileText size={15}/>{localize(language, 'Empty — pin a matching validated artifact.', 'Trống — ghim biểu đồ đã xác thực phù hợp.')}</div>}</article>; }
