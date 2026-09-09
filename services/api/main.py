@@ -201,6 +201,9 @@ class ChartRequest(BaseModel):
     # group rather than applying one global limit to all groups.
     limit_per_secondary: bool = False
     limit: int = Field(default=12, ge=1, le=30)
+    # Only server-resolved table intents may request the complete aggregate rather
+    # than a ranked Top-N subset.
+    include_all_categories: bool = False
     filters: list[FilterSpec] = Field(default_factory=list, max_length=10)
     # Applied in addition to chart-local filters. Values never become SQL fragments.
     date_scope: DateScope | None = None
@@ -210,6 +213,8 @@ class ChartRequest(BaseModel):
         payload = handler(self)
         if self.date_scope is None:
             payload.pop("date_scope", None)
+        if not self.include_all_categories:
+            payload.pop("include_all_categories", None)
         return payload
 
 
@@ -335,6 +340,12 @@ class SemanticSelection(BaseModel):
     role: Literal["metric", "dimension"]
 
 
+class TableColumn(BaseModel):
+    key: str
+    label: str
+    value_format: Literal["text", "number", "percent"] = "text"
+
+
 class ChatResponse(BaseModel):
     answer: str
     insight: str
@@ -342,6 +353,7 @@ class ChatResponse(BaseModel):
     title: str = ""
     chart: "ChartResult | None" = None
     table: list[dict[str, str | float | int]] = Field(default_factory=list)
+    table_columns: list[TableColumn] = Field(default_factory=list)
     caveats: list[str] = Field(default_factory=list)
     clarification_options: list[ClarificationOption] = Field(default_factory=list)
     proposals: list[dict[str, object]] = Field(default_factory=list)
@@ -1064,14 +1076,17 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
         filter_clauses.append(date_scope_clause)
         parameters.extend(date_scope_parameters)
     chronological = request.chart_type in {"line", "area"} and dimension_profile.kind == "time" and not secondary
+    # Full-category output is reserved for a server-resolved table intent. All
+    # ordinary chart requests retain their bounded Top-N query contract.
+    limit_clause = "" if request.include_all_categories else " LIMIT ?"
     connection = duckdb.connect(":memory:")
     try:
         connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
         where_clause = " AND ".join(filter_clauses)
         if request.chart_type == "scatter":
-            query = f"SELECT {dimension} AS label, {x_expression} AS x_value, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
+            query = f"SELECT {dimension} AS label, {x_expression} AS x_value, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST{limit_clause}"
         elif request.chart_type == "combo":
-            query = f"SELECT {dimension} AS label, {expression} AS value, {secondary_expression} AS secondary_value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
+            query = f"SELECT {dimension} AS label, {expression} AS value, {secondary_expression} AS secondary_value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST{limit_clause}"
         elif secondary and request.limit_per_secondary:
             query = f"""WITH aggregates AS (
                 SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value
@@ -1083,17 +1098,17 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
             SELECT label, secondary_label, value FROM ranked
             WHERE group_rank <= ? ORDER BY secondary_label ASC, value DESC NULLS LAST, label ASC"""
         elif secondary:
-            query = f"SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1, 2 ORDER BY value DESC NULLS LAST LIMIT ?"
+            query = f"SELECT {dimension} AS label, {secondary} AS secondary_label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1, 2 ORDER BY value DESC NULLS LAST{limit_clause}"
         elif chronological:
-            query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY TRY_CAST({dimension} AS TIMESTAMP) ASC NULLS LAST LIMIT ?"
+            query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY TRY_CAST({dimension} AS TIMESTAMP) ASC NULLS LAST{limit_clause}"
         else:
-            query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST LIMIT ?"
-        records = connection.execute(query, [*parameters, request.limit]).fetchall()
+            query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST{limit_clause}"
+        records = connection.execute(query, [*parameters, *([] if request.include_all_categories else [request.limit])]).fetchall()
     finally:
         connection.close()
     warnings: list[str] = []
     if not records: warnings.append("Không có giá trị phù hợp với phạm vi hiện tại." if language == "vi" else "No values match the current scope.")
-    if records and len(records) < request.limit and not (secondary and request.limit_per_secondary):
+    if records and len(records) < request.limit and not request.include_all_categories and not (secondary and request.limit_per_secondary):
         warnings.append(
             f"Only {len(records)} valid categories are available (requested Top {request.limit})."
             if language == "en" else f"Chỉ có {len(records)} category hợp lệ (đã yêu cầu Top {request.limit})."
@@ -1806,6 +1821,14 @@ def _complete_chat_intent(columns: list[ColumnProfile], message: str, chart: Cha
     return ChartRequest.model_validate({**chart.model_dump(), **updates})
 
 
+def _requests_sales_contribution(message: str) -> bool:
+    normalized = canonical_field_name(message).replace("_", " ")
+    return bool(
+        re.search(r"\b(?:percent|percentage|%|contribution|share)\b", normalized)
+        and re.search(r"\b(?:sales?|sale|revenue|doanh thu)\b", normalized)
+    )
+
+
 def _output_intent(message: str) -> Literal["table", "chart", "kpi"]:
     normalized = canonical_field_name(message).replace("_", " ")
     table_words = ("table", "tabular", "rows", "bang", "dang bang")
@@ -1962,16 +1985,53 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
     except ValueError as error:
         return ChatResponse(answer=(f"Please clarify the requested scope: {error}" if request.language == "en" else f"Hãy xác nhận phạm vi yêu cầu: {error}"), insight="No aggregate ran." if request.language == "en" else "Chưa chạy aggregate.", scope="Awaiting complete intent", caveats=[], mode="clarification")
     output_intent = _output_intent(request.message)
-    chart_request = chart_request.model_copy(update={"date_scope": request.date_scope})
+    contribution_requested = output_intent == "table" and _requests_sales_contribution(request.message)
+    explicit_top_n = bool(re.search(r"\b(?:top|highest|cao nhat)\s+\d+\b", canonical_field_name(request.message).replace("_", " ")))
+    chart_request = chart_request.model_copy(update={
+        "date_scope": request.date_scope,
+        # A contribution denominator must cover every matching category; a default
+        # chart limit would make the percentage partial and misleading.
+        "include_all_categories": contribution_requested and not explicit_top_n,
+    })
     chart = build_chart(run_id, chart_request, request.language)
+    contribution_denominator_rows = chart.rows
+    if contribution_requested and explicit_top_n:
+        # Preserve the explicit Top-N rows while deriving their shares against the
+        # complete matching aggregate, never against a truncated displayed subset.
+        contribution_denominator_rows = build_chart(
+            run_id,
+            chart_request.model_copy(update={"include_all_categories": True}),
+            request.language,
+        ).rows
     metric = next(item for item in profile_data.columns if item.name == chart_request.metric)
     dimension = next(item for item in profile_data.columns if item.name == chart_request.dimension)
-    scope = (f"{chart.aggregation.upper()} {metric.name} theo {dimension.name}; {chart.result_count} kết quả, xếp {chart.sort_mode}" if request.language == "vi" else f"{chart.aggregation.upper()} {metric.name} by {dimension.name}; {chart.result_count} results, sorted {chart.sort_mode}")
+    if contribution_requested:
+        scope = (f"{chart.aggregation.upper()} {metric.name} theo toàn bộ {dimension.name}; {chart.result_count} kết quả" if request.language == "vi" else f"{chart.aggregation.upper()} {metric.name} across all {dimension.name}; {chart.result_count} results")
+    else:
+        scope = (f"{chart.aggregation.upper()} {metric.name} theo {dimension.name}; {chart.result_count} kết quả, xếp {chart.sort_mode}" if request.language == "vi" else f"{chart.aggregation.upper()} {metric.name} by {dimension.name}; {chart.result_count} results, sorted {chart.sort_mode}")
     if chart_request.secondary_dimension:
         scope += f"; per {chart_request.secondary_dimension}; top {chart_request.limit} per group" if chart_request.limit_per_secondary else f"; {chart_request.secondary_dimension}"
     scope += "; " + (json.dumps([item.model_dump() for item in chart_request.filters], ensure_ascii=False) if chart_request.filters else "all data (no filters)")
     insight = chart.insight_headline
     caveats = list(chart.warnings)
+    table = chart.rows
+    table_columns: list[TableColumn] = []
+    title = chart.title
+    if contribution_requested:
+        total_sales = sum(float(row["value"]) for row in contribution_denominator_rows)
+        table = [
+            {
+                **row,
+                "contribution_pct": round(float(row["value"]) / total_sales * 100, 2) if total_sales else 0.0,
+            }
+            for row in chart.rows
+        ]
+        table_columns = [
+            TableColumn(key="display_label", label=display_label(dimension.name)),
+            TableColumn(key="value", label=display_label(metric.name), value_format="number"),
+            TableColumn(key="contribution_pct", label="% Contribution of Sales", value_format="percent"),
+        ]
+        title = (f"{display_label(metric.name)} theo {display_label(dimension.name)}" if request.language == "vi" else f"{display_label(metric.name)} by {display_label(dimension.name)}")
     if any(word in request.message.lower() for word in {"cùng kỳ", "year over year", "yoy", "năm ngoái"}):
         caveats.append("So sánh cùng kỳ cần một trường thời gian được chuẩn hoá theo tháng/năm; bản chat hiện trả xu hướng tổng hợp trước để bạn review phạm vi." if request.language == "vi" else "A year-over-year comparison needs a time field normalized by month/year; this response returns an aggregate trend for you to review the scope first.")
     if output_intent == "kpi":
@@ -1986,7 +2046,7 @@ def chat_about_run(run_id: str, request: ChatRequest, *, allow_llm: bool = True)
         answer = f"Đã chuẩn bị bảng {metric.name} theo {dimension.name}." if request.language == "vi" else f"I prepared a table of {metric.name} by {dimension.name}."
     else:
         answer = f"Đã phân tích {metric.name} theo {dimension.name}." if request.language == "vi" else f"I analyzed {metric.name} by {dimension.name}."
-    return ChatResponse(answer=answer, insight=insight, scope=scope, title=chart.title, chart=chart if output_intent == "chart" else None, table=chart.rows, caveats=caveats, mode="analysis", output_mode=output_intent, planner=cast(Literal["llm", "deterministic"], planner))
+    return ChatResponse(answer=answer, insight=insight, scope=scope, title=title, chart=chart if output_intent == "chart" else None, table=table, table_columns=table_columns, caveats=caveats, mode="analysis", output_mode=output_intent, planner=cast(Literal["llm", "deterministic"], planner))
 
 
 @app.post("/api/runs/{run_id}/chat/stream")

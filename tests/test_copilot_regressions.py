@@ -94,6 +94,33 @@ def test_top_date_lookup_returns_direct_kpi_not_a_trend_chart(run):
     assert "04-Jan-26 has the highest Net Sales at 200." == result["answer"]
 
 
+def test_contribution_table_uses_all_divisions_without_availability_caveat():
+    divisions = "\n".join(f"Division {index},{index * 10}" for index in range(1, 14))
+    response = client.post(
+        "/api/runs/upload",
+        files={"file": ("divisions.csv", f"division,net_sales\n{divisions}\n", "text/csv")},
+    )
+    assert response.status_code == 201, response.text
+
+    result = chat(
+        response.json()["run_id"],
+        "Show a data table of net sales by division and % contribution of sales of those divisions",
+    )
+
+    assert result["mode"] == "analysis"
+    assert result["output_mode"] == "table"
+    assert result["chart"] is None
+    assert len(result["table"]) == 13
+    assert result["table"][0]["value"] == 130
+    assert result["table"][0]["contribution_pct"] == pytest.approx(130 / 910 * 100, abs=0.01)
+    assert sum(row["contribution_pct"] for row in result["table"]) == pytest.approx(100, abs=0.02)
+    assert result["table_columns"][-1] == {
+        "key": "contribution_pct", "label": "% Contribution of Sales", "value_format": "percent",
+    }
+    assert "Top 12" not in result["title"]
+    assert not any("available" in caveat.lower() for caveat in result["caveats"])
+
+
 def test_top_n_title_reports_actual_available_count_and_requested_limit(run):
     # When user explicitly chooses a non-default limit (e.g., custom 12 via control),
     # title should honor the requested Top N even when fewer categories exist,

@@ -24,7 +24,10 @@ export default function ExecutiveChartCard({ instance, profile, language, onPin,
  useEffect(() => { onCompanionChange?.(instance.id, result && (result.chart_type === 'pie' || result.chart_type === 'donut') ? result : null); }, [instance.id, onCompanionChange, result]);
  const fingerprint = JSON.stringify({ run: profile.run_id, language, request });
  useEffect(() => {
-   if (result && JSON.stringify(request) === JSON.stringify(instance.request)) return;
+   // The card prop can carry a new global date scope while its overview result is
+   // still from the previous scope. Only reuse a result when the server-returned
+   // validated request exactly matches the current request.
+   if (result?.request && JSON.stringify(request) === JSON.stringify(result.request)) return;
    const controller = new AbortController(); const id = ++sequence.current;
    setLoading(true); setError(null);
    fetch(`/api/runs/${profile.run_id}/chart?language=${language}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(request), signal: controller.signal })
