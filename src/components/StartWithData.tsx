@@ -77,18 +77,17 @@ function formatDemoValue(view: DemoView, value: number) {
   return value.toLocaleString('en-US');
 }
 
+function valueAt(view: DemoView, index: number) { return view.values[index]; }
+
 function DemoVisual({ view, point, onPoint }: { view: DemoView; point: number | null; onPoint: (index: number | null) => void }) {
   const selected = point === null ? view.values.length - 1 : point;
   const activate = (index: number) => onPoint(index);
   if (view.id === 'revenue') {
-    // The SVG plot and visible x-axis share the same 0–100 coordinate span.
-    // Keep horizontal padding out of the scale; otherwise responsive SVG resizing
-    // makes the curve shorter than the month labels underneath it.
-    const max = Math.max(...view.values); const width = 100; const height = 150; const paddingY = 22;
-    const bandWidth = width / view.values.length;
-    const coords = view.values.map((value, index) => ({ x: bandWidth * (index + .5), y: height - paddingY - (value / max) * (height - paddingY * 2) }));
-    const baseline = height - paddingY;
-    return <div className="demo-chart demo-line-chart" role="group" aria-label={`${view.label} trend`}><svg viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label={`${view.label}: ${view.values.join(', ')}`}><path d={`M ${coords.map(c => `${c.x} ${c.y}`).join(' L ')}`} className="demo-line-path" /><path d={`M ${coords[0].x} ${baseline} L ${coords.map(c => `${c.x} ${c.y}`).join(' L ')} L ${coords.at(-1)?.x} ${baseline} Z`} className="demo-area-fill" />{coords.map((coord, index) => <g key={view.labels[index]}><circle cx={coord.x} cy={coord.y} r={selected === index ? 2.2 : 1.5} className={selected === index ? 'selected' : ''} /><text x={coord.x} y={coord.y - 10} textAnchor="middle">{formatDemoValue(view, view.values[index])}</text><rect x={coord.x - 9} y="0" width="18" height={height} fill="transparent" tabIndex={0} role="button" aria-label={`${view.labels[index]}: ${formatDemoValue(view, view.values[index])}`} onMouseEnter={() => activate(index)} onFocus={() => activate(index)} onClick={() => activate(index)} /></g>)}</svg><div className="demo-axis-labels">{view.labels.map(label => <span key={label}>{label}</span>)}</div></div>;
+    const width = 360; const height = 190; const plotLeft = 30; const plotRight = 330; const plotTop = 24; const plotBottom = 132; const axisY = 158;
+    const max = Math.max(...view.values); const min = Math.min(...view.values); const spread = Math.max(1, max - min);
+    const coords = view.values.map((value, index) => ({ x: plotLeft + index * ((plotRight - plotLeft) / (view.values.length - 1)), y: plotBottom - ((value - min) / spread) * (plotBottom - plotTop) }));
+    const selectedCoord = coords[selected];
+    return <div className="demo-chart demo-line-chart" role="group" aria-label={`${view.label} trend`}><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${view.label}: ${view.values.join(', ')}`}><line x1={plotLeft} x2={plotRight} y1={plotBottom} y2={plotBottom} className="demo-baseline"/><path d={`M ${coords.map(c => `${c.x} ${c.y}`).join(' L ')}`} className="demo-line-path" /><path d={`M ${coords[0].x} ${plotBottom} L ${coords.map(c => `${c.x} ${c.y}`).join(' L ')} L ${coords.at(-1)?.x} ${plotBottom} Z`} className="demo-area-fill" />{coords.map((coord, index) => <g key={view.labels[index]}><circle cx={coord.x} cy={coord.y} r={selected === index ? 5 : 3.5} className={selected === index ? 'selected' : ''} /><rect x={coord.x - 24} y={plotTop - 16} width="48" height={plotBottom - plotTop + 30} fill="transparent" tabIndex={0} role="button" aria-label={`${view.labels[index]}: ${formatDemoValue(view, view.values[index])}`} onMouseEnter={() => activate(index)} onFocus={() => activate(index)} onClick={() => activate(index)} /></g>)}<text x={selectedCoord.x} y={Math.max(16, selectedCoord.y - 12)} textAnchor="middle" className="demo-selected-value">{formatDemoValue(view, valueAt(view, selected))}</text>{coords.map((coord, index) => <text key={view.labels[index]} x={coord.x} y={axisY} textAnchor="middle" className="demo-axis-label">{view.labels[index]}</text>)}</svg></div>;
   }
   if (view.id === 'orders') {
     const max = Math.max(...view.values);
