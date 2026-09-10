@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { LoaderCircle, TriangleAlert } from 'lucide-react';
+
 import { ChartRequest, ChartResult, DatasetProfile } from '../types';
 import { Language, text } from '../i18n';
 import { formatChartValue } from '../formatting';
+import { executedChartArtifact } from '../domain/artifact';
 
 type Props = {
   result: ChartResult;
@@ -14,6 +16,7 @@ type Props = {
   artifactId: string;
 };
 
+/** Editable draft; downstream actions operate only on the last validated response. */
 export default function ChartCompanionTable({ result: initialResult, request: initialRequest, profile, language, onPin, onViewRecords, artifactId }: Props) {
   const [request, setRequest] = useState(initialRequest);
   const [result, setResult] = useState(initialResult);
@@ -34,7 +37,7 @@ export default function ChartCompanionTable({ result: initialResult, request: in
       .then(async response => { const body = await response.json(); if (!response.ok) throw new Error(body.detail || text(language, 'chartRejected')); return body as ChartResult; })
       .then(body => { if (id === sequence.current) setResult(body); })
       .catch(reason => { if (id === sequence.current) setError(reason instanceof Error ? reason.message : text(language, 'chartUpdateFailed')); })
-      .finally(() => { if (id ===sequence.current) setLoading(false); });
+      .finally(() => { if (id === sequence.current) setLoading(false); });
   };
   const addFilter = () => {
     if (!filterColumn || !filterValue.trim()) return;
@@ -47,6 +50,8 @@ export default function ChartCompanionTable({ result: initialResult, request: in
     setFilterValue('');
   };
   const removeFilter = (index: number) => refresh({ ...request, filters: request.filters.filter((_, itemIndex) => itemIndex !== index) });
+  const artifact = executedChartArtifact(`${artifactId}-table`, profile.run_id, request, result);
+  const actionsEnabled = !loading && !error && artifact !== null;
   const metric = result.metric_display_name ?? result.metric;
   const dimension = result.dimension;
   const total = result.rows.reduce((sum, row) => sum + Math.max(0, Number(row.value)), 0);
@@ -57,6 +62,6 @@ export default function ChartCompanionTable({ result: initialResult, request: in
     {request.filters.length > 0 && <div className="chart-filter-chips">{request.filters.map((filter, index) => <span key={`${filter.column}-${index}`}>{filter.column} {filter.operator} {filter.value ?? filter.values?.join(' – ')} <button type="button" aria-label={`Remove ${filter.column} filter`} onClick={() => removeFilter(index)}>×</button></span>)}</div>}
     {error && <p className="chart-error"><TriangleAlert size={15}/>{error}</p>}
     <div className="chart-companion-scroll"><table><thead><tr><th>#</th><th>{dimension}</th><th>{metric}</th><th>%</th></tr></thead><tbody>{result.rows.map((row, index) => <tr key={`${row.label}-${index}`}><td>{index + 1}</td><td title={row.display_label ?? row.label}>{row.display_label ?? row.label}</td><td>{formatChartValue(Number(row.value), language)}</td><td>{total > 0 ? `${(Number(row.value) / total * 100).toFixed(1)}%` : '—'}</td></tr>)}</tbody></table></div>
-    <footer className="chart-actions"><button type="button" disabled={loading} onClick={() => onPin(`${artifactId}-table`, result, request)}>{text(language, 'addReport')}</button><button type="button" disabled={loading} onClick={() => onViewRecords(result, request)}>{text(language, 'viewRecords')}</button></footer>
+    <footer className="chart-actions"><button type="button" disabled={!actionsEnabled} onClick={() => artifact && onPin(artifact.artifactId, artifact.result, artifact.request)}>{text(language, 'addReport')}</button><button type="button" disabled={!actionsEnabled} onClick={() => artifact && onViewRecords(artifact.result, artifact.request)}>{text(language, 'viewRecords')}</button></footer>
   </aside>;
 }
