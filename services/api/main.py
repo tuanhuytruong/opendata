@@ -32,6 +32,7 @@ from openpyxl import load_workbook
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
 from database_adapters import ReadResult, read_registered_source
+from filter_contract import compile_filters
 from formatting import compact_number, format_display_date, format_number, parse_date_value, percent, value_format_descriptor
 from planning import analyst_proposals, business_semantic_catalog, canonical_field_name, comparison_target, display_label, executive_overview_proposals, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, presentation_title, propose_charts
 from source_registry import public_source, registered_sources
@@ -730,44 +731,11 @@ def _data_query_from_params(page: int, page_size: int, search: str, sort_by: str
         raise HTTPException(422, "Invalid data query.") from error
 
 
-def _compile_filters(filters: list[FilterSpec], headers: list[str], profile_columns: dict[str, ColumnProfile], allowed_columns: set[str]) -> tuple[list[str], list[str | float]]:
-    """Compile the one shared, parameterized filter contract for charts and raw data."""
-    clauses: list[str] = []
-    parameters: list[str | float] = []
-    operators = {"equals": "=", "not_equals": "<>", "greater_than": ">", "greater_or_equal": ">=", "less_than": "<", "less_or_equal": "<="}
-    for item in filters:
-        if item.column not in allowed_columns:
-            raise HTTPException(422, "Only non-sensitive, non-identifier columns can be used in filters.")
-        field = quote_identifier(item.column, headers)
-        kind = profile_columns[item.column].kind
-        if item.operator == "in":
-            if kind not in {"cat", "time", "num"}:
-                raise HTTPException(422, "IN filters require a categorical, time, or numeric field.")
-            clauses.append(f"{field} IN ({', '.join('?' for _ in item.values)})")
-            parameters.extend(item.values)
-        elif item.operator == "date_range":
-            if kind != "time" or len(item.values) != 2 or not all(is_date(value) for value in item.values):
-                raise HTTPException(422, f"date_range requires two valid dates for time field {item.column}.")
-            clauses.append(f"TRY_CAST({field} AS TIMESTAMP) BETWEEN TRY_CAST(? AS TIMESTAMP) AND TRY_CAST(? AS TIMESTAMP)")
-            parameters.extend(item.values)
-        elif item.operator in operators:
-            operator = operators[item.operator]
-            if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
-                if kind != "num" or not is_number(item.value):
-                    raise HTTPException(422, f"Numeric comparison requires a numeric value for {item.column}.")
-                clauses.append(f"TRY_CAST(REPLACE({field}, ',', '') AS DOUBLE) {operator} ?")
-                parameters.append(float(item.value.replace(',', '')))
-            else:
-                clauses.append(f"{field} {operator} ?")
-                parameters.append(item.value)
-        else:
-            raise HTTPException(422, "Unsupported filter operator.")
-    return clauses, parameters
 
 
 def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str], profile_columns: dict[str, ColumnProfile]) -> tuple[str, list[str | float]]:
     """Build raw-data predicates plus the raw-data-only text search."""
-    clauses, parameters = _compile_filters(query.filters, headers, profile_columns, set(visible_headers))
+    clauses, parameters = compile_filters(query.filters, headers, profile_columns, set(visible_headers), quote_identifier=quote_identifier, is_date=is_date, is_number=is_number)
     term = query.search.strip()
     if term:
         clauses.append("(" + " OR ".join(f"LOWER(COALESCE({quote_identifier(header, headers)}, '')) LIKE ?" for header in visible_headers) + ")")
@@ -1087,7 +1055,7 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     if secondary:
         filter_clauses.extend([f"{secondary} IS NOT NULL", f"TRIM({secondary}) <> ''"])
     visible_filter_columns = {name for name, column in profiles.items() if column.kind not in {"id", "unknown"} and not is_sensitive_column(name)}
-    compiled_filters, parameters = _compile_filters(request.filters, headers, profiles, visible_filter_columns)
+    compiled_filters, parameters = compile_filters(request.filters, headers, profiles, visible_filter_columns, quote_identifier=quote_identifier, is_date=is_date, is_number=is_number)
     filter_clauses.extend(compiled_filters)
     date_scope_clause, date_scope_parameters = _date_scope_clause(request.date_scope, headers, profiles)
     if date_scope_clause:
