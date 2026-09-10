@@ -15,6 +15,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `git diff --check HEAD^ HEAD` requires the direct parent on push builds.
+          fetch-depth: 2
 
       - uses: actions/setup-python@v5
         with:
