@@ -20,13 +20,12 @@ queue = DurableJobQueue(JOB_DIR)
 
 
 def process_once() -> bool:
-    job = queue.next_queued()
+    job = queue.claim_next()
     if job is None:
         return False
     job_id = str(job["job_id"])
     if queue.get(job_id).get("status") == "cancelled":
         return True
-    queue.update(job_id, status="running")
     try:
         # Checkpoint before and after each bounded operation; never log data/metadata.
         if queue.get(job_id).get("status") == "cancelled":

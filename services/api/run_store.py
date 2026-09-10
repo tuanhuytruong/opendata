@@ -12,9 +12,12 @@ import os
 import re
 import shutil
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+import fcntl
 
 from fastapi import HTTPException
 
@@ -153,9 +156,23 @@ class DurableJobQueue:
             raise HTTPException(404, "Job was not found.")
         return self.root / f"{job_id}.json"
 
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        """Serialize filesystem queue transitions across API and worker processes."""
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock_path = self.root / ".queue.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     def create(self, job_id: str, run_id: str, kind: str, max_attempts: int = 3) -> dict[str, Any]:
         record = {"job_id": job_id, "run_id": run_id, "kind": kind, "status": "queued", "attempt": 0, "max_attempts": max_attempts, "created_at": _now().isoformat(), "updated_at": _now().isoformat(), "error": None}
-        _atomic_write(self._path(job_id), json.dumps(record, separators=(",", ":")))
+        with self._locked():
+            _atomic_write(self._path(job_id), json.dumps(record, separators=(",", ":")))
         return record
 
     def get(self, job_id: str) -> dict[str, Any]:
@@ -165,17 +182,31 @@ class DurableJobQueue:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def update(self, job_id: str, **changes: Any) -> dict[str, Any]:
-        record = self.get(job_id)
-        if record["status"] in {"completed", "cancelled"}:
+        with self._locked():
+            record = self.get(job_id)
+            if record["status"] in {"completed", "cancelled"}:
+                return record
+            record.update(changes, updated_at=_now().isoformat())
+            _atomic_write(self._path(job_id), json.dumps(record, separators=(",", ":")))
             return record
-        record.update(changes, updated_at=_now().isoformat())
-        _atomic_write(self._path(job_id), json.dumps(record, separators=(",", ":")))
-        return record
 
     def cancel(self, job_id: str) -> dict[str, Any]:
         return self.update(job_id, status="cancelled")
 
+    def claim_next(self) -> dict[str, Any] | None:
+        """Atomically select and transition one queued job to running."""
+        with self._locked():
+            for path in sorted(self.root.glob("*.json")):
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if record.get("status") != "queued":
+                    continue
+                record.update(status="running", updated_at=_now().isoformat())
+                _atomic_write(path, json.dumps(record, separators=(",", ":")))
+                return record
+        return None
+
     def next_queued(self) -> dict[str, Any] | None:
+        """Read-only compatibility helper. Workers must call claim_next()."""
         if not self.root.exists():
             return None
         for path in sorted(self.root.glob("*.json")):

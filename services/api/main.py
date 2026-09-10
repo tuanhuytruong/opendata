@@ -30,7 +30,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_serializer
 
-from database_adapters import read_registered_source
+from database_adapters import ReadResult, read_registered_source
 from formatting import compact_number, format_display_date, format_number, parse_date_value, percent, value_format_descriptor
 from planning import analyst_proposals, business_semantic_catalog, canonical_field_name, comparison_target, display_label, executive_overview_proposals, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, presentation_title, propose_charts
 from source_registry import public_source, registered_sources
@@ -555,11 +555,11 @@ def build_profile(file_name: str, headers: list[str], rows: list[dict[str, str]]
 
 
 def profile_for_run(run_id: str, headers: list[str], rows: list[dict[str, str]]) -> DatasetProfile:
-    """Compute the full profile only on demand, then retain it per API process."""
+    """Return a cached profile only after retention metadata authorizes the run."""
+    metadata = RUN_STORE.metadata(run_id)
     cached = PROFILE_CACHE.get(run_id)
     if cached is not None:
         return cached
-    metadata = RUN_STORE.metadata(run_id)
     result = build_profile(str(metadata["file_name"]), headers, rows, run_id=run_id)
     PROFILE_CACHE[run_id] = result
     return result
@@ -787,13 +787,21 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def cleanup_expired_runs_and_cache() -> int:
+    """Expire filesystem runs and invalidate in-process profiles in the same transition."""
+    removed = RUN_STORE.cleanup_expired()
+    if removed:
+        PROFILE_CACHE.clear()
+    return removed
+
+
 @app.get("/api/readiness")
 def readiness() -> dict[str, object]:
     """Readiness is intentionally dependency-light: sources are checked on use."""
     try:
         RUN_STORE.root.mkdir(parents=True, exist_ok=True)
         JOB_QUEUE.root.mkdir(parents=True, exist_ok=True)
-        RUN_STORE.cleanup_expired()
+        cleanup_expired_runs_and_cache()
     except OSError as error:
         raise HTTPException(503, "Artifact storage is not writable.") from error
     return {"status": "ready", "registered_source_count": len(registered_sources())}
@@ -815,7 +823,7 @@ def cleanup_expired_runs(request: Request) -> dict[str, int]:
     provided = request.headers.get("X-OpenData-Maintenance-Key", "")
     if not key or not secrets.compare_digest(provided, key):
         raise HTTPException(404, "Not found.")
-    return {"removed_runs": RUN_STORE.cleanup_expired()}
+    return {"removed_runs": cleanup_expired_runs_and_cache()}
 
 
 @app.post("/api/jobs", status_code=202)
@@ -847,11 +855,15 @@ def stage_registered_source(source_id: str) -> DatasetProfile:
     source = sources.get(source_id)
     if source is None:
         raise HTTPException(404, "Registered source was not found.")
-    headers, rows = read_registered_source(source)
-    headers = validate_headers(headers)
-    normalized = [{header: (row.get(header) or "").strip() for header in headers} for row in rows]
-    if len(normalized) >= source.max_rows:
-        raise HTTPException(422, f"Registered source reached its {source.max_rows:,}-row scan cap; narrow its operator configuration.")
+    read_result = read_registered_source(source)
+    headers, rows = read_result
+    headers = validate_headers(cast(list[str], headers))
+    normalized = [{header: (row.get(header) or "").strip() for header in headers} for row in cast(list[dict[str, str]], rows)]
+    # Database adapters fetch one bounded look-ahead row. The explicit flag is the
+    # only safe way to distinguish an exact cap from a truncated source. Tuple
+    # results remain accepted for existing mocked adapters during the transition.
+    if isinstance(read_result, ReadResult) and read_result.truncated:
+        raise HTTPException(422, f"Registered source exceeds its {source.max_rows:,}-row scan cap; narrow its operator configuration.")
     return profile(f"{source.display_name} ({source.locator})", headers, normalized, source_type=source.engine, source_label=f"{source.display_name} ({source.locator})")
 
 
@@ -873,11 +885,12 @@ async def upload_dataset(file: UploadFile = File(...)) -> DatasetProfile:
 
 @app.get("/api/runs/{run_id}/profile/status", response_model=DatasetProfile)
 def profile_status(run_id: str) -> DatasetProfile:
-    """Lazily materialize the complete profile; later requests use the process cache."""
-    cached = PROFILE_CACHE.get(run_id)
-    if cached is not None:
-        return cached
-    headers, rows = load_run(run_id)
+    """Lazily materialize the complete profile without bypassing retention checks."""
+    try:
+        headers, rows = load_run(run_id)
+    except HTTPException:
+        PROFILE_CACHE.pop(run_id, None)
+        raise
     return profile_for_run(run_id, headers, rows)
 
 

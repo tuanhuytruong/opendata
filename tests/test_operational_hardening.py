@@ -1,10 +1,12 @@
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sys
 
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "services" / "api"))
+import main  # noqa: E402
 from main import app  # noqa: E402
 from run_store import DurableJobQueue, RunStore  # noqa: E402
 
@@ -32,6 +34,23 @@ def test_run_store_isolated_artifacts_expiry_and_cleanup(tmp_path) -> None:
     assert not (tmp_path / run_id).exists()
 
 
+def test_expired_run_cannot_be_served_from_profile_cache() -> None:
+    data = upload_csv("channel,net_sales\nOnline,100\n")
+    run_id = data["run_id"]
+    complete = client.get(f"/api/runs/{run_id}/profile/status")
+    assert complete.status_code == 200, complete.text
+    assert run_id in main.PROFILE_CACHE
+
+    metadata_path = main.RUN_STORE._metadata_path(run_id)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    expired = client.get(f"/api/runs/{run_id}/profile/status")
+    assert expired.status_code == 404
+    assert run_id not in main.PROFILE_CACHE
+
+
 def test_durable_job_retries_and_cancellation(tmp_path) -> None:
     queue = DurableJobQueue(tmp_path)
     job_id = "b" * 32
@@ -43,6 +62,21 @@ def test_durable_job_retries_and_cancellation(tmp_path) -> None:
     queue.create(second, "a" * 32, "report")
     assert queue.cancel(second)["status"] == "cancelled"
     assert queue.cancel(second)["status"] == "cancelled"
+
+
+def test_durable_job_claim_is_atomic_across_workers(tmp_path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    queue = DurableJobQueue(tmp_path)
+    job_id = "d" * 32
+    queue.create(job_id, "a" * 32, "profile")
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        claims = list(workers.map(lambda _: queue.claim_next(), range(2)))
+    claimed = [item for item in claims if item is not None]
+    assert len(claimed) == 1
+    assert claimed[0]["job_id"] == job_id
+    assert claimed[0]["status"] == "running"
+    assert queue.get(job_id)["status"] == "running"
 
 
 def test_optional_basic_auth_protects_the_entire_api(monkeypatch) -> None:
