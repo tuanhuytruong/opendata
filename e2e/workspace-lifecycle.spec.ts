@@ -40,4 +40,7 @@ test('keeps the profiling shell isolated until the completed workspace is ready'
   await expect(page.getByRole('heading', { name: 'Executive Hub' })).toBeVisible();
   await expect(page.locator('.workspace-grid')).toBeVisible();
   await expect(page.locator('.executive-chart-grid')).toBeVisible();
+
+  await page.getByRole('button', { name: 'Deep Dive Lab' }).click();
+  await expect(page.getByRole('heading', { name: 'Deep Dive Lab' })).toBeVisible();
 });
