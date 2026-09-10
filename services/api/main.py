@@ -58,10 +58,22 @@ PROFILE_CACHE: dict[str, DatasetProfile] = {}
 VALID_CHARTS = {"bar", "line", "area", "scatter"}
 
 
+def release_manifest() -> dict[str, object] | None:
+    """Read only a validated local build manifest; never fail API startup for it."""
+    try:
+        payload = json.loads((STATIC_DIR / "release-manifest.json").read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) and isinstance(payload.get("source_sha"), str) else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def build_sha() -> str:
     configured = os.getenv("OPENDATA_BUILD_SHA", "").strip()
     if configured:
         return configured
+    manifest = release_manifest()
+    if manifest:
+        return str(manifest["source_sha"])
     try:
         return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True, stderr=subprocess.DEVNULL).strip()
     except (OSError, subprocess.CalledProcessError):
@@ -69,6 +81,7 @@ def build_sha() -> str:
 
 
 BUILD_SHA = build_sha()
+RELEASE_MANIFEST = release_manifest()
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -775,8 +788,12 @@ def _run_data_query(run_id: str, query: DataQuery) -> tuple[list[str], list[dict
 
 
 @app.get("/api/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "build_sha": BUILD_SHA}
+def health() -> dict[str, object]:
+    return {
+        "status": "ok",
+        "build_sha": BUILD_SHA,
+        "release_manifest": RELEASE_MANIFEST,
+    }
 
 
 def cleanup_expired_runs_and_cache() -> int:

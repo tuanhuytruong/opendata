@@ -10,9 +10,11 @@ const csv = [
 test('keeps the profiling shell isolated until the completed workspace is ready', async ({ page }) => {
   await page.goto('/');
   const health = await page.request.get('/api/health');
-  const healthBody = await health.json() as { status: string; build_sha: string };
+  const healthBody = await health.json() as { status: string; build_sha: string; release_manifest: { source_sha: string; assets: Record<string, string> } | null };
   expect(healthBody.status).toBe('ok');
   expect(healthBody.build_sha).toBe(await page.locator('html').getAttribute('data-build-sha'));
+  expect(healthBody.release_manifest?.source_sha).toBe(healthBody.build_sha);
+  expect(Object.keys(healthBody.release_manifest?.assets ?? {})).not.toHaveLength(0);
   await expect(page.getByRole('heading', { name: 'Bring your dataset' })).toBeVisible();
   await expect(page.locator('html')).toHaveAttribute('data-build-sha', /.+/);
   await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toHaveCount(0);

@@ -34,6 +34,13 @@ def test_run_store_isolated_artifacts_expiry_and_cleanup(tmp_path) -> None:
     assert not (tmp_path / run_id).exists()
 
 
+def test_health_exposes_release_manifest_only_when_valid(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(main, "STATIC_DIR", tmp_path)
+    assert main.release_manifest() is None
+    (tmp_path / "release-manifest.json").write_text('{"source_sha":"release-sha","assets":{}}', encoding="utf-8")
+    assert main.release_manifest() == {"source_sha": "release-sha", "assets": {}}
+
+
 def test_expired_run_cannot_be_served_from_profile_cache() -> None:
     data = upload_csv("channel,net_sales\nOnline,100\n")
     run_id = data["run_id"]
