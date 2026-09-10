@@ -2,6 +2,11 @@ node_modules/
 build/
 dist/
 coverage/
+playwright-report/
+test-results/
+
+# Local-only browser QA proxy; Playwright uses E2E_BASE_URL in CI.
+vite.e2e.config.ts
 .DS_Store
 *.log
 var/
