@@ -116,6 +116,19 @@ class RunStore:
         self.metadata(run_id)
         return self._dir(run_id) / "dataset.csv"
 
+    @contextmanager
+    def locked_artifact(self, run_id: str, name: str) -> Iterator[None]:
+        """Serialize read-modify-write transitions for one run artifact."""
+        self.metadata(run_id)
+        path = self._dir(run_id) / f".{name}.lock"
+        with path.open("a+", encoding="utf-8") as lock:
+            os.chmod(path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
     def save_artifact_json(self, run_id: str, name: str, value: dict[str, Any]) -> None:
         self.metadata(run_id)
         _atomic_write(self._dir(run_id) / name, json.dumps(value, indent=2, ensure_ascii=False))

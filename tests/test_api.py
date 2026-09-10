@@ -564,6 +564,21 @@ def test_executive_overview_is_deterministic_validated_and_excludes_sensitive_fi
     assert "private@example.test" not in str(body)
 
 
+def test_custom_report_rejects_stale_revision_without_overwriting_current_document() -> None:
+    data = upload_csv("store,net_sales\nA,100\nB,40\n")
+    run_id = data["run_id"]
+    original = client.get(f"/api/runs/{run_id}/custom-report").json()
+    assert original["revision"] == 0
+    first = client.put(f"/api/runs/{run_id}/custom-report", json={"title": "Current", "expected_revision": original["revision"]})
+    assert first.status_code == 200, first.text
+    assert first.json()["revision"] == 1
+    stale = client.put(f"/api/runs/{run_id}/custom-report", json={"title": "Stale", "expected_revision": original["revision"]})
+    assert stale.status_code == 409, stale.text
+    current = client.get(f"/api/runs/{run_id}/custom-report").json()
+    assert current["title"] == "Current"
+    assert current["revision"] == 1
+
+
 def test_custom_report_is_run_scoped_idempotent_and_glossary_is_validated() -> None:
     data = upload_csv("store,net_sales,email\nA,100,private@example.test\nB,40,private@example.test\n")
     run_id = data["run_id"]

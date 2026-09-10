@@ -302,9 +302,11 @@ class CustomReportDocument(BaseModel):
     manual_glossary_notes: list[ManualGlossaryNote] = Field(default_factory=list, max_length=30)
     glossary: list[dict[str, str]] = Field(default_factory=list)
     updated_at: str = ""
+    revision: int = Field(default=0, ge=0)
 
 
 class CustomReportUpdate(BaseModel):
+    expected_revision: int | None = Field(default=None, ge=0)
     title: str = Field(default="Custom Report", min_length=1, max_length=120)
     locale: Literal["en", "vi"] = "en"
     layout_blueprint: ReportLayoutBlueprint = Field(default_factory=ReportLayoutBlueprint)
@@ -1337,7 +1339,7 @@ def _custom_report_document(run_id: str, update: CustomReportUpdate | None = Non
         try:
             stored = RUN_STORE.artifact_json(run_id, path)
             # Migrate the one former alias only at the read boundary; every response
-            # and subsequent save uses the canonical template enum.
+            # and subsequent save uses the canonical server/client enum.
             blueprint = stored.get("layout_blueprint") if isinstance(stored, dict) else None
             if isinstance(blueprint, dict) and blueprint.get("template") in LEGACY_REPORT_LAYOUTS:
                 stored = {**stored, "layout_blueprint": {"template": LEGACY_REPORT_LAYOUTS[blueprint["template"]]}}
@@ -1345,10 +1347,16 @@ def _custom_report_document(run_id: str, update: CustomReportUpdate | None = Non
         except HTTPException as error:
             if error.status_code != 404: raise
             return CustomReportDocument(run_id=run_id, glossary=[])
-    artifacts = list({item.artifact_id: _report_artifact(run_id, item, update.locale) for item in update.pinned_artifacts}.values())
-    document = CustomReportDocument(run_id=run_id, title=update.title, locale=update.locale, layout_blueprint=update.layout_blueprint, executive_summary=update.executive_summary, sections=update.sections, pinned_artifacts=artifacts, manual_glossary_notes=update.manual_glossary_notes, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat())
-    RUN_STORE.save_artifact_json(run_id, path, document.model_dump())
-    return document
+    # A report edit is a read-modify-write transition.  The per-artifact lock makes
+    # the revision check and atomic write one storage-boundary operation.
+    with RUN_STORE.locked_artifact(run_id, path):
+        current = _custom_report_document(run_id)
+        if update.expected_revision is not None and update.expected_revision != current.revision:
+            raise HTTPException(409, "This report changed elsewhere. Refresh before saving again.")
+        artifacts = list({item.artifact_id: _report_artifact(run_id, item, update.locale) for item in update.pinned_artifacts}.values())
+        document = CustomReportDocument(run_id=run_id, title=update.title, locale=update.locale, layout_blueprint=update.layout_blueprint, executive_summary=update.executive_summary, sections=update.sections, pinned_artifacts=artifacts, manual_glossary_notes=update.manual_glossary_notes, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat(), revision=current.revision + 1)
+        RUN_STORE.save_artifact_json(run_id, path, document.model_dump())
+        return document
 
 
 @app.get("/api/runs/{run_id}/custom-report", response_model=CustomReportDocument)
@@ -1366,14 +1374,14 @@ def update_custom_report(run_id: str, request: CustomReportUpdate) -> CustomRepo
 def pin_custom_report_artifact(run_id: str, request: PinArtifactRequest) -> CustomReportDocument:
     current = _custom_report_document(run_id)
     artifacts = [item for item in current.pinned_artifacts if item.artifact_id != request.artifact_id] + [CustomReportArtifact(artifact_id=request.artifact_id, chart=request.chart, annotation=request.annotation)]
-    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, locale=current.locale, layout_blueprint=current.layout_blueprint, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
+    return _custom_report_document(run_id, CustomReportUpdate(expected_revision=current.revision, title=current.title, locale=current.locale, layout_blueprint=current.layout_blueprint, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
 
 
 @app.delete("/api/runs/{run_id}/custom-report/artifacts/{artifact_id}", response_model=CustomReportDocument)
 def unpin_custom_report_artifact(run_id: str, artifact_id: str) -> CustomReportDocument:
     current = _custom_report_document(run_id)
     artifacts = [item for item in current.pinned_artifacts if item.artifact_id != artifact_id]
-    return _custom_report_document(run_id, CustomReportUpdate(title=current.title, locale=current.locale, layout_blueprint=current.layout_blueprint, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
+    return _custom_report_document(run_id, CustomReportUpdate(expected_revision=current.revision, title=current.title, locale=current.locale, layout_blueprint=current.layout_blueprint, executive_summary=current.executive_summary, sections=current.sections, pinned_artifacts=artifacts, manual_glossary_notes=current.manual_glossary_notes))
 
 
 @app.get("/api/runs/{run_id}/manifest")
