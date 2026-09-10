@@ -7,7 +7,10 @@ remote=${OPENDATA_DEV_HOST:-ubuntu@10.10.0.2}
 remote_root=${OPENDATA_DEV_ROOT:-/opt/opendata}
 
 [[ -f "$archive" && -f "$checksum" ]]
-sha256sum --check "$checksum"
+(
+  cd "$(dirname "$archive")"
+  sha256sum --check "$(basename "$checksum")"
+)
 source_sha=$(basename "$archive" | sed -E 's/^opendata-([0-9a-f]{40})\.tar\.gz$/\1/')
 [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]]
 
