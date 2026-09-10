@@ -3,7 +3,7 @@ import { LoaderCircle, TriangleAlert } from 'lucide-react';
 
 import { ChartRequest, ChartResult, DatasetProfile } from '../types';
 import { Language, text } from '../i18n';
-import { formatChartValue } from '../formatting';
+import { formatChartValue, formatNumber } from '../formatting';
 import { executedChartArtifact } from '../domain/artifact';
 
 type Props = {
@@ -67,7 +67,7 @@ export default function ChartCompanionTable({ result: initialResult, request: in
     <div className="chart-filter-row"><select aria-label="Filter column" value={filterColumn} onChange={event => setFilterColumn(event.target.value)}><option value="">Filter column</option>{filterable.map(column => <option value={column.name} key={column.name}>{column.name}</option>)}</select><input aria-label="Filter value" value={filterValue} onChange={event => setFilterValue(event.target.value)} placeholder="Value"/><button type="button" onClick={addFilter} disabled={!filterColumn || !filterValue.trim() || loading}>Add filter</button></div>
     {request.filters.length > 0 && <div className="chart-filter-chips">{request.filters.map((filter, index) => <span key={`${filter.column}-${index}`}>{filter.column} {filter.operator} {filter.value ?? filter.values?.join(' – ')} <button type="button" aria-label={`Remove ${filter.column} filter`} onClick={() => removeFilter(index)}>×</button></span>)}</div>}
     {error && <p className="chart-error"><TriangleAlert size={15}/>{error}</p>}
-    <div className="chart-companion-scroll"><table><thead><tr><th>#</th><th>{dimension}</th><th>{metric}</th>{hasShare && <th>%</th>}</tr></thead><tbody>{result.rows.map((row, index) => <tr key={`${row.label}-${index}`}><td>{index + 1}</td><td title={row.display_label ?? row.label}>{row.display_label ?? row.label}</td><td>{formatChartValue(Number(row.value), language)}</td>{hasShare && <td>{total > 0 ? `${(Number(row.value) / total * 100).toFixed(1)}%` : '—'}</td>}</tr>)}<tr className="font-semibold border-t-2 bg-slate-50"><td></td><td>{language === 'vi' ? 'Tổng phạm vi' : 'Scope total'}</td><td>{result.scope_total_formatted_value ?? formatChartValue(total, language)}</td>{hasShare && <td>100.0%</td>}</tr></tbody></table></div>
+    <div className="chart-companion-scroll"><table><thead><tr><th>#</th><th>{dimension}</th><th>{metric}</th>{hasShare && <th>%</th>}</tr></thead><tbody>{result.rows.map((row, index) => <tr key={`${row.label}-${index}`}><td>{index + 1}</td><td title={row.display_label ?? row.label}>{row.display_label ?? row.label}</td><td>{formatChartValue(Number(row.value), language)}</td>{hasShare && <td>{total > 0 ? `${(Number(row.value) / total * 100).toFixed(1)}%` : '—'}</td>}</tr>)}<tr className="font-semibold border-t-2 bg-slate-50"><td></td><td>Grand Total</td><td>{formatNumber(total, language)}</td>{hasShare && <td>100.0%</td>}</tr></tbody></table></div>
     <footer className="chart-actions"><button type="button" disabled={!actionsEnabled} onClick={() => artifact && onPin(artifact.artifactId, artifact.result, artifact.request)}>{text(language, 'addReport')}</button><button type="button" disabled={!actionsEnabled} onClick={() => artifact && onViewRecords(artifact.result, artifact.request)}>{text(language, 'viewRecords')}</button></footer>
   </aside>;
 }

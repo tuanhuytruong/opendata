@@ -44,8 +44,8 @@ test('latest global date scope wins without unmounting the active workspace', as
   const companion = page.locator('.chart-companion-table').first();
   await expect(companion).toBeVisible();
   await expect(companion).toHaveAttribute('data-applied-scope-key', expectedScope);
-  await expect(companion).toContainText('Scope total');
-  await expect(companion.getByText('Scope total', { exact: true })).toBeVisible();
+  await expect(companion).toContainText('Grand Total');
+  await expect(companion.getByText('Grand Total', { exact: true })).toBeVisible();
   await expect(page.locator('.workspace-grid')).toBeVisible();
   await expect(page.locator('.executive-chart-grid')).toBeVisible();
 });
