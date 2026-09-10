@@ -28,13 +28,24 @@ test('latest global date scope wins without unmounting the active workspace', as
   await expect(from).toHaveValue('2026-01-01');
   await expect(to).toHaveValue('2026-02-01');
 
+  // A companion table belongs to a concrete executed chart. Turn the ranking
+  // card into a bounded donut before changing the global scope.
+  const rankingCard = page.locator('.executive-chart-card.role-ranking').first();
+  await rankingCard.locator('select').nth(2).selectOption('donut');
+  await expect(page.locator('.chart-companion-table').first()).toBeVisible();
+
   await from.fill('2026-01-02');
   await expect(page.locator('.workspace-grid')).toBeVisible();
   await expect(page.locator('.executive-chart-grid')).toBeVisible();
   await from.fill('2026-01-03');
 
   const expectedScope = JSON.stringify({ column: 'sale_date', start: '2026-01-03', end: '2026-02-01' });
-  await expect(page.locator('[data-applied-scope-key]')).toHaveAttribute('data-applied-scope-key', expectedScope);
+  await expect(page.locator('section.space-y-3[data-applied-scope-key]')).toHaveAttribute('data-applied-scope-key', expectedScope);
+  const companion = page.locator('.chart-companion-table').first();
+  await expect(companion).toBeVisible();
+  await expect(companion).toHaveAttribute('data-applied-scope-key', expectedScope);
+  await expect(companion).toContainText('Scope total');
+  await expect(companion.getByText('Scope total', { exact: true })).toBeVisible();
   await expect(page.locator('.workspace-grid')).toBeVisible();
   await expect(page.locator('.executive-chart-grid')).toBeVisible();
 });

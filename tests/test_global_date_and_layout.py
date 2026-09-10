@@ -14,6 +14,8 @@ def test_global_date_scope_filters_chart_overview_and_chat() -> None:
     assert chart.status_code == 200, chart.text
     assert chart.json()["request"]["date_scope"] == scope
     assert chart.json()["rows"][0]["value"] == 60.0
+    # Total is calculated before Top-N limiting, against this exact global scope.
+    assert chart.json()["scope_total_value"] == 100.0
     overview = client.get(f"/api/runs/{run_id}/executive-overview?language=en&date_column=sale_date&start=2026-01-02&end=2026-01-03")
     assert overview.status_code == 200, overview.text
     assert overview.json()["applied_date_scope"] == scope
@@ -21,6 +23,20 @@ def test_global_date_scope_filters_chart_overview_and_chat() -> None:
     chat = client.post(f"/api/runs/{run_id}/chat", json={"message": "sales by channel", "language": "en", "date_scope": scope})
     assert chat.status_code == 200, chat.text
     assert chat.json()["chart"]["request"]["date_scope"] == scope
+
+
+def test_chart_scope_total_is_not_limited_by_top_n() -> None:
+    data = upload_csv(
+        "sale_date,site_name,net_sales\n"
+        "2026-01-01,North,100\n2026-01-01,South,70\n2026-01-01,East,30\n"
+    )
+    response = client.post(f"/api/runs/{data['run_id']}/chart", json={
+        "dimension": "site_name", "metric": "net_sales", "chart_type": "bar", "limit": 2,
+        "date_scope": {"column": "sale_date", "start": "2026-01-01", "end": "2026-01-01"},
+    })
+    assert response.status_code == 200, response.text
+    assert [row["value"] for row in response.json()["rows"]] == [100.0, 70.0]
+    assert response.json()["scope_total_value"] == 200.0
 
 
 def test_global_date_scope_rejects_unsafe_reversed_and_out_of_profile_ranges() -> None:

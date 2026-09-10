@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import fcntl
+import duckdb
 
 from fastapi import HTTPException
 
@@ -115,6 +116,35 @@ class RunStore:
     def dataset_path(self, run_id: str) -> Path:
         self.metadata(run_id)
         return self._dir(run_id) / "dataset.csv"
+
+    def analytics_database_path(self, run_id: str) -> Path:
+        """A run-local DuckDB relation survives requests but expires with the run."""
+        self.metadata(run_id)
+        return self._dir(run_id) / "analytics.duckdb"
+
+    @contextmanager
+    def analytics_connection(self, run_id: str) -> Iterator[duckdb.DuckDBPyConnection]:
+        """Open the authorized run relation, creating it once under a filesystem lock."""
+        self.metadata(run_id)
+        database_path = self.analytics_database_path(run_id)
+        with self.locked_artifact(run_id, "analytics"):
+            connection = duckdb.connect(str(database_path))
+            try:
+                exists = connection.execute(
+                    "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = 'dataset'"
+                ).fetchone()
+                if not exists:
+                    connection.execute(
+                        "CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)",
+                        [str(self.dataset_path(run_id))],
+                    )
+            except Exception:
+                connection.close()
+                raise
+        try:
+            yield connection
+        finally:
+            connection.close()
 
     @contextmanager
     def locked_artifact(self, run_id: str, name: str) -> Iterator[None]:

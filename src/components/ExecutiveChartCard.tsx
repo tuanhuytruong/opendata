@@ -6,11 +6,11 @@ import { Language, text } from '../i18n';
 import ValidatedChart from './ValidatedChart';
 import ChartTypeSelect from './ChartTypeSelect';
 
-interface Props { instance: ChartInstance; profile: DatasetProfile; language: Language; onPin: (id: string, chart: ChartResult, request: ChartRequest) => void; onViewRecords?: (chart: ChartResult, request: ChartRequest) => void; onCompanionChange?: (id: string, result: ChartResult | null) => void; }
+interface Props { instance: ChartInstance; profile: DatasetProfile; language: Language; globalDateScope?: ChartRequest['date_scope'] | null; onPin: (id: string, chart: ChartResult, request: ChartRequest) => void; onViewRecords?: (chart: ChartResult, request: ChartRequest) => void; onCompanionChange?: (id: string, result: ChartResult | null) => void; }
 const LIMITS = [5, 10, 12, 20, 30];
 const boundedLimit = (value: number) => Number.isInteger(value) && value >= 1 && value <= 30 ? value : 12;
 
-export default function ExecutiveChartCard({ instance, profile, language, onPin, onViewRecords, onCompanionChange }: Props) {
+export default function ExecutiveChartCard({ instance, profile, language, globalDateScope, onPin, onViewRecords, onCompanionChange }: Props) {
  const dimensions = useMemo(() => profile.columns.filter(c => c.kind === 'cat' || c.kind === 'time'), [profile]);
  const metrics = useMemo(() => profile.columns.filter(c => c.kind === 'num'), [profile]);
  const [request, setRequest] = useState<ChartRequest>(instance.request);
@@ -20,8 +20,23 @@ export default function ExecutiveChartCard({ instance, profile, language, onPin,
  const [error, setError] = useState<string | null>(null);
  const [customLimitMode, setCustomLimitMode] = useState(() => !LIMITS.includes(instance.request.limit));
  const sequence = useRef(0);
+ const requestRef = useRef(instance.request);
  const instanceFingerprint = JSON.stringify(instance.request);
- useEffect(() => { setRequest(instance.request); setResult(instance.result ?? null); setError(null); setCustomLimitMode(!LIMITS.includes(instance.request.limit)); }, [instance.id, profile.run_id, instanceFingerprint]);
+ useEffect(() => {
+   const current = requestRef.current;
+   const withoutScope = (value: ChartRequest) => ({ ...value, date_scope: undefined });
+   const customConfiguration = JSON.stringify(withoutScope(current)) !== JSON.stringify(withoutScope(instance.request));
+   if (customConfiguration) {
+     // A global date change must refresh an edited chart/table, not reset it to
+     // the overview default and unmount its companion surface.
+     const scoped = { ...current, date_scope: globalDateScope ?? instance.request.date_scope };
+     requestRef.current = scoped;
+     setRequest(scoped);
+     return;
+   }
+   requestRef.current = instance.request;
+   setRequest(instance.request); setResult(instance.result ?? null); setError(null); setCustomLimitMode(!LIMITS.includes(instance.request.limit));
+ }, [instance.id, profile.run_id, instanceFingerprint, globalDateScope]);
  useEffect(() => { onCompanionChange?.(instance.id, result && (result.chart_type === 'pie' || result.chart_type === 'donut') ? result : null); }, [instance.id, onCompanionChange, result]);
  const fingerprint = JSON.stringify({ run: profile.run_id, language, request });
  useEffect(() => {
@@ -38,7 +53,7 @@ export default function ExecutiveChartCard({ instance, profile, language, onPin,
      .finally(() => { if (id === sequence.current) setLoading(false); });
    return () => controller.abort();
  }, [fingerprint]);
- const updateRequest = (next: ChartRequest) => { setResult(null); setRequest(next); };
+ const updateRequest = (next: ChartRequest) => { requestRef.current = next; setResult(null); setRequest(next); };
  const executed = result ? executedChartArtifact(instance.id, profile.run_id, request, result) : null;
  const grouped = Boolean(request.secondary_dimension);
  const types: ChartRequest['chart_type'][] = request.x_metric ? ['scatter'] : grouped ? ['bar', 'stacked_bar'] : ['bar', 'line', 'area', 'pie', 'donut', 'combo']; // pareto/heatmap reserved server-side only

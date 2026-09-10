@@ -12,6 +12,7 @@ import json
 import math
 import os
 from collections import Counter
+from contextlib import nullcontext
 import urllib.error
 import urllib.request
 import re
@@ -55,6 +56,9 @@ STATIC_DIR = Path(os.getenv("OPENDATA_STATIC_DIR", str(Path(__file__).resolve().
 RUN_STORE = RunStore(DATA_DIR)
 JOB_QUEUE = DurableJobQueue(JOB_DIR)
 PROFILE_CACHE: dict[str, DatasetProfile] = {}
+# Immutable server-derived overview results. Every lookup still authorizes run metadata
+# first, so a response can never outlive its retained run.
+EXECUTIVE_OVERVIEW_CACHE: dict[str, ExecutiveOverview] = {}
 VALID_CHARTS = {"bar", "line", "area", "scatter"}
 
 
@@ -412,6 +416,9 @@ class ChartResult(BaseModel):
     sort_mode: Literal["chronological", "ranking"] = "ranking"
     result_count: int = 0
     requested_limit: int = 0
+    # Aggregate across the exact validated scope before Top-N limiting.
+    scope_total_value: float | None = None
+    scope_total_formatted_value: str | None = None
     insight_headline: str = ""
     evidence: list[str] = Field(default_factory=list)
 
@@ -801,6 +808,7 @@ def cleanup_expired_runs_and_cache() -> int:
     removed = RUN_STORE.cleanup_expired()
     if removed:
         PROFILE_CACHE.clear()
+        EXECUTIVE_OVERVIEW_CACHE.clear()
     return removed
 
 
@@ -823,6 +831,8 @@ def delete_run(run_id: str) -> None:
     import shutil
     shutil.rmtree(RUN_STORE._dir(run_id), ignore_errors=True)
     PROFILE_CACHE.pop(run_id, None)
+    for key in [key for key in EXECUTIVE_OVERVIEW_CACHE if key.startswith(f"{run_id}:")]:
+        EXECUTIVE_OVERVIEW_CACHE.pop(key, None)
 
 
 @app.post("/api/maintenance/cleanup")
@@ -993,16 +1003,23 @@ def values(run_id: str, column: str) -> dict[str, str | list[str]]:
     return {"column": column, "values": result}
 
 
-def _validate_date_scope_bounds(scope: DateScope | None, rows: list[dict[str, str]]) -> None:
-    """Reject ranges outside the selected field's actual retained coverage."""
+def _validate_date_scope_bounds(scope: DateScope | None, rows: list[dict[str, str]] | None = None, profile: DatasetProfile | None = None) -> None:
+    """Reject ranges outside retained coverage, using cached profile bounds when available."""
     if scope is None:
         return
-    values = [value.date() for row in rows if (value := parse_date_value((row.get(scope.column) or "").strip())) is not None]
-    if not values:
-        raise HTTPException(422, f"Date scope column has no valid dates: {scope.column}")
-    if scope.start is not None and scope.start < min(values):
+    bounds = next((item for item in (profile.time_field_bounds if profile else []) if item.column == scope.column), None)
+    if bounds is not None:
+        minimum, maximum = bounds.min_date, bounds.max_date
+    else:
+        if rows is None:
+            raise HTTPException(422, f"Date scope column has no valid dates: {scope.column}")
+        values = [value.date() for row in rows if (value := parse_date_value((row.get(scope.column) or "").strip())) is not None]
+        if not values:
+            raise HTTPException(422, f"Date scope column has no valid dates: {scope.column}")
+        minimum, maximum = min(values), max(values)
+    if scope.start is not None and scope.start < minimum:
         raise HTTPException(422, "Date scope start is before the selected field's dataset minimum.")
-    if scope.end is not None and scope.end > max(values):
+    if scope.end is not None and scope.end > maximum:
         raise HTTPException(422, "Date scope end is after the selected field's dataset maximum.")
 
 
@@ -1031,10 +1048,18 @@ def _date_scope_clause(scope: DateScope | None, headers: list[str], profiles: di
     return " AND ".join(clauses), parameters
 
 
-@app.post("/api/runs/{run_id}/chart", response_model=ChartResult)
-def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"] = "vi") -> ChartResult:
-    headers, rows = load_run(run_id)
-    profile_guard = profile_for_run(run_id, headers, rows)
+def _build_chart(
+    run_id: str,
+    request: ChartRequest,
+    language: Literal["en", "vi"] = "vi",
+    connection: duckdb.DuckDBPyConnection | None = None,
+    headers: list[str] | None = None,
+    rows: list[dict[str, str]] | None = None,
+    profile_data: DatasetProfile | None = None,
+) -> ChartResult:
+    if headers is None or rows is None:
+        headers, rows = load_run(run_id)
+    profile_guard = profile_data or profile_for_run(run_id, headers, rows)
     guard_profiles = {item.name: item for item in profile_guard.columns}
     for role, column in (("dimension", request.dimension), ("secondary_dimension", request.secondary_dimension), ("x_metric", request.x_metric), ("secondary_metric", request.secondary_metric)):
         if column and guard_profiles.get(column) and guard_profiles[column].kind == "id":
@@ -1047,9 +1072,9 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     secondary = quote_identifier(request.secondary_dimension, headers) if request.secondary_dimension else None
     x_metric = quote_identifier(request.x_metric, headers) if request.x_metric else None
     secondary_metric = quote_identifier(request.secondary_metric, headers) if request.secondary_metric else None
-    profile_data = profile_for_run(run_id, headers, rows)
-    profiles = {item.name: item for item in profile_data.columns}
-    _validate_date_scope_bounds(request.date_scope, rows)
+    resolved_profile = profile_data or profile_for_run(run_id, headers, rows)
+    profiles = {item.name: item for item in resolved_profile.columns}
+    _validate_date_scope_bounds(request.date_scope, rows, resolved_profile)
     dimension_profile = profiles[request.dimension]
     metric_profile = profiles[request.metric]
     if metric_profile.kind != "num" and request.aggregation != "count":
@@ -1082,9 +1107,8 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     # Full-category output is reserved for a server-resolved table intent. All
     # ordinary chart requests retain their bounded Top-N query contract.
     limit_clause = "" if request.include_all_categories else " LIMIT ?"
-    connection = duckdb.connect(":memory:")
-    try:
-        connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
+    connection_context = nullcontext(connection) if connection is not None else RUN_STORE.analytics_connection(run_id)
+    with connection_context as active_connection:
         where_clause = " AND ".join(filter_clauses)
         if request.chart_type == "scatter":
             query = f"SELECT {dimension} AS label, {x_expression} AS x_value, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST{limit_clause}"
@@ -1106,9 +1130,10 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
             query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY TRY_CAST({dimension} AS TIMESTAMP) ASC NULLS LAST{limit_clause}"
         else:
             query = f"SELECT {dimension} AS label, {expression} AS value FROM dataset WHERE {where_clause} GROUP BY 1 ORDER BY value DESC NULLS LAST{limit_clause}"
-        records = connection.execute(query, [*parameters, *([] if request.include_all_categories else [request.limit])]).fetchall()
-    finally:
-        connection.close()
+        records = active_connection.execute(query, [*parameters, *([] if request.include_all_categories else [request.limit])]).fetchall()
+        scope_total_value = active_connection.execute(
+            f"SELECT {expression} FROM dataset WHERE {where_clause}", parameters
+        ).fetchone()[0]
     warnings: list[str] = []
     if not records: warnings.append("Không có giá trị phù hợp với phạm vi hiện tại." if language == "vi" else "No values match the current scope.")
     if records and len(records) < request.limit and not request.include_all_categories and not (secondary and request.limit_per_secondary):
@@ -1139,7 +1164,18 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     # even when filtering/null handling leaves fewer categories, and disclose the
     # availability separately in warnings/result_count.
     title = presentation_title(request.metric, request.dimension, request.chart_type, language=language, limit=request.limit, secondary_dimension=request.secondary_dimension)
-    return ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), secondary_metric=request.secondary_metric, secondary_metric_display_name=display_label(request.secondary_metric) if request.secondary_metric else "", value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), requested_limit=request.limit, insight_headline=insight_headline, evidence=evidence)
+    scope_total = None if scope_total_value is None else float(scope_total_value)
+    return ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), secondary_metric=request.secondary_metric, secondary_metric_display_name=display_label(request.secondary_metric) if request.secondary_metric else "", value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), requested_limit=request.limit, scope_total_value=scope_total, scope_total_formatted_value=format_number(scope_total) if scope_total is not None else None, insight_headline=insight_headline, evidence=evidence)
+
+
+@app.post("/api/runs/{run_id}/chart", response_model=ChartResult)
+def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"] = "vi") -> ChartResult:
+    return _build_chart(run_id, request, language)
+
+
+def _executive_overview_cache_key(run_id: str, language: str, scope: DateScope | None) -> str:
+    normalized_scope = scope.model_dump_json() if scope else "null"
+    return f"{run_id}:{language}:{normalized_scope}"
 
 
 @app.get("/api/runs/{run_id}/executive-overview", response_model=ExecutiveOverview)
@@ -1154,22 +1190,34 @@ def executive_overview(
         raise HTTPException(422, "date_column is required when a date range is supplied.")
     date_scope = DateScope(column=date_column, start=start, end=end) if date_column else None
     """Generate only schema-derived, server-validated executive aggregates."""
+    # Authorize retention before cache lookup; cache never becomes a shadow run store.
+    RUN_STORE.metadata(run_id)
+    cache_key = _executive_overview_cache_key(run_id, language, date_scope)
+    cached = EXECUTIVE_OVERVIEW_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     headers, rows = load_run(run_id)
     profile_data = profile_for_run(run_id, headers, rows)
     proposals, omissions = executive_overview_proposals(profile_data.columns)
     charts: list[ChartResult] = []
     warnings: list[str] = list(omissions)
-    for proposal in proposals:
-        try:
-            request = ChartRequest.model_validate(cast(dict[str, object], proposal["request"]))
-            request = request.model_copy(update={"date_scope": date_scope})
-            chart = build_chart(run_id, request, language)
-            if chart.rows:
-                charts.append(chart)
-            else:
-                warnings.append(f"{chart.title}: " + (chart.warnings[0] if chart.warnings else "no matching values"))
-        except (HTTPException, ValueError, TypeError) as error:
-            warnings.append(str(getattr(error, "detail", error))[:220])
+    # Default charts share one already-authorized run relation. The former path
+    # recreated an in-memory table for every proposal, multiplying CSV parse time.
+    with RUN_STORE.analytics_connection(run_id) as overview_connection:
+        for proposal in proposals:
+            try:
+                request = ChartRequest.model_validate(cast(dict[str, object], proposal["request"]))
+                request = request.model_copy(update={"date_scope": date_scope})
+                chart = _build_chart(
+                    run_id, request, language, connection=overview_connection,
+                    headers=headers, rows=rows, profile_data=profile_data,
+                )
+                if chart.rows:
+                    charts.append(chart)
+                else:
+                    warnings.append(f"{chart.title}: " + (chart.warnings[0] if chart.warnings else "no matching values"))
+            except (HTTPException, ValueError, TypeError) as error:
+                warnings.append(str(getattr(error, "detail", error))[:220])
     catalog = business_semantic_catalog(profile_data.columns)
     all_metrics = [item for item in [*catalog.sales_metrics, *catalog.quantity_metrics, *catalog.cost_metrics, *catalog.profit_metrics] if item is not None]
     all_metrics.extend(item for item in profile_data.columns if item.kind == "num" and item not in all_metrics and not any(token in canonical_field_name(item.name) for token in ("id", "code", "key")))
@@ -1178,9 +1226,7 @@ def executive_overview(
     scorecard_scope_clause, scorecard_scope_parameters = _date_scope_clause(date_scope, headers, profile_columns)
     scorecard_where = f" WHERE {scorecard_scope_clause}" if scorecard_scope_clause else ""
     safe_time: ColumnProfile | None = next((item for item in profile_data.columns if item.kind == "time"), None)
-    connection = duckdb.connect(":memory:")
-    try:
-        connection.execute("CREATE TABLE dataset AS SELECT * FROM read_csv_auto(?, all_varchar=true)", [str(RUN_STORE.dataset_path(run_id))])
+    with RUN_STORE.analytics_connection(run_id) as connection:
         for metric in all_metrics:
             if len(scorecards) == 4:
                 break
@@ -1210,14 +1256,11 @@ def executive_overview(
                     comparison["sparkline"] = [float(period_value or 0) for _, period_value in periods]
             if date_scope and date_scope.start and date_scope.end:
                 time_identifier = quote_identifier(date_scope.column, headers)
-                global_bounds = [
-                    parsed_date.date() for row in rows
-                    if (parsed_date := parse_date_value((row.get(date_scope.column) or "").strip())) is not None
-                ]
+                global_bounds = next((item for item in profile_data.time_field_bounds if item.column == date_scope.column), None)
                 duration_days = (date_scope.end - date_scope.start).days + 1
                 prior_end = date_scope.start - timedelta(days=1)
                 prior_start = prior_end - timedelta(days=duration_days - 1)
-                if global_bounds and prior_start >= min(global_bounds):
+                if global_bounds is not None and prior_start >= global_bounds.min_date:
                     current_clause, current_params = _date_scope_clause(date_scope, headers, profile_columns)
                     prior_clause, prior_params = _date_scope_clause(
                         DateScope(column=date_scope.column, start=prior_start, end=prior_end), headers, profile_columns
@@ -1248,13 +1291,13 @@ def executive_overview(
                             "prior_period_label": f"{prior_start.isoformat()} to {prior_end.isoformat()}",
                         }
             scorecards.append(ExecutiveScorecard(label=label, value=float(value), formatted_value=format_number(float(value)), compact_formatted_value=compact_number(float(value)), metric=metric.name, aggregation="sum", scope=scope, **comparison))
-    finally:
-        connection.close()
     if len(scorecards) < 4:
         warnings.append((f"Chỉ có {len(scorecards)} scorecard vì schema không có đủ bốn metric số an toàn." if language == "vi" else f"Only {len(scorecards)} scorecards are available because the schema has fewer than four safe numeric metrics."))
     summary = (f"Bộ tổng quan gồm {len(scorecards)} scorecard và {len(charts)} biểu đồ aggregate đã xác thực từ {profile_data.row_count:,} dòng." if language == "vi" else f"This executive overview contains {len(scorecards)} validated scorecards and {len(charts)} validated aggregate charts from {profile_data.row_count:,} rows.")
     guardrail = ("Scorecard và biểu đồ chỉ dùng aggregate run-scoped đã xác thực trên server; không dùng raw rows hoặc trường nhạy cảm." if language == "vi" else "Scorecards and charts use only validated, run-scoped server aggregates; no raw rows or sensitive fields are used.")
-    return ExecutiveOverview(run_id=run_id, summary=summary, applied_date_scope=date_scope, scorecards=scorecards, charts=charts, warnings=warnings, guardrail=guardrail)
+    overview = ExecutiveOverview(run_id=run_id, summary=summary, applied_date_scope=date_scope, scorecards=scorecards, charts=charts, warnings=warnings, guardrail=guardrail)
+    EXECUTIVE_OVERVIEW_CACHE[cache_key] = overview
+    return overview
 
 def _custom_report_glossary(run_id: str, artifacts: list[CustomReportArtifact]) -> list[dict[str, str]]:
     headers, rows = load_run(run_id)
