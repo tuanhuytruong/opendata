@@ -1,0 +1,193 @@
+/* Copilot-owned date context and immutable artifact focus. */
+.chat-panel > .date-scope-control {
+  border-width: 0 0 1px;
+  border-radius: 0;
+  box-shadow: none;
+  background: #fff;
+  padding: 10px 16px;
+  align-items: center;
+}
+.date-scope-copilot {
+  gap: 8px;
+}
+.date-scope-copilot label {
+  flex: 1 1 104px;
+}
+.date-scope-copilot select,
+.date-scope-copilot input {
+  min-width: 0;
+  width: 100%;
+}
+.date-scope-chip {
+  flex: 1 1 100%;
+  color: #475569;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.artifact-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+.artifact-focus-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #4338ca;
+  font-size: 12px;
+  font-weight: 700;
+}
+.artifact-focus-backdrop {
+  position: fixed;
+  z-index: 60;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgb(15 23 42 / 0.58);
+}
+.artifact-focus-dialog {
+  width: min(1280px, 100%);
+  max-height: calc(100vh - 64px);
+  overflow: auto;
+  border-radius: 18px;
+  background: #fff;
+  box-shadow: 0 24px 64px rgb(15 23 42 / 0.32);
+  padding: 22px;
+}
+.artifact-focus-dialog header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.artifact-focus-dialog h2 {
+  margin-top: 3px;
+  font-size: 22px;
+  font-weight: 750;
+}
+.artifact-focus-close {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  color: #475569;
+}
+.artifact-focus-close svg {
+  width: 17px;
+}
+.artifact-focus-insight {
+  margin-top: 16px;
+  border-left: 3px solid #4f46e5;
+  background: #eef2ff;
+  padding: 10px 12px;
+  color: #312e81;
+  font-size: 13px;
+  font-weight: 600;
+}
+.artifact-focus-chart {
+  height: min(65vh, 680px);
+  min-height: 440px;
+  margin-top: 18px;
+}
+.artifact-focus-table {
+  max-height: 65vh;
+  margin-top: 18px;
+  overflow: auto;
+  border: 1px solid #dbe3ef;
+  border-radius: 10px;
+}
+.artifact-focus-table table {
+  width: 100%;
+  font-size: 13px;
+}
+.artifact-focus-table th {
+  position: sticky;
+  top: 0;
+  background: #f8fafc;
+  text-align: left;
+  padding: 10px;
+}
+.artifact-focus-table td {
+  padding: 10px;
+  border-top: 1px solid #e2e8f0;
+}
+.artifact-focus-table td:last-child,
+.artifact-focus-table th:last-child {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.artifact-focus-caveat {
+  margin-top: 12px;
+  border-radius: 8px;
+  background: #fffbeb;
+  padding: 9px;
+  color: #92400e;
+  font-size: 12px;
+}
+.scorecard-value-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.scorecard-value-row b {
+  flex: 1;
+}
+.scorecard-value-row .scorecard-sparkline {
+  width: 42%;
+  min-width: 80px;
+  margin: 0;
+  height: 38px;
+}
+.scorecard-sparkline-area {
+  fill: currentColor;
+  opacity: 0.12;
+}
+.scorecard-comparison {
+  display: flex !important;
+  align-items: baseline;
+  gap: 6px;
+}
+.scorecard-comparison span {
+  color: #64748b;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Wide trend canvases retain readable labels rather than collapsing to tiny ticks. */
+.role-trend .validated-chart-label {
+  font-size: 11px !important;
+}
+.role-trend .recharts-cartesian-axis-tick-value {
+  font-size: 11px;
+}
+@media (max-width: 640px) {
+  .chat-panel > .date-scope-control {
+    padding: 10px 12px;
+  }
+  .artifact-focus-backdrop {
+    padding: 12px;
+  }
+  .artifact-focus-dialog {
+    max-height: calc(100vh - 24px);
+    padding: 16px;
+  }
+  .artifact-focus-chart {
+    height: 55vh;
+    min-height: 300px;
+  }
+  .scorecard-value-row .scorecard-sparkline {
+    width: 38%;
+  }
+}
+

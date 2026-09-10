@@ -1,0 +1,146 @@
+/* Shared global date scope; one request context for overview, chart, and Copilot. */
+.date-scope-control {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+  flex-wrap: wrap;
+  border: 1px solid #dbe3ef;
+  border-radius: 14px;
+  background: #fff;
+  padding: 12px 14px;
+  box-shadow: 0 1px 2px #0f172a0d;
+}
+.date-scope-control > div {
+  margin-right: auto;
+}
+.date-scope-control b {
+  display: block;
+  margin-top: 2px;
+  font-size: 14px;
+}
+.date-scope-control label {
+  display: grid;
+  gap: 4px;
+  color: #64748b;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.date-scope-control select,
+.date-scope-control input {
+  min-width: 118px;
+  border: 1px solid #cbd5e1;
+  border-radius: 7px;
+  background: #fff;
+  padding: 6px 7px;
+  color: #334155;
+  font-size: 12px;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.date-scope-control button {
+  border: 1px solid #c7d2fe;
+  border-radius: 7px;
+  background: #eef2ff;
+  color: #4338ca;
+  padding: 7px 9px;
+  font-size: 12px;
+  font-weight: 700;
+}
+.scorecard-sparkline {
+  color: #4f46e5;
+}
+.scorecard-sparkline polyline {
+  stroke: currentColor !important;
+  stroke-width: 2px !important;
+  stroke-linecap: round !important;
+  stroke-linejoin: round !important;
+}
+.executive-scorecard:has(.scorecard-comparison.up) .scorecard-sparkline {
+  color: #059669;
+}
+.executive-scorecard:has(.scorecard-comparison.down) .scorecard-sparkline {
+  color: #e11d48;
+}
+.grouped-ranking-compact {
+  max-height: 400px;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+}
+.grouped-ranking-compact .grouped-ranking-section {
+  margin-bottom: 8px;
+}
+.grouped-ranking-compact .grouped-ranking-section h4 {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 5px 7px;
+  background: #f8fafc;
+  font-size: 11px;
+}
+.share-tooltip {
+  display: grid;
+  gap: 4px;
+  max-width: 260px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  padding: 9px 10px;
+  color: #334155;
+  font-size: 12px;
+  box-shadow: 0 4px 12px #0f172a1c;
+}
+.share-tooltip b {
+  overflow-wrap: anywhere;
+}
+.share-tooltip span {
+  color: #475569;
+}
+.report-preview-executive-brief .preview-summary {
+  border-left: 4px solid #4f46e5;
+}
+.report-preview-performance-review {
+  background: #f8fafc;
+}
+.report-preview-performance-review .preview-evidence {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.report-preview-segment-deep-dive .preview-evidence {
+  border: 2px solid #0f766e;
+}
+.report-preview-segment-deep-dive .preview-section {
+  border-left: 3px solid #0f766e;
+}
+.report-preview-period-review {
+  background: #fff7ed;
+}
+.report-preview-period-review .preview-section:nth-of-type(odd) {
+  background: #fff;
+}
+.report-preview-period-review .preview-section:nth-of-type(even) {
+  background: #fef3c7;
+}
+.report-preview-period-review .preview-evidence {
+  border-top: 3px solid #ea580c;
+}
+@media (max-width: 640px) {
+  .date-scope-control > div {
+    width: 100%;
+  }
+  .date-scope-control label {
+    flex: 1;
+  }
+  .date-scope-control select,
+  .date-scope-control input {
+    width: 100%;
+    min-width: 0;
+  }
+  .report-preview-performance-review .preview-evidence {
+    grid-template-columns: 1fr;
+  }
+}
+
