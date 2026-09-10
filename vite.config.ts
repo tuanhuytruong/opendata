@@ -10,6 +10,15 @@ const buildSha = process.env.OPENDATA_BUILD_SHA ?? execFileSync('git', ['rev-par
 export default defineConfig({
   define: { __OPENDATA_BUILD_SHA__: JSON.stringify(buildSha) },
   plugins: [react(), tailwindcss()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'vendor-charts': ['recharts'],
+        },
+      },
+    },
+  },
   resolve: { alias: { '@': path.resolve(__dirname, '.') } },
   server: {
     port: 5173,
