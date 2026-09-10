@@ -5,8 +5,9 @@ coverage/
 playwright-report/
 test-results/
 
-# Local-only browser QA proxy; Playwright uses E2E_BASE_URL in CI.
+# Local-only browser QA proxy; the committed CI runner config lives in scripts/.
 vite.e2e.config.ts
+!scripts/vite.e2e.config.ts
 .DS_Store
 *.log
 var/
