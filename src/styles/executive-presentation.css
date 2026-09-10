@@ -81,32 +81,6 @@
   color: #be123c;
 }
 .scorecard-comparison.neutral {
-  color: #475569;
-}
-.scorecard-sparkline {
-  display: block;
-  width: 100%;
-  height: 26px;
-  margin-top: 8px;
-  overflow: visible;
-}
-.scorecard-sparkline polyline {
-  fill: none;
-  stroke: #6366f1;
-  stroke-width: 8;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-.scorecard-comparison {
-  font-weight: 700;
-}
-.scorecard-comparison.up {
-  color: #047857;
-}
-.scorecard-comparison.down {
-  color: #be123c;
-}
-.scorecard-comparison.neutral {
   color: #64748b;
 }
 .scorecard-sparkline {

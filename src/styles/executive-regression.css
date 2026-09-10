@@ -158,11 +158,8 @@
   height: 42px;
 }
 @media (max-width: 900px) {
-  .executive-chart-grid.artifact-count-6 > .executive-chart-card.role-trend {
-    grid-column: auto;
-  }
-}
-@media (max-width: 900px) {
+  /* This late rule intentionally owns the Hub compact breakpoint until all later
+     workspace styles are consolidated; it preserves the documented one-column gate. */
   .executive-chart-grid {
     grid-template-columns: 1fr;
   }
