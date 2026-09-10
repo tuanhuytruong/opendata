@@ -730,18 +730,19 @@ def _data_query_from_params(page: int, page_size: int, search: str, sort_by: str
         raise HTTPException(422, "Invalid data query.") from error
 
 
-def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str], profile_columns: dict[str, ColumnProfile]) -> tuple[str, list[str | float]]:
-    """Build only parameterized predicates against non-sensitive, non-identifier fields."""
+def _compile_filters(filters: list[FilterSpec], headers: list[str], profile_columns: dict[str, ColumnProfile], allowed_columns: set[str]) -> tuple[list[str], list[str | float]]:
+    """Compile the one shared, parameterized filter contract for charts and raw data."""
     clauses: list[str] = []
     parameters: list[str | float] = []
     operators = {"equals": "=", "not_equals": "<>", "greater_than": ">", "greater_or_equal": ">=", "less_than": "<", "less_or_equal": "<="}
-    for item in query.filters:
-        if item.column not in visible_headers:
-            raise HTTPException(422, "Only non-sensitive, non-identifier columns can be used in data exploration.")
+    for item in filters:
+        if item.column not in allowed_columns:
+            raise HTTPException(422, "Only non-sensitive, non-identifier columns can be used in filters.")
         field = quote_identifier(item.column, headers)
         kind = profile_columns[item.column].kind
         if item.operator == "in":
-            if kind not in {"cat", "time", "num"}: raise HTTPException(422, "IN filters require a categorical, time, or numeric field.")
+            if kind not in {"cat", "time", "num"}:
+                raise HTTPException(422, "IN filters require a categorical, time, or numeric field.")
             clauses.append(f"{field} IN ({', '.join('?' for _ in item.values)})")
             parameters.extend(item.values)
         elif item.operator == "date_range":
@@ -759,7 +760,14 @@ def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str]
             else:
                 clauses.append(f"{field} {operator} ?")
                 parameters.append(item.value)
-        else: raise HTTPException(422, "Unsupported filter operator.")
+        else:
+            raise HTTPException(422, "Unsupported filter operator.")
+    return clauses, parameters
+
+
+def _data_where(query: DataQuery, headers: list[str], visible_headers: list[str], profile_columns: dict[str, ColumnProfile]) -> tuple[str, list[str | float]]:
+    """Build raw-data predicates plus the raw-data-only text search."""
+    clauses, parameters = _compile_filters(query.filters, headers, profile_columns, set(visible_headers))
     term = query.search.strip()
     if term:
         clauses.append("(" + " OR ".join(f"LOWER(COALESCE({quote_identifier(header, headers)}, '')) LIKE ?" for header in visible_headers) + ")")
@@ -1078,28 +1086,9 @@ def build_chart(run_id: str, request: ChartRequest, language: Literal["en", "vi"
     filter_clauses = [f"{dimension} IS NOT NULL", f"TRIM({dimension}) <> ''"]
     if secondary:
         filter_clauses.extend([f"{secondary} IS NOT NULL", f"TRIM({secondary}) <> ''"])
-    parameters: list[str | int | float] = []
-    for item in request.filters:
-        field = quote_identifier(item.column, headers)
-        operators = {"equals": "=", "not_equals": "<>", "greater_than": ">", "greater_or_equal": ">=", "less_than": "<", "less_or_equal": "<="}
-        if item.operator == "in":
-            filter_clauses.append(f"{field} IN ({', '.join('?' for _ in item.values)})")
-            parameters.extend(item.values)
-            continue
-        if item.operator == "date_range":
-            if len(item.values) != 2 or not all(is_date(value) for value in item.values): raise HTTPException(422, f"date_range requires two valid dates for {item.column}.")
-            filter_clauses.append(f"TRY_CAST({field} AS TIMESTAMP) BETWEEN TRY_CAST(? AS TIMESTAMP) AND TRY_CAST(? AS TIMESTAMP)")
-            parameters.extend(item.values)
-            continue
-        operator = operators[item.operator]
-        if item.operator in {"greater_than", "greater_or_equal", "less_than", "less_or_equal"}:
-            if not is_number(item.value):
-                raise HTTPException(422, f"Numeric comparison requires a numeric value for {item.column}.")
-            filter_clauses.append(f"TRY_CAST(REPLACE({field}, ',', '') AS DOUBLE) {operator} ?")
-            parameters.append(float(item.value.replace(",", "")))
-        else:
-            filter_clauses.append(f"{field} {operator} ?")
-            parameters.append(item.value)
+    visible_filter_columns = {name for name, column in profiles.items() if column.kind not in {"id", "unknown"} and not is_sensitive_column(name)}
+    compiled_filters, parameters = _compile_filters(request.filters, headers, profiles, visible_filter_columns)
+    filter_clauses.extend(compiled_filters)
     date_scope_clause, date_scope_parameters = _date_scope_clause(request.date_scope, headers, profiles)
     if date_scope_clause:
         filter_clauses.append(date_scope_clause)

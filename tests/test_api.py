@@ -656,6 +656,35 @@ def test_data_explorer_rejects_invalid_or_sensitive_schema_and_filters() -> None
     assert client.get(base + "&filters=SELECT%20*%20FROM%20dataset").status_code == 422
 
 
+def test_chart_and_data_explorer_share_the_filter_contract() -> None:
+    data = upload_csv(
+        "sale_date,store,net_sales,customer_id\n"
+        "2026-01-01,Alpha,10,C-1\n"
+        "2026-01-10,Beta,20,C-2\n"
+        "2026-02-01,Alpha,30,C-3\n"
+    )
+    run_id = data["run_id"]
+    filters = [
+        {"column": "sale_date", "operator": "date_range", "values": ["2026-01-01", "2026-01-31"]},
+        {"column": "net_sales", "operator": "greater_or_equal", "value": "20"},
+    ]
+    raw = client.get(f"/api/runs/{run_id}/data?page_size=10&filters={json.dumps(filters)}")
+    chart = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "net_sales", "filters": filters})
+    assert raw.status_code == 200, raw.text
+    assert chart.status_code == 200, chart.text
+    assert raw.json()["total"] == 1
+    assert chart.json()["rows"] == [{"label": "Beta", "display_label": "Beta", "value": 20.0, "formatted_value": "20"}]
+
+    for invalid in (
+        [{"column": "net_sales", "operator": "date_range", "values": ["2026-01-01", "2026-01-31"]}],
+        [{"column": "customer_id", "operator": "equals", "value": "C-1"}],
+    ):
+        raw = client.get(f"/api/runs/{run_id}/data?page_size=10&filters={json.dumps(invalid)}")
+        chart = client.post(f"/api/runs/{run_id}/chart", json={"dimension": "store", "metric": "net_sales", "filters": invalid})
+        assert raw.status_code == 422, raw.text
+        assert chart.status_code == 422, chart.text
+
+
 def test_filtered_data_export_matches_active_query_and_excludes_sensitive_values() -> None:
     data = upload_csv(
         "store,net_sales,email\n"
