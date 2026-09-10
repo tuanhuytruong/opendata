@@ -114,7 +114,7 @@ body { background:#f1f5f9; color:#0f172a; font-family:var(--font-sans); }
 
 
 /* Executive Hub density: six peer artifacts form a wider desktop 3 rows × 2 columns grid. */
-.executive-chart-grid { grid-template-columns:repeat(2,minmax(0,1fr)); grid-auto-flow:row dense; align-items:stretch; }
+.executive-chart-grid { grid-template-columns:repeat(2,minmax(0,1fr)); align-items:stretch; }
 .executive-chart-grid.artifact-count-6 > .executive-chart-card.role-trend { grid-column:auto; }
 .executive-chart-grid .chart-companion-table { min-height:0; }
 .executive-chart-grid .chart-visual, .executive-chart-grid .role-trend .chart-visual { height:300px; }

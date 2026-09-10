@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 import re
 import secrets
+import subprocess
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, cast
@@ -54,6 +55,19 @@ RUN_STORE = RunStore(DATA_DIR)
 JOB_QUEUE = DurableJobQueue(JOB_DIR)
 PROFILE_CACHE: dict[str, DatasetProfile] = {}
 VALID_CHARTS = {"bar", "line", "area", "scatter"}
+
+
+def build_sha() -> str:
+    configured = os.getenv("OPENDATA_BUILD_SHA", "").strip()
+    if configured:
+        return configured
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+
+
+BUILD_SHA = build_sha()
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -784,7 +798,7 @@ def _run_data_query(run_id: str, query: DataQuery) -> tuple[list[str], list[dict
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "build_sha": BUILD_SHA}
 
 
 def cleanup_expired_runs_and_cache() -> int:

@@ -21,7 +21,9 @@ def upload_csv(content: str, name: str = "sales.csv") -> dict:
 
 
 def test_health() -> None:
-    assert client.get("/api/health").json() == {"status": "ok"}
+    payload = client.get("/api/health").json()
+    assert payload["status"] == "ok"
+    assert payload["build_sha"]
 
 
 def test_configured_upload_limits_match_product_contract() -> None:

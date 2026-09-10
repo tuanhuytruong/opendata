@@ -87,7 +87,9 @@ def test_optional_basic_auth_protects_the_entire_api(monkeypatch) -> None:
     assert challenge.headers["www-authenticate"] == 'Basic realm="OpenData pilot", charset="UTF-8"'
     assert client.get("/api/health", auth=("pilot", "wrong")).status_code == 401
     assert client.get("/", auth=("pilot", "wrong")).status_code == 401
-    assert client.get("/api/health", auth=("pilot", "correct-horse")).json() == {"status": "ok"}
+    health = client.get("/api/health", auth=("pilot", "correct-horse")).json()
+    assert health["status"] == "ok"
+    assert health["build_sha"]
     assert "text/html" in client.get("/", auth=("pilot", "correct-horse")).headers["content-type"]
 
 

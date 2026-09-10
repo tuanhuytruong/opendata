@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { LoaderCircle, TriangleAlert } from 'lucide-react';
 import { ChartInstance, ChartRequest, ChartResult, DatasetProfile } from '../types';
+import { executedChartArtifact } from '../domain/artifact';
 import { Language, text } from '../i18n';
 import ValidatedChart from './ValidatedChart';
 import ChartTypeSelect from './ChartTypeSelect';
@@ -38,11 +39,12 @@ export default function ExecutiveChartCard({ instance, profile, language, onPin,
    return () => controller.abort();
  }, [fingerprint]);
  const updateRequest = (next: ChartRequest) => { setResult(null); setRequest(next); };
+ const executed = result ? executedChartArtifact(instance.id, profile.run_id, request, result) : null;
  const grouped = Boolean(request.secondary_dimension);
  const types: ChartRequest['chart_type'][] = request.x_metric ? ['scatter'] : grouped ? ['bar', 'stacked_bar'] : ['bar', 'line', 'area', 'pie', 'donut', 'combo']; // pareto/heatmap reserved server-side only
  const updateType = (chart_type: ChartRequest['chart_type']) => updateRequest({ ...request, chart_type, x_metric: chart_type === 'scatter' ? metrics.find(x => x.name !== request.metric)?.name : undefined, secondary_metric: chart_type === 'combo' ? request.secondary_metric ?? metrics.find(x => x.name !== request.metric)?.name : undefined });
- const pin = async () => { if (!result || loading || pinning) return; setPinning(true); try { onPin(instance.id, result, request); } finally { window.setTimeout(() => setPinning(false), 300); } };
- const viewRecords = () => { if (result && !loading) onViewRecords?.(result, request); };
+ const pin = async () => { if (!executed || loading || pinning) return; setPinning(true); try { onPin(executed.artifactId, executed.result, executed.request); } finally { window.setTimeout(() => setPinning(false), 300); } };
+ const viewRecords = () => { if (executed && !loading) onViewRecords?.(executed.result, executed.request); };
  const dimensionIsTime = profile.columns.find(column => column.name === request.dimension)?.kind === 'time';
  const limitName = dimensionIsTime ? 'Periods' : 'Top N';
  const selectedLimit = customLimitMode ? 'custom' : String(request.limit);

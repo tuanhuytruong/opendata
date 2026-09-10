@@ -58,11 +58,13 @@ export default function App() {
     } catch (error) { setMessages(items => [...items, { id: `${id}-error`, role: 'assistant', text: error instanceof Error ? error.message : 'Unable to complete the analysis.' }]); }
     finally { setBusy(false); }
   };
-  const addToReport = async (artifactId: string, chart: ChartResult, request: ChartRequest) => { if (!profile) return; setReportNotice(null); try { const response = await fetch(`/api/runs/${profile.run_id}/custom-report/artifacts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ artifact_id: artifactId, chart: { ...request, date_scope: dateScope ?? request.date_scope } }) }); const next = await response.json(); if (!response.ok) throw new Error(next.detail || 'Unable to add this chart to the report.'); setReport(next as CustomReportDocument); setReportNotice('Added to the persisted Custom Report.'); } catch (error) { setReportNotice(error instanceof Error ? error.message : 'Unable to add this chart to the report.'); } };
-  const openMatchingRecords = (chart: ChartResult, _request: ChartRequest) => {
+  const addToReport = async (artifactId: string, chart: ChartResult, request: ChartRequest) => { if (!profile) return; setReportNotice(null); try { const response = await fetch(`/api/runs/${profile.run_id}/custom-report/artifacts`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ artifact_id: artifactId, chart: request }) }); const next = await response.json(); if (!response.ok) throw new Error(next.detail || 'Unable to add this chart to the report.'); setReport(next as CustomReportDocument); setReportNotice('Added to the persisted Custom Report.'); } catch (error) { setReportNotice(error instanceof Error ? error.message : 'Unable to add this chart to the report.'); } };
+  const openMatchingRecords = (chart: ChartResult, request: ChartRequest) => {
     if (!profile) return;
     const allowed = new Set(profile.columns.filter(column => column.kind !== 'id' && column.kind !== 'unknown').map(column => column.name));
-    const validatedRequest = toRequest(chart);
+    // Callers pass the immutable server-validated executed request; never infer a
+    // new scope from global UI state or chart rows when drilling into raw data.
+    const validatedRequest = structuredClone(request);
     const filters = validatedRequest.filters.filter(filter => allowed.has(filter.column)).map(filter => ({ ...filter }));
     const dimensionKind = profile.columns.find(column => column.name === chart.dimension)?.kind;
     const displayed = [...new Set(chart.rows.map(row => String(row.label)).filter(Boolean))];
