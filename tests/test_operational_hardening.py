@@ -97,7 +97,13 @@ def test_optional_basic_auth_protects_the_entire_api(monkeypatch) -> None:
     health = client.get("/api/health", auth=("pilot", "correct-horse")).json()
     assert health["status"] == "ok"
     assert health["build_sha"]
-    assert "text/html" in client.get("/", auth=("pilot", "correct-horse")).headers["content-type"]
+    # Clean CI checks out source only; dist/ is intentionally release-built and
+    # therefore may be absent. The auth contract is that valid credentials reach
+    # the app (200 when static assets exist, 404 otherwise), never another 401.
+    root = client.get("/", auth=("pilot", "correct-horse"))
+    assert root.status_code in {200, 404}
+    if root.status_code == 200:
+        assert "text/html" in root.headers["content-type"]
 
 
 def test_invalid_partial_basic_auth_configuration_fails_closed(monkeypatch) -> None:
