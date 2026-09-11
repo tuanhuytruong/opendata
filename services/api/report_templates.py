@@ -56,7 +56,7 @@ def apply_template(document: dict[str, Any], template_id: str) -> dict[str, Any]
         raise ValueError("Unknown report template.")
     definition = TEMPLATE_DEFINITIONS[template_id]
     library = list(document.get("artifact_library") or [])
-    pages = [{"page_id": f"page-{index + 1}", "title": title, "order": index} for index, title in enumerate(definition["pages"])]
+    pages = [{"page_id": f"{template_id}-page-{index + 1}", "title": title, "order": index} for index, title in enumerate(definition["pages"])]
     blocks: list[dict[str, Any]] = []
     blocks.append({"type": "header", "block_id": "template-header", "text": definition["title"], "level": 1})
     block_types = definition["block_types"][1:]

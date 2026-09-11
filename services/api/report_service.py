@@ -27,9 +27,13 @@ def empty_document(run_id: str) -> ReportDocumentV2:
     return ReportDocumentV2(run_id=run_id, updated_at=datetime.now(timezone.utc).isoformat())
 
 
-def _hash_artifact(chart: dict[str, Any], result: dict[str, Any] | None) -> str:
-    payload = json.dumps({"chart": chart, "result": result}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+def _hash_artifact(chart: dict[str, Any], result: dict[str, Any] | None, dataset_sha256: str) -> str:
+    payload = json.dumps({"chart": chart, "result": result, "dataset_sha256": dataset_sha256}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _dataset_sha256(store: RunStore, run_id: str) -> str:
+    return hashlib.sha256(store.dataset_path(run_id).read_bytes()).hexdigest()
 
 
 def _load_unlocked(store: RunStore, run_id: str) -> ReportDocumentV2:
@@ -78,6 +82,8 @@ def mutate_document(
         next_document = mutation(current)
         if next_document.run_id != run_id:
             raise HTTPException(422, "Report run does not match the active dataset.")
+        if next_document == current:
+            return current
         next_document = validate_report_v2(next_document.model_copy(update={"revision": current.revision + 1, "updated_at": datetime.now(timezone.utc).isoformat()}).model_dump(mode="json"))
         store.save_artifact_json(run_id, V2_PATH, next_document.model_dump(mode="json"))
         return next_document
@@ -98,6 +104,11 @@ def add_artifact(
     if view not in {"chart", "table"}:
         raise HTTPException(422, "Artifact view must be chart or table.")
     normalized_origin = cast(Literal["executive_hub", "data_copilot", "legacy", "unknown"], origin if origin in {"executive_hub", "data_copilot", "legacy", "unknown"} else "unknown")
+    try:
+        dataset_sha256 = _dataset_sha256(store, run_id)
+    except FileNotFoundError as error:
+        raise HTTPException(404, "Dataset is no longer available for this run.") from error
+    normalized_view: Literal["chart", "table"] = cast(Literal["chart", "table"], view)
     snapshot = ReportArtifactSnapshot(
         artifact_id=artifact_id,
         origin=normalized_origin,
@@ -105,13 +116,25 @@ def add_artifact(
         result=result,
         provenance=provenance or {},
         created_at=datetime.now(timezone.utc).isoformat(),
-        artifact_hash=_hash_artifact(chart, result),
+        artifact_hash=_hash_artifact(chart, result, dataset_sha256),
+        dataset_sha256=dataset_sha256,
+        view_capabilities=[normalized_view],
     )
 
     def mutation(current: ReportDocumentV2) -> ReportDocumentV2:
         existing = next((item for item in current.artifact_library if item.artifact_id == artifact_id), None)
+        if existing and existing.artifact_hash == snapshot.artifact_hash:
+            capabilities = list(dict.fromkeys([*existing.view_capabilities, normalized_view]))
+            if capabilities == existing.view_capabilities:
+                return current
+            return current.model_copy(update={
+                "artifact_library": [
+                    item.model_copy(update={"view_capabilities": capabilities}) if item.artifact_id == artifact_id else item
+                    for item in current.artifact_library
+                ]
+            })
         library = [item for item in current.artifact_library if item.artifact_id != artifact_id]
-        library.append(snapshot if existing is None else existing)
+        library.append(snapshot)
         return current.model_copy(update={"artifact_library": library})
 
     return mutate_document(store, run_id, expected_revision, mutation)
@@ -153,7 +176,7 @@ def legacy_projection(document: ReportDocumentV2) -> dict[str, Any]:
         "run_id": document.run_id,
         "title": document.title,
         "locale": document.locale,
-        "layout_blueprint": {"template": "executive_briefing"},
+        "layout_blueprint": {"template": next((template for template in ("executive_briefing", "sales_performance_review", "category_division_deep_dive", "weekly_monthly_business_review") if any(page.page_id == template for page in document.pages)), "executive_briefing")},
         "executive_summary": next((getattr(block, "text", "") for block in document.blocks if getattr(block, "type", None) == "text"), ""),
         "sections": [],
         "pinned_artifacts": artifacts,

@@ -79,7 +79,7 @@ export default function App() {
     setDeepDiveScope({ title: chart.title, aggregation: validatedRequest.aggregation, metric: validatedRequest.metric, dimension: validatedRequest.dimension, secondary_dimension: validatedRequest.secondary_dimension, filters });
     setView('eda');
   };
-  const pin = (message: Message) => { if (message.result?.chart) void addToReport(message.id, message.result.chart, toRequest(message.result.chart)); };
+  const pin = (message: Message) => { if (message.result?.chart) void addToReport(message.id, message.result.chart, toRequest(message.result.chart), 'data_copilot'); };
   return <div className="min-h-screen bg-slate-100 text-slate-900">
     <header className="app-header"><div className="app-header-inner">
       <div className="flex items-center gap-2"><span className="w-9 h-9 grid place-items-center rounded-xl bg-indigo-600 text-white shadow-sm"><Sparkles className="w-4 h-4" /></span><div><b className="font-display block leading-4">OpenData</b><span className="text-[11px] text-slate-400">{t('workspace')}</span></div></div>

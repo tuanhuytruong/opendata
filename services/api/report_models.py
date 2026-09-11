@@ -156,6 +156,16 @@ class ReportArtifactSnapshot(StrictModel):
     provenance: dict[str, Any] = Field(default_factory=dict)
     created_at: str = ""
     artifact_hash: str = ""
+    dataset_sha256: str = Field(default="", max_length=128)
+    view_capabilities: list[Literal["chart", "table"]] = Field(default_factory=lambda: ["chart", "table"], max_length=2)
+
+    @field_validator("provenance")
+    @classmethod
+    def provenance_is_metadata(cls, value: dict[str, Any]) -> dict[str, Any]:
+        forbidden = {"rows", "evidence", "warnings", "html", "raw_html", "sql"}
+        if forbidden.intersection(value):
+            raise ValueError("Artifact provenance may only contain metadata.")
+        return value
 
     @field_validator("chart")
     @classmethod
@@ -220,6 +230,8 @@ def build_v2_from_legacy(payload: dict[str, Any]) -> dict[str, Any]:
         canonical = {key: payload[key] for key in ("schema_version", "run_id", "title", "locale", "page_settings", "pages", "blocks", "placements", "artifact_library", "updated_at", "revision") if key in payload}
         return ReportDocumentV2.model_validate(canonical).model_dump(mode="json")
     template = ((payload.get("layout_blueprint") or {}).get("template") or "executive_briefing")
+    if template not in REPORT_TEMPLATES:
+        template = "executive_briefing"
     if template == "executive":
         template = "executive_briefing"
     run_id = str(payload.get("run_id", ""))

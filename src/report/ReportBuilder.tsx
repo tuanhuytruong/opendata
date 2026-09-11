@@ -39,6 +39,7 @@ export default function ReportBuilder({ runId, report, language, onChange }: Pro
     return () => { active = false; };
   }, [runId]);
 
+
   const commit = useCallback((next: ReportDocumentV2, dirty = true) => {
     setHistory(previous => [...previous.slice(-29), document]);
     setFuture([]);
@@ -86,7 +87,14 @@ export default function ReportBuilder({ runId, report, language, onChange }: Pro
   const removeSelected = () => { if (!selectedId) return; mutate(current => ({ ...current, blocks: current.blocks.filter(block => block.block_id !== selectedId), placements: current.placements.filter(item => item.block_id !== selectedId) })); setSelectedId(null); };
   const duplicateSelected = () => { if (!selected) return; const blockId = safeId(selected.type); const placement = placementFor(document, selected.block_id); mutate(current => ({ ...current, blocks: [...current.blocks, { ...selected, block_id: blockId } as ReportBlock], placements: [...current.placements, { ...(placement ?? { page_id: currentPage?.page_id ?? 'page-1', x: 0, y: 0, w: 6, h: 4 }), block_id: blockId, y: (placement?.y ?? 0) + (placement?.h ?? 4) }] })); setSelectedId(blockId); };
   const addPage = () => { const nextPage = { page_id: safeId('page'), title: `Page ${document.pages.length + 1}`, order: document.pages.length }; mutate(current => ({ ...current, pages: [...current.pages, nextPage] })); setPageId(nextPage.page_id); };
-  const changeLayout = (layout: Layout[]) => { mutate(current => ({ ...current, placements: current.placements.map(item => { const changed = layout.find(entry => entry.i === item.block_id); return changed ? { ...item, x: changed.x, y: changed.y, w: changed.w, h: changed.h } : item; }) }), false); setState('dirty'); };
+  const changeLayout = (layout: Layout[]) => {
+    const next = { ...document, placements: document.placements.map(item => {
+      const changed = layout.find(entry => entry.i === item.block_id);
+      return changed ? { ...item, x: changed.x, y: changed.y, w: changed.w, h: changed.h } : item;
+    }) };
+    commit(next);
+    void persist(next);
+  };
   const updateSelectedText = (value: string) => { if (!selected) return; mutate(current => ({ ...current, blocks: current.blocks.map(block => block.block_id === selected.block_id && ('text' in block) ? { ...block, text: value } as ReportBlock : block) }), false); };
   const undo = () => { const previous = history.at(-1); if (!previous) return; setFuture(items => [...items, document]); setHistory(items => items.slice(0, -1)); setDocument(previous); setState('dirty'); };
   const redo = () => { const next = future.at(-1); if (!next) return; setHistory(items => [...items, document]); setFuture(items => items.slice(0, -1)); setDocument(next); setState('dirty'); };
@@ -95,7 +103,6 @@ export default function ReportBuilder({ runId, report, language, onChange }: Pro
   const addLibraryArtifact = async (artifactId: string, view: 'chart' | 'table') => { const item = artifactFor(document, artifactId); if (!item) return; addBlock(view === 'table' ? 'data_table' : 'chart', item.artifact_id, view); };
   const statusLabel = state === 'dirty' ? 'Unsaved changes' : state === 'saving' ? 'Saving…' : state === 'conflict' ? 'Conflict — reload required' : message || (state === 'saved' ? 'Saved' : 'Ready');
 
-  useEffect(() => { if (initial.current) { initial.current = false; return; } }, []);
 
   return <section className="report-builder" data-report-revision={document.revision}>
     <header className="report-builder-toolbar"><div><p className="section-eyebrow">Report Builder v2</p><input className="report-name-input" aria-label="Report name" value={document.title} onChange={event => mutate(current => ({ ...current, title: event.target.value }), false)} onBlur={saveDraft}/><span className={`report-save-state report-save-${state}`} aria-live="polite">{statusLabel}</span></div><div className="report-toolbar-actions"><button type="button" onClick={undo} disabled={!history.length} title="Undo"><Undo2 size={15}/></button><button type="button" onClick={redo} disabled={!future.length} title="Redo"><Redo2 size={15}/></button><button type="button" onClick={() => setPreview(value => !value)}>{preview ? 'Edit' : 'Preview'}</button><button type="button" onClick={saveDraft}><Save size={15}/>Save</button><button type="button" onClick={() => void exportReport()}><Download size={15}/>Export HTML</button></div></header>

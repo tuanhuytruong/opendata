@@ -42,6 +42,9 @@ def test_artifact_library_is_owner_scoped_and_cas(tmp_path: Path) -> None:
     assert saved.artifact_library[0].origin == "executive_hub"
     with pytest.raises(HTTPException, match="changed elsewhere"):
         add_artifact(store, run_id, first.revision, "chart-2", chart, result, origin="data_copilot")
+    current = get_document(store, run_id)
+    same = add_artifact(store, run_id, current.revision, "chart-1", chart, result, origin="data_copilot")
+    assert same.revision == current.revision
 
 
 def test_templates_change_real_hierarchy_and_placements(tmp_path: Path) -> None:
