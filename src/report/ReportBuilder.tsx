@@ -32,40 +32,52 @@ export default function ReportBuilder({ runId, report, language, onChange }: Pro
   const initial = useRef(true);
   const pending = useRef<ReportDocumentV2 | null>(null);
   const loaded = useRef(false);
+  const documentRef = useRef(document);
+  const persistedRevision = useRef(document.revision);
+  const saveQueue = useRef(Promise.resolve());
 
   useEffect(() => {
     let active = true;
-    void getReportV2(runId).then(next => { if (active) { setDocument(next); setPageId(next.pages[0]?.page_id ?? 'page-1'); loaded.current = true; } }).catch(error => { if (active) setMessage(error instanceof Error ? error.message : 'Unable to load the report builder.'); });
+    void getReportV2(runId).then(next => { if (active) { documentRef.current = next; persistedRevision.current = next.revision; setDocument(next); setPageId(next.pages[0]?.page_id ?? 'page-1'); loaded.current = true; } }).catch(error => { if (active) setMessage(error instanceof Error ? error.message : 'Unable to load the report builder.'); });
     return () => { active = false; };
   }, [runId]);
 
 
   const commit = useCallback((next: ReportDocumentV2, dirty = true) => {
-    setHistory(previous => [...previous.slice(-29), document]);
+    setHistory(previous => [...previous.slice(-29), documentRef.current]);
     setFuture([]);
+    documentRef.current = next;
     setDocument(next);
     if (dirty && loaded.current) setState('dirty');
-  }, [document]);
+  }, []);
   const currentPage = document.pages.find(page => page.page_id === pageId) ?? document.pages[0];
   const pageBlocks = useMemo(() => document.blocks.filter(block => document.placements.some(item => item.page_id === currentPage?.page_id && item.block_id === block.block_id)), [document, currentPage?.page_id]);
   const selected = selectedId ? blockFor(document, selectedId) : undefined;
 
-  const persist = useCallback(async (next: ReportDocumentV2) => {
+  const persist = useCallback((next: ReportDocumentV2) => {
     setState('saving'); setMessage(''); pending.current = next;
-    try {
-      const saved = await saveReportV2(runId, next);
-      if (pending.current === next) { setDocument(saved); setState('saved'); setMessage('Saved'); }
-    } catch (error) {
-      if (pending.current === next) { setState(error instanceof Error && error.message.includes('(409)') ? 'conflict' : 'error'); setMessage(error instanceof Error ? error.message : 'Unable to save report.'); }
-    }
+    saveQueue.current = saveQueue.current.then(async () => {
+      try {
+        const queued = { ...next, revision: persistedRevision.current };
+        const saved = await saveReportV2(runId, queued);
+        documentRef.current = saved;
+        persistedRevision.current = saved.revision;
+        setDocument(current => current.revision <= saved.revision ? saved : current);
+        if (pending.current === next) { setState('saved'); setMessage('Saved'); }
+      } catch (error) {
+        if (pending.current === next) { setState(error instanceof Error && error.message.includes('(409)') ? 'conflict' : 'error'); setMessage(error instanceof Error ? error.message : 'Unable to save report.'); }
+      }
+    });
   }, [runId]);
+
+  const persistLatest = useCallback(() => persist(documentRef.current), [persist]);
 
   const mutate = (updater: (current: ReportDocumentV2) => ReportDocumentV2, save = true) => {
     const next = updater(document);
     commit(next);
-    if (save) void persist(next);
+    if (save) persist(next);
   };
-  const saveDraft = () => void persist(document);
+  const saveDraft = () => persistLatest();
   const addBlock = (type: ReportBlock['type'], artifactId?: string, view: 'chart' | 'table' = 'chart') => {
     const blockId = safeId(type);
     const index = document.blocks.length;
@@ -93,13 +105,13 @@ export default function ReportBuilder({ runId, report, language, onChange }: Pro
       return changed ? { ...item, x: changed.x, y: changed.y, w: changed.w, h: changed.h } : item;
     }) };
     commit(next);
-    void persist(next);
+    persist(next);
   };
   const updateSelectedText = (value: string) => { if (!selected) return; mutate(current => ({ ...current, blocks: current.blocks.map(block => block.block_id === selected.block_id && ('text' in block) ? { ...block, text: value } as ReportBlock : block) }), false); };
-  const undo = () => { const previous = history.at(-1); if (!previous) return; setFuture(items => [...items, document]); setHistory(items => items.slice(0, -1)); setDocument(previous); setState('dirty'); };
-  const redo = () => { const next = future.at(-1); if (!next) return; setHistory(items => [...items, document]); setFuture(items => items.slice(0, -1)); setDocument(next); setState('dirty'); };
-  const applyTemplate = async (template: string) => { if (!window.confirm('Replace canvas layout and keep Library?')) return; setState('saving'); try { const next = await applyTemplateV2(runId, document.revision, template); setDocument(next); setPageId(next.pages[0]?.page_id ?? 'page-1'); setState('saved'); setMessage('Saved'); } catch (error) { setState('error'); setMessage(error instanceof Error ? error.message : 'Unable to apply template.'); } };
-  const exportReport = async () => { setState('saving'); try { const result = await createReportExport(runId, document.revision); window.open(`/api/runs/${runId}/custom-report/exports/${result.export_id}`, '_blank', 'noopener,noreferrer'); setState('saved'); setMessage(`Exported revision ${result.revision}`); } catch (error) { setState('error'); setMessage(error instanceof Error ? error.message : 'Unable to export this report.'); } };
+  const undo = () => { const previous = history.at(-1); if (!previous) return; setFuture(items => [...items, documentRef.current]); setHistory(items => items.slice(0, -1)); documentRef.current = previous; setDocument(previous); setState('dirty'); };
+  const redo = () => { const next = future.at(-1); if (!next) return; setHistory(items => [...items, documentRef.current]); setFuture(items => items.slice(0, -1)); documentRef.current = next; setDocument(next); setState('dirty'); };
+  const applyTemplate = async (template: string) => { if (!window.confirm('Replace canvas layout and keep Library?')) return; setState('saving'); try { const next = await applyTemplateV2(runId, documentRef.current.revision, template); documentRef.current = next; setDocument(next); setPageId(next.pages[0]?.page_id ?? 'page-1'); setState('saved'); setMessage('Saved'); } catch (error) { setState('error'); setMessage(error instanceof Error ? error.message : 'Unable to apply template.'); } };
+  const exportReport = async () => { setState('saving'); try { const result = await createReportExport(runId, documentRef.current.revision); window.open(`/api/runs/${runId}/custom-report/exports/${result.export_id}`, '_blank', 'noopener,noreferrer'); setState('saved'); setMessage(`Exported revision ${result.revision}`); } catch (error) { setState('error'); setMessage(error instanceof Error ? error.message : 'Unable to export this report.'); } };
   const addLibraryArtifact = async (artifactId: string, view: 'chart' | 'table') => { const item = artifactFor(document, artifactId); if (!item) return; addBlock(view === 'table' ? 'data_table' : 'chart', item.artifact_id, view); };
   const statusLabel = state === 'dirty' ? 'Unsaved changes' : state === 'saving' ? 'Saving…' : state === 'conflict' ? 'Conflict — reload required' : message || (state === 'saved' ? 'Saved' : 'Ready');
 
