@@ -45,6 +45,14 @@ def _atomic_write(path: Path, data: str) -> None:
             os.unlink(temporary)
 
 
+class ArtifactNotFoundError(FileNotFoundError):
+    """A run artifact has not been written yet."""
+
+
+class ArtifactMalformedError(ValueError):
+    """A durable run artifact exists but is not valid JSON."""
+
+
 class RunStore:
     def __init__(self, root: Path, retention_hours: int = DEFAULT_RETENTION_HOURS) -> None:
         if not 1 <= retention_hours <= 24 * 30:
@@ -163,15 +171,46 @@ class RunStore:
         self.metadata(run_id)
         _atomic_write(self._dir(run_id) / name, json.dumps(value, indent=2, ensure_ascii=False))
 
+    def save_export(self, run_id: str, export_id: str, html_text: str, manifest: dict[str, Any]) -> None:
+        self.metadata(run_id)
+        if not re.fullmatch(r"[a-f0-9-]{8,80}", export_id):
+            raise HTTPException(422, "Export ID is invalid.")
+        directory = self._dir(run_id) / "exports" / export_id
+        _atomic_write(directory / "report.html", html_text)
+        _atomic_write(directory / "manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+
+    def export_text(self, run_id: str, export_id: str, name: str = "report.html") -> str:
+        self.metadata(run_id)
+        if not re.fullmatch(r"[a-f0-9-]{8,80}", export_id) or name not in {"report.html", "manifest.json"}:
+            raise HTTPException(404, "Report export was not found.")
+        path = self._dir(run_id) / "exports" / export_id / name
+        if not path.exists():
+            raise HTTPException(404, "Report export was not found.")
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise HTTPException(500, "Report export is unavailable.") from error
+
+    def export_manifest(self, run_id: str, export_id: str) -> dict[str, Any]:
+        try:
+            return json.loads(self.export_text(run_id, export_id, "manifest.json"))
+        except json.JSONDecodeError as error:
+            raise HTTPException(500, "Report export manifest is invalid.") from error
+
     def artifact_json(self, run_id: str, name: str) -> dict[str, Any]:
         self.metadata(run_id)
         path = self._dir(run_id) / name
         if not path.exists():
-            raise HTTPException(404, "Report manifest is not available until a report is generated.")
+            raise ArtifactNotFoundError(name)
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as error:
-            raise HTTPException(404, "Report manifest is unavailable.") from error
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise ArtifactMalformedError(name) from error
+        except OSError as error:
+            raise HTTPException(500, "Report artifact is unavailable.") from error
+        if not isinstance(value, dict):
+            raise ArtifactMalformedError(name)
+        return value
 
     def cleanup_expired(self) -> int:
         if not self.root.exists():

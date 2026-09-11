@@ -38,7 +38,11 @@ from filter_contract import compile_filters
 from formatting import compact_number, format_display_date, format_number, parse_date_value, percent, value_format_descriptor
 from planning import analyst_proposals, business_semantic_catalog, canonical_field_name, comparison_target, display_label, executive_overview_proposals, evidence_for_chart, is_starter_analysis_request, narrative_from_evidence, parse_filter, presentation_title, propose_charts
 from source_registry import public_source, registered_sources
-from run_store import DurableJobQueue, RunStore
+from run_store import ArtifactMalformedError, ArtifactNotFoundError, DurableJobQueue, RunStore
+from report_models import ReportDocumentV2, validate_report_v2
+from report_service import add_artifact as add_v2_artifact, apply_template_cas, get_document as get_v2_document, mutate_document, remove_artifact as remove_v2_artifact
+from report_templates import template_list
+from report_exports import create_export
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROFILE_ROWS = 600_000
@@ -352,6 +356,41 @@ class PinArtifactRequest(BaseModel):
     artifact_id: str = Field(min_length=1, max_length=120)
     chart: ChartRequest
     annotation: str = Field(default="", max_length=2_000)
+
+
+class ReportV2ArtifactRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_revision: int = Field(ge=0)
+    artifact_id: str = Field(min_length=1, max_length=120)
+    chart: ChartRequest
+    origin: Literal["executive_hub", "data_copilot", "unknown"] = "unknown"
+    view: Literal["chart", "table"] = "chart"
+    annotation: str = Field(default="", max_length=2_000)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class ReportV2ArtifactDeleteRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_revision: int = Field(ge=0)
+
+
+class ReportV2TemplateRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_revision: int = Field(ge=0)
+    mode: Literal["replace_layout_keep_library"] = "replace_layout_keep_library"
+
+
+class ReportV2ExportRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    revision: int = Field(ge=0)
+    format: Literal["html"] = "html"
+
+
+class ReportV2SaveRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    expected_revision: int = Field(ge=0)
+    document: ReportDocumentV2
+
 
 class TextFilterRequest(BaseModel):
     text: str = Field(min_length=3, max_length=600)
@@ -1375,9 +1414,10 @@ def _custom_report_document(run_id: str, update: CustomReportUpdate | None = Non
             if isinstance(blueprint, dict) and blueprint.get("template") in LEGACY_REPORT_LAYOUTS:
                 stored = {**stored, "layout_blueprint": {"template": LEGACY_REPORT_LAYOUTS[blueprint["template"]]}}
             return CustomReportDocument.model_validate(stored)
-        except HTTPException as error:
-            if error.status_code != 404: raise
+        except ArtifactNotFoundError:
             return CustomReportDocument(run_id=run_id, glossary=[])
+        except (ArtifactMalformedError, ValidationError) as error:
+            raise HTTPException(500, "Saved report is invalid and was not overwritten.") from error
     # A report edit is a read-modify-write transition.  The per-artifact lock makes
     # the revision check and atomic write one storage-boundary operation.
     with RUN_STORE.locked_artifact(run_id, path):
@@ -1388,6 +1428,72 @@ def _custom_report_document(run_id: str, update: CustomReportUpdate | None = Non
         document = CustomReportDocument(run_id=run_id, title=update.title, locale=update.locale, layout_blueprint=update.layout_blueprint, executive_summary=update.executive_summary, sections=update.sections, pinned_artifacts=artifacts, manual_glossary_notes=update.manual_glossary_notes, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat(), revision=current.revision + 1)
         RUN_STORE.save_artifact_json(run_id, path, document.model_dump(mode="json"))
         return document
+
+
+@app.get("/api/report-templates")
+def get_report_templates() -> dict[str, object]:
+    return {"templates": template_list()}
+
+
+@app.get("/api/runs/{run_id}/custom-report/v2", response_model=ReportDocumentV2)
+def get_custom_report_v2(run_id: str) -> ReportDocumentV2:
+    return get_v2_document(RUN_STORE, run_id)
+
+
+@app.put("/api/runs/{run_id}/custom-report/v2", response_model=ReportDocumentV2)
+def save_custom_report_v2(run_id: str, request: ReportV2SaveRequest) -> ReportDocumentV2:
+    if request.document.run_id != run_id:
+        raise HTTPException(422, "Document run does not match the save precondition.")
+    if request.document.revision != request.expected_revision + 1:
+        raise HTTPException(409, "This report changed elsewhere. Reload before saving again.")
+
+    def mutation(current: ReportDocumentV2) -> ReportDocumentV2:
+        incoming = validate_report_v2(request.document.model_dump(mode="json"))
+        return incoming.model_copy(update={"artifact_library": current.artifact_library, "revision": current.revision + 1})
+
+    return mutate_document(RUN_STORE, run_id, request.expected_revision, mutation)
+
+
+@app.post("/api/runs/{run_id}/custom-report/v2/artifacts", response_model=ReportDocumentV2)
+def add_custom_report_v2_artifact(run_id: str, request: ReportV2ArtifactRequest) -> ReportDocumentV2:
+    validated = build_chart(run_id, request.chart, "en")
+    return add_v2_artifact(
+        RUN_STORE,
+        run_id,
+        request.expected_revision,
+        request.artifact_id,
+        request.chart.model_dump(mode="json"),
+        validated.model_dump(mode="json"),
+        origin=request.origin,
+        provenance={"annotation": request.annotation, "title": validated.title, "scope": validated.title},
+        view=request.view,
+    )
+
+
+@app.delete("/api/runs/{run_id}/custom-report/v2/artifacts/{artifact_id}", response_model=ReportDocumentV2)
+def delete_custom_report_v2_artifact(run_id: str, artifact_id: str, request: ReportV2ArtifactDeleteRequest) -> ReportDocumentV2:
+    return remove_v2_artifact(RUN_STORE, run_id, request.expected_revision, artifact_id)
+
+
+@app.post("/api/runs/{run_id}/custom-report/v2/templates/{template_id}", response_model=ReportDocumentV2)
+def apply_custom_report_v2_template(run_id: str, template_id: str, request: ReportV2TemplateRequest) -> ReportDocumentV2:
+    return apply_template_cas(RUN_STORE, run_id, request.expected_revision, template_id)
+
+
+@app.post("/api/runs/{run_id}/custom-report/exports")
+def export_custom_report_v2(run_id: str, request: ReportV2ExportRequest) -> dict[str, object]:
+    export_id, manifest = create_export(RUN_STORE, run_id, request.revision, lambda payload: _report_chart_svg(ChartResult.model_validate(payload)))
+    return {"export_id": export_id, "revision": request.revision, "format": request.format, "manifest": manifest}
+
+
+@app.get("/api/runs/{run_id}/custom-report/exports/{export_id}", response_class=HTMLResponse)
+def get_custom_report_export(run_id: str, export_id: str) -> HTMLResponse:
+    return HTMLResponse(RUN_STORE.export_text(run_id, export_id, "report.html"), headers={"Content-Disposition": f'attachment; filename="opendata-report-{export_id}.html"'})
+
+
+@app.get("/api/runs/{run_id}/custom-report/exports/{export_id}/manifest")
+def get_custom_report_export_manifest(run_id: str, export_id: str) -> dict[str, object]:
+    return RUN_STORE.export_manifest(run_id, export_id)
 
 
 @app.get("/api/runs/{run_id}/custom-report", response_model=CustomReportDocument)
