@@ -110,7 +110,23 @@ export default function ReportBuilder({ runId, report, language, onChange }: Pro
   const updateSelectedText = (value: string) => { if (!selected) return; mutate(current => ({ ...current, blocks: current.blocks.map(block => block.block_id === selected.block_id && ('text' in block) ? { ...block, text: value } as ReportBlock : block) }), false); };
   const undo = () => { const previous = history.at(-1); if (!previous) return; setFuture(items => [...items, documentRef.current]); setHistory(items => items.slice(0, -1)); documentRef.current = previous; setDocument(previous); setState('dirty'); };
   const redo = () => { const next = future.at(-1); if (!next) return; setHistory(items => [...items, documentRef.current]); setFuture(items => items.slice(0, -1)); documentRef.current = next; setDocument(next); setState('dirty'); };
-  const applyTemplate = async (template: string) => { if (!window.confirm('Replace canvas layout and keep Library?')) return; setState('saving'); try { const next = await applyTemplateV2(runId, documentRef.current.revision, template); documentRef.current = next; setDocument(next); setPageId(next.pages[0]?.page_id ?? 'page-1'); setState('saved'); setMessage('Saved'); } catch (error) { setState('error'); setMessage(error instanceof Error ? error.message : 'Unable to apply template.'); } };
+  const applyTemplate = async (template: string) => {
+    if (!window.confirm('Replace canvas layout and keep Library?')) return;
+    setState('saving'); setMessage('');
+    saveQueue.current = saveQueue.current.then(async () => {
+      try {
+        const next = await applyTemplateV2(runId, persistedRevision.current, template);
+        documentRef.current = next;
+        persistedRevision.current = next.revision;
+        setDocument(next);
+        setPageId(next.pages[0]?.page_id ?? 'page-1');
+        setState('saved'); setMessage('Saved');
+      } catch (error) {
+        setState(error instanceof Error && error.message.includes('(409)') ? 'conflict' : 'error');
+        setMessage(error instanceof Error ? error.message : 'Unable to apply template.');
+      }
+    });
+  };
   const exportReport = async () => { setState('saving'); try { const result = await createReportExport(runId, documentRef.current.revision); window.open(`/api/runs/${runId}/custom-report/exports/${result.export_id}`, '_blank', 'noopener,noreferrer'); setState('saved'); setMessage(`Exported revision ${result.revision}`); } catch (error) { setState('error'); setMessage(error instanceof Error ? error.message : 'Unable to export this report.'); } };
   const addLibraryArtifact = async (artifactId: string, view: 'chart' | 'table') => { const item = artifactFor(document, artifactId); if (!item) return; addBlock(view === 'table' ? 'data_table' : 'chart', item.artifact_id, view); };
   const statusLabel = state === 'dirty' ? 'Unsaved changes' : state === 'saving' ? 'Saving…' : state === 'conflict' ? 'Conflict — reload required' : message || (state === 'saved' ? 'Saved' : 'Ready');
