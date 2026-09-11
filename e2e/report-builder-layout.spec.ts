@@ -61,3 +61,31 @@ test('selecting a block does not move it away from the click point', async ({ pa
     await expect(block).toHaveClass(/selected/);
   }
 });
+
+test('clicking a divider keeps one stable selected block without layout mutations', async ({ page }) => {
+  const requests: string[] = [];
+  page.on('request', request => {
+    if (request.url().includes('/custom-report/v2') && request.method() === 'PUT') requests.push(request.url());
+  });
+  await openBuilder(page);
+  await page.getByRole('button', { name: 'divider', exact: true }).click();
+  await expect(page.locator('.report-block-divider')).toHaveCount(1);
+  await expect(page.locator('.report-save-state')).toHaveText('Saved');
+  requests.length = 0;
+
+  const divider = page.locator('.report-block-divider').first();
+  await divider.scrollIntoViewIfNeeded();
+  const before = await divider.boundingBox();
+  expect(before).not.toBeNull();
+  if (!before) return;
+  for (let index = 0; index < 6; index += 1) {
+    await divider.click({ position: { x: Math.min(24, before.width / 2), y: Math.max(34, Math.min(48, before.height / 2)) } });
+    await expect(divider).toHaveClass(/selected/);
+  }
+  const after = await divider.boundingBox();
+  expect(after).not.toBeNull();
+  if (!after) return;
+  expect(after.x).toBeCloseTo(before.x, 0);
+  expect(after.y).toBeCloseTo(before.y, 0);
+  expect(requests).toHaveLength(0);
+});
