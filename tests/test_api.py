@@ -579,6 +579,30 @@ def test_custom_report_rejects_stale_revision_without_overwriting_current_docume
     assert current["revision"] == 1
 
 
+def test_custom_report_date_scope_persists_and_exports_as_json() -> None:
+    data = upload_csv("sale_date,net_sales\n2026-01-01,100\n2026-01-02,40\n")
+    run_id = data["run_id"]
+    artifact = {
+        "artifact_id": "scoped-sales",
+        "chart": {
+            "dimension": "sale_date",
+            "metric": "net_sales",
+            "chart_type": "line",
+            "date_scope": {"column": "sale_date", "start": "2026-01-01", "end": "2026-01-02"},
+        },
+    }
+    saved = client.post(f"/api/runs/{run_id}/custom-report/artifacts", json=artifact)
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["pinned_artifacts"][0]["chart"]["date_scope"] == artifact["chart"]["date_scope"]
+    persisted = json.loads((Path(__file__).resolve().parents[1] / "var" / "uploads" / run_id / "custom-report.json").read_text())
+    assert persisted["pinned_artifacts"][0]["chart"]["date_scope"] == artifact["chart"]["date_scope"]
+    exported = client.get(f"/api/runs/{run_id}/report")
+    assert exported.status_code == 200, exported.text
+    manifest = client.get(f"/api/runs/{run_id}/manifest")
+    assert manifest.status_code == 200, manifest.text
+    assert manifest.json()["chart_specs"][0]["date_scope"] == artifact["chart"]["date_scope"]
+
+
 def test_custom_report_is_run_scoped_idempotent_and_glossary_is_validated() -> None:
     data = upload_csv("store,net_sales,email\nA,100,private@example.test\nB,40,private@example.test\n")
     run_id = data["run_id"]

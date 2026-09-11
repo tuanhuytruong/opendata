@@ -11,6 +11,7 @@ import io
 import json
 import math
 import os
+import logging
 from collections import Counter
 from contextlib import nullcontext
 import urllib.error
@@ -147,6 +148,19 @@ app.add_middleware(SecurityHeadersMiddleware)
 app.add_middleware(InMemoryRateLimitMiddleware)
 app.add_middleware(BasicAuthMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://localhost:5174"], allow_credentials=False, allow_methods=["GET", "POST", "DELETE"], allow_headers=["content-type"])
+logger = logging.getLogger(__name__)
+
+
+@app.exception_handler(Exception)
+async def unhandled_api_error(request: Request, error: Exception) -> JSONResponse:
+    """Never turn an API failure into an unparseable plain-text response."""
+    request_id = request.headers.get("x-request-id") or uuid4().hex
+    logger.exception("Unhandled API error request_id=%s path=%s", request_id, request.url.path)
+    return JSONResponse(
+        {"code": "internal_error", "message": "The request could not be completed. Retry shortly.", "request_id": request_id},
+        status_code=500,
+        headers={"X-Request-Id": request_id},
+    )
 
 
 class ColumnProfile(BaseModel):
@@ -1372,7 +1386,7 @@ def _custom_report_document(run_id: str, update: CustomReportUpdate | None = Non
             raise HTTPException(409, "This report changed elsewhere. Refresh before saving again.")
         artifacts = list({item.artifact_id: _report_artifact(run_id, item, update.locale) for item in update.pinned_artifacts}.values())
         document = CustomReportDocument(run_id=run_id, title=update.title, locale=update.locale, layout_blueprint=update.layout_blueprint, executive_summary=update.executive_summary, sections=update.sections, pinned_artifacts=artifacts, manual_glossary_notes=update.manual_glossary_notes, glossary=_custom_report_glossary(run_id, artifacts), updated_at=datetime.now(timezone.utc).isoformat(), revision=current.revision + 1)
-        RUN_STORE.save_artifact_json(run_id, path, document.model_dump())
+        RUN_STORE.save_artifact_json(run_id, path, document.model_dump(mode="json"))
         return document
 
 
@@ -1527,7 +1541,7 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     charts = [item.result or build_chart(run_id, item.chart) for item in document.pinned_artifacts]
     evidence = [fact for chart in charts for fact in evidence_for_chart(chart)]
     metadata = RUN_STORE.metadata(run_id)
-    manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256(RUN_STORE.dataset_path(run_id).read_bytes()).hexdigest(), "source_type": metadata["source_type"], "source_label": metadata["source_label"], "chart_specs": [item.chart.model_dump() for item in document.pinned_artifacts], "chart_count": len(charts), "evidence": evidence, "document_updated_at": document.updated_at}
+    manifest = {"run_id": run_id, "generated_at": datetime.now(timezone.utc).isoformat(), "dataset_sha256": hashlib.sha256(RUN_STORE.dataset_path(run_id).read_bytes()).hexdigest(), "source_type": metadata["source_type"], "source_label": metadata["source_label"], "chart_specs": [item.chart.model_dump(mode="json") for item in document.pinned_artifacts], "chart_count": len(charts), "evidence": evidence, "document_updated_at": document.updated_at}
     RUN_STORE.save_artifact_json(run_id, "report.manifest.json", manifest)
     esc = lambda value: html.escape(str(value))
     artifact_parts = []
@@ -1589,7 +1603,7 @@ def build_report(run_id: str, request: ReportRequest | None = None) -> HTMLRespo
     artifact += "<!-- report-layout-slots: {} -->".format(
         json.dumps({role: [item.artifact_id for item in items] for role, items in slots.items()}, separators=(",", ":"))
     )
-    compatibility_payload = json.dumps([chart.model_dump() for chart in charts]).replace("</", "<\\/")
+    compatibility_payload = json.dumps([chart.model_dump(mode="json") for chart in charts]).replace("</", "<\\/")
     artifact += f"<!-- validated-artifact-json: {compatibility_payload} -->"
     return HTMLResponse(artifact, headers={"Content-Disposition": 'attachment; filename="opendata-authored-report.html"'})
 
