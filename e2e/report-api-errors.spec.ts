@@ -13,10 +13,10 @@ test('keeps the report draft and exposes Retry after a text/plain save failure',
   });
   await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeVisible();
   await page.getByRole('button', { name: 'Custom Report' }).click();
-  const title = page.locator('.report-editor input').first();
+  const title = page.locator('.report-name-input').first();
   await expect(title).toBeVisible();
 
-  await page.route('**/api/runs/*/custom-report', async route => {
+  await page.route('**/api/runs/*/custom-report/v2', async route => {
     if (route.request().method() === 'PUT') {
       await route.fulfill({ status: 500, contentType: 'text/plain', body: 'Internal Server Error' });
       return;
@@ -27,10 +27,10 @@ test('keeps the report draft and exposes Retry after a text/plain save failure',
   await title.blur();
   await expect(page.getByText('Request failed (500): Internal Server Error')).toBeVisible();
   await expect(title).toHaveValue('Draft survives failure');
-  const retry = page.getByRole('button', { name: 'Retry' });
+  const retry = page.getByRole('button', { name: 'Save' });
   await expect(retry).toBeVisible();
 
-  await page.unroute('**/api/runs/*/custom-report');
+  await page.unroute('**/api/runs/*/custom-report/v2');
   await retry.click();
   await expect(page.getByText('Saved', { exact: true })).toBeVisible();
   await expect(title).toHaveValue('Draft survives failure');

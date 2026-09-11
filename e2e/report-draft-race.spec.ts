@@ -14,11 +14,11 @@ test('does not let a completed report save overwrite a newer local draft', async
   });
   await expect(page.getByRole('navigation', { name: 'Workspace navigation' })).toBeVisible();
   await page.getByRole('button', { name: 'Custom Report' }).click();
-  const title = page.locator('.report-editor input').first();
+  const title = page.locator('.report-name-input').first();
   await expect(title).toBeVisible();
 
   let releaseSave: (() => void) | undefined;
-  await page.route('**/api/runs/*/custom-report', async route => {
+  await page.route('**/api/runs/*/custom-report/v2', async route => {
     if (route.request().method() !== 'PUT') return route.continue();
     await new Promise<void>(resolve => { releaseSave = resolve; });
     await route.continue();
