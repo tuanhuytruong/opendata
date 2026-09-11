@@ -1,6 +1,16 @@
 .report-builder {
+  width: 100%;
   min-width: 0;
   color: #0f172a;
+}
+.report-workspace-section {
+  width: 100%;
+  min-width: 0;
+}
+.report-builder *,
+.report-builder *::before,
+.report-builder *::after {
+  box-sizing: border-box;
 }
 .report-builder-toolbar {
   display: flex;
