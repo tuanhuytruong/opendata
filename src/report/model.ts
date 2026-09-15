@@ -29,20 +29,24 @@ export type ReportChartPresentation = {
   locale: 'en' | 'vi';
 };
 
+export type ReportColorTone = 'slate' | 'indigo' | 'violet' | 'teal' | 'amber' | 'rose';
+export type ReportBlockAppearance = { background: 'default' | `${ReportColorTone}-pastel`; foreground: 'default' | `${ReportColorTone}-strong` };
+export const defaultAppearance: ReportBlockAppearance = { background: 'default', foreground: 'default' };
 export type ReportPage = { page_id: string; title: string; order: number };
 export type ReportPlacement = { block_id: string; page_id: string; x: number; y: number; w: number; h: number };
 export type ActionRow = { owner: string; action: string; deadline: string; status: 'not_started' | 'in_progress' | 'blocked' | 'done' };
 export type GlossaryNote = { note_id: string; text: string };
+type Appearance = { appearance?: ReportBlockAppearance };
 export type ReportBlock =
-  | { type: 'header'; block_id: string; text: string; rich_text?: RichTextDocument; level: 1 | 2 | 3 }
-  | { type: 'text'; block_id: string; text: string; rich_text?: RichTextDocument }
-  | { type: 'note'; block_id: string; text: string; rich_text?: RichTextDocument; tone: 'neutral' | 'info' | 'warning' | 'success' }
-  | { type: 'divider'; block_id: string; style?: 'solid' | 'dashed' | 'dotted'; thickness?: 1 | 2 | 3; color?: 'slate' | 'indigo' | 'amber' }
-  | { type: 'kpi_strip'; block_id: string; artifact_ids: string[]; items?: Array<{ artifact_id: string; row_label?: string; label_override?: string }> }
-  | { type: 'action_table'; block_id: string; rows: ActionRow[] }
-  | { type: 'glossary'; block_id: string; artifact_ids: string[]; manual_note_ids: string[]; authored_notes?: GlossaryNote[] }
-  | { type: 'chart'; block_id: string; artifact_id: string; view: 'chart'; title: string }
-  | { type: 'data_table'; block_id: string; artifact_id: string; view: 'table'; title: string; visible_rows?: number };
+  | ({ type: 'header'; block_id: string; text: string; rich_text?: RichTextDocument; level: 1 | 2 | 3 } & Appearance)
+  | ({ type: 'text'; block_id: string; text: string; rich_text?: RichTextDocument } & Appearance)
+  | ({ type: 'note'; block_id: string; text: string; rich_text?: RichTextDocument; tone: 'neutral' | 'info' | 'warning' | 'success' } & Appearance)
+  | ({ type: 'divider'; block_id: string; style?: 'solid' | 'dashed' | 'dotted'; thickness?: 1 | 2 | 3; color?: 'slate' | 'indigo' | 'amber' } & Appearance)
+  | ({ type: 'kpi_strip'; block_id: string; artifact_ids: string[]; items?: Array<{ artifact_id: string; row_label?: string; label_override?: string }> } & Appearance)
+  | ({ type: 'action_table'; block_id: string; rows: ActionRow[] } & Appearance)
+  | ({ type: 'glossary'; block_id: string; artifact_ids: string[]; manual_note_ids: string[]; authored_notes?: GlossaryNote[] } & Appearance)
+  | ({ type: 'chart'; block_id: string; artifact_id: string; view: 'chart'; title: string } & Appearance)
+  | ({ type: 'data_table'; block_id: string; artifact_id: string; view: 'table'; title: string; visible_rows?: number } & Appearance);
 export type ReportArtifactSnapshot = {
   artifact_id: string;
   origin: 'executive_hub' | 'data_copilot' | 'legacy' | 'unknown';

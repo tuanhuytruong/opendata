@@ -31,6 +31,22 @@ def test_v2_document_has_strict_schema_and_twelve_column_placements(tmp_path: Pa
     assert all(0 <= placement.x < 12 for placement in document.placements)
 
 
+def test_block_appearance_is_bounded_and_rejects_unsafe_pairing() -> None:
+    payload = {
+        "run_id": "a" * 32,
+        "blocks": [{"type": "text", "block_id": "note-1", "text": "Safe", "appearance": {"background": "indigo-pastel", "foreground": "indigo-strong"}}],
+        "placements": [{"block_id": "note-1", "page_id": "page-1", "x": 0, "y": 0, "w": 12, "h": 3}],
+    }
+    saved = ReportDocumentV2.model_validate(payload)
+    assert saved.blocks[0].appearance.background == "indigo-pastel"
+    payload["blocks"][0]["appearance"]["foreground"] = "rose-strong"
+    with pytest.raises(ValueError, match="must match"):
+        ReportDocumentV2.model_validate(payload)
+    payload["blocks"][0]["appearance"] = {"background": "#fff", "foreground": "indigo-strong"}
+    with pytest.raises(ValueError):
+        ReportDocumentV2.model_validate(payload)
+
+
 def test_artifact_library_is_owner_scoped_and_cas(tmp_path: Path) -> None:
     store = _store(tmp_path)
     run_id = "a" * 32

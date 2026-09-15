@@ -162,8 +162,20 @@ class ReportPage(StrictModel):
         return _safe_text(value, 160, info.field_name)
 
 
+class ReportBlockAppearance(StrictModel):
+    background: Literal["default", "slate-pastel", "indigo-pastel", "violet-pastel", "teal-pastel", "amber-pastel", "rose-pastel"] = "default"
+    foreground: Literal["default", "slate-strong", "indigo-strong", "violet-strong", "teal-strong", "amber-strong", "rose-strong"] = "default"
+
+    @model_validator(mode="after")
+    def has_safe_pairing(self) -> "ReportBlockAppearance":
+        if self.background != "default" and self.foreground != "default" and self.background.split("-", 1)[0] != self.foreground.split("-", 1)[0]:
+            raise ValueError("Block foreground must match its pastel background tone.")
+        return self
+
+
 class HeaderBlock(StrictModel):
     type: Literal["header"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     text: str = Field(default="Untitled section", min_length=1, max_length=2_000)
     rich_text: RichTextDocument = Field(default_factory=lambda: RichTextDocument.model_validate(rich_text_from_text("Untitled section", heading_level=1)))
@@ -183,6 +195,7 @@ class HeaderBlock(StrictModel):
 
 class TextBlock(StrictModel):
     type: Literal["text"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     text: str = Field(default="", max_length=8_000)
     rich_text: RichTextDocument = Field(default_factory=RichTextDocument)
@@ -200,6 +213,7 @@ class TextBlock(StrictModel):
 
 class NoteBlock(StrictModel):
     type: Literal["note"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     text: str = Field(default="", max_length=4_000)
     rich_text: RichTextDocument = Field(default_factory=RichTextDocument)
@@ -218,6 +232,7 @@ class NoteBlock(StrictModel):
 
 class DividerBlock(StrictModel):
     type: Literal["divider"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     style: Literal["solid", "dashed", "dotted"] = "solid"
     thickness: Literal[1, 2, 3] = 1
@@ -237,6 +252,7 @@ class KpiItem(StrictModel):
 
 class KpiStripBlock(StrictModel):
     type: Literal["kpi_strip"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     artifact_ids: list[str] = Field(default_factory=list, max_length=12)
     items: list[KpiItem] = Field(default_factory=list, max_length=12)
@@ -285,12 +301,14 @@ class ActionRow(StrictModel):
 
 class ActionTableBlock(StrictModel):
     type: Literal["action_table"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     rows: list[ActionRow] = Field(default_factory=list, max_length=30)
 
 
 class ChartBlock(StrictModel):
     type: Literal["chart"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     artifact_id: str = Field(min_length=1, max_length=120)
     view: Literal["chart"] = "chart"
@@ -304,6 +322,7 @@ class ChartBlock(StrictModel):
 
 class DataTableBlock(StrictModel):
     type: Literal["data_table"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     artifact_id: str = Field(min_length=1, max_length=120)
     view: Literal["table"] = "table"
@@ -328,6 +347,7 @@ class GlossaryNote(StrictModel):
 
 class GlossaryBlock(StrictModel):
     type: Literal["glossary"]
+    appearance: ReportBlockAppearance = Field(default_factory=ReportBlockAppearance)
     block_id: str = Field(min_length=1, max_length=80)
     artifact_ids: list[str] = Field(default_factory=list, max_length=24)
     manual_note_ids: list[str] = Field(default_factory=list, max_length=30)
