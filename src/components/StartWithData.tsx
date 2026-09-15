@@ -1,8 +1,8 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Bot, CheckCircle2, ChevronRight, FileText, LayoutDashboard, LoaderCircle, Sparkles, Upload } from 'lucide-react';
 
-import DatasetSelector from './DatasetSelector';
+import DatasetSelector, { type DatasetSelectorHandle } from './DatasetSelector';
 import { DatasetProfile } from '../types';
 import { displayNumber, Language, text } from '../i18n';
 
@@ -33,6 +33,7 @@ const demoViews: DemoView[] = [
 
 export default function StartWithData({ language, profile, selectedFile, loading, onUploadStart, onProfile }: Props) {
   const t = (key: Parameters<typeof text>[1]) => text(language, key);
+  const selectorRef = useRef<DatasetSelectorHandle>(null);
   const isProfiling = Boolean(profile || selectedFile);
   const complete = profile?.profile_status === 'complete';
   return <main className="start-canvas">
@@ -41,12 +42,12 @@ export default function StartWithData({ language, profile, selectedFile, loading
         <p className="section-eyebrow">{t('startEyebrow')}</p>
         <h1 id="start-title" className="font-display">{isProfiling ? t('profileTitle') : t('startTitle')}</h1>
         <p>{isProfiling ? t('profileSubtitle') : t('startSubtitle')}</p>
-        {!isProfiling && <div className="start-actions"><a className="start-primary" href="#import-data"><Upload className="w-4 h-4" />{t('importData')}</a><a className="start-secondary" href="#demo-data"><Sparkles className="w-4 h-4" />{t('exploreDemo')}</a></div>}
+        {!isProfiling && <div className="start-actions"><button type="button" className="start-primary" onClick={() => selectorRef.current?.openFilePicker()}><Upload className="w-4 h-4" />{t('importData')}</button><a className="start-secondary" href="#demo-data"><Sparkles className="w-4 h-4" />{t('exploreDemo')}</a></div>}
         {!isProfiling && <p className="start-limits">{t('uploadHint')}</p>}
       </div>
       <DemoPreview language={language} />
     </section>
-    {isProfiling ? <ProfilingPanel language={language} profile={profile} selectedFile={selectedFile} loading={loading} complete={complete} /> : <section id="import-data" className="start-import-section" aria-labelledby="import-title"><div><p className="section-eyebrow">{t('importData')}</p><h2 id="import-title" className="font-display">{t('importTitle')}</h2><p>{t('importSubtitle')}</p></div><DatasetSelector language={language} onUploadStart={onUploadStart} onProfile={onProfile} /></section>}
+    {isProfiling ? <ProfilingPanel language={language} profile={profile} selectedFile={selectedFile} loading={loading} complete={complete} /> : <section id="import-data" className="start-import-section" aria-labelledby="import-title"><div><p className="section-eyebrow">{t('importData')}</p><h2 id="import-title" className="font-display">{t('importTitle')}</h2><p>{t('importSubtitle')}</p></div><DatasetSelector ref={selectorRef} language={language} onUploadStart={onUploadStart} onProfile={onProfile} /></section>}
     {!isProfiling && <section className="product-preview" aria-labelledby="product-preview-title"><div><p className="section-eyebrow">{t('productEyebrow')}</p><h2 id="product-preview-title" className="font-display">{t('productTitle')}</h2></div><div className="product-preview-grid"><PreviewCard icon={<LayoutDashboard />} title={t('previewHubTitle')} body={t('previewHubBody')} /><PreviewCard icon={<Bot />} title={t('previewCopilotTitle')} body={t('previewCopilotBody')} /><PreviewCard icon={<FileText />} title={t('previewDeepDiveTitle')} body={t('previewDeepDiveBody')} /></div></section>}
   </main>;
 }

@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { forwardRef, useImperativeHandle, useRef, useState } from 'react';
 import { AlertCircle, Database, LoaderCircle, Upload } from 'lucide-react';
 import { DatasetProfile } from '../types';
 import { Language, text } from '../i18n';
@@ -9,9 +9,11 @@ interface DatasetSelectorProps {
   onUploadStart?: (file: File) => void;
   onUploadFailure?: () => void;
 }
+export type DatasetSelectorHandle = { openFilePicker: () => void };
 
-export default function DatasetSelector({ language, onProfile, onUploadStart, onUploadFailure }: DatasetSelectorProps) {
+const DatasetSelector = forwardRef<DatasetSelectorHandle, DatasetSelectorProps>(function DatasetSelector({ language, onProfile, onUploadStart, onUploadFailure }, ref) {
   const inputRef = useRef<HTMLInputElement>(null);
+  useImperativeHandle(ref, () => ({ openFilePicker: () => inputRef.current?.click() }), []);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -40,4 +42,6 @@ export default function DatasetSelector({ language, onProfile, onUploadStart, on
     </div>
     {error && <div className="flex gap-2 p-3 mt-4 bg-rose-50 border border-rose-100 text-rose-700 rounded-xl text-xs"><AlertCircle className="w-4 h-4 shrink-0" />{error}</div>}
   </section>;
-}
+});
+
+export default DatasetSelector;
