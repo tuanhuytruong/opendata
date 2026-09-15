@@ -2,6 +2,8 @@ import { parseApiResponse } from '../api/response';
 import type { ChartRequest, ChartResult } from '../types';
 import type { ReportDocumentV2 } from './model';
 
+const asChartResult = (value: Record<string, any> | undefined): ChartResult | null => value ? value as ChartResult : null;
+
 const json = async <T>(response: Response) => parseApiResponse<T>(response);
 
 export async function getReportV2(runId: string): Promise<ReportDocumentV2> {
@@ -41,4 +43,4 @@ export async function createReportExport(runId: string, revision: number): Promi
   }));
 }
 
-export const chartSnapshot = (document: ReportDocumentV2, artifactId: string): ChartResult | null => document.artifact_library.find(item => item.artifact_id === artifactId)?.result ?? null;
+export const chartSnapshot = (document: ReportDocumentV2, artifactId: string): ChartResult | null => asChartResult(document.artifact_library.find(item => item.artifact_id === artifactId)?.result);

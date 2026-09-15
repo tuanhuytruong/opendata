@@ -16,6 +16,7 @@ from report_models import (
     build_v2_from_legacy,
     validate_report_v2,
 )
+from report_chart_presentation import build_report_chart_presentation
 from report_templates import apply_template
 from run_store import ArtifactMalformedError, ArtifactNotFoundError, RunStore
 
@@ -36,9 +37,23 @@ def _dataset_sha256(store: RunStore, run_id: str) -> str:
     return hashlib.sha256(store.dataset_path(run_id).read_bytes()).hexdigest()
 
 
+def _hydrate_presentation(document: ReportDocumentV2) -> ReportDocumentV2:
+    """Backfill presentation metadata for reports saved before the parity contract."""
+    artifacts = []
+    changed = False
+    for artifact in document.artifact_library:
+        if artifact.result and (not artifact.presentation or not artifact.presentation.get("rows")):
+            artifact = artifact.model_copy(update={
+                "presentation": build_report_chart_presentation(artifact.result, locale=document.locale),
+            })
+            changed = True
+        artifacts.append(artifact)
+    return document.model_copy(update={"artifact_library": artifacts}) if changed else document
+
+
 def _load_unlocked(store: RunStore, run_id: str) -> ReportDocumentV2:
     try:
-        return validate_report_v2(store.artifact_json(run_id, V2_PATH))
+        return _hydrate_presentation(validate_report_v2(store.artifact_json(run_id, V2_PATH)))
     except ArtifactNotFoundError:
         pass
     except (ArtifactMalformedError, ValueError) as error:
@@ -49,7 +64,7 @@ def _load_unlocked(store: RunStore, run_id: str) -> ReportDocumentV2:
         return empty_document(run_id)
     except (ArtifactMalformedError, ValueError) as error:
         raise HTTPException(500, "Saved report is invalid and was not overwritten.") from error
-    return validate_report_v2(build_v2_from_legacy({**legacy, "run_id": run_id}))
+    return _hydrate_presentation(validate_report_v2(build_v2_from_legacy({**legacy, "run_id": run_id})))
 
 
 def get_document(store: RunStore, run_id: str) -> ReportDocumentV2:
@@ -109,11 +124,13 @@ def add_artifact(
     except FileNotFoundError as error:
         raise HTTPException(404, "Dataset is no longer available for this run.") from error
     normalized_view: Literal["chart", "table"] = cast(Literal["chart", "table"], view)
+    presentation = build_report_chart_presentation(result)
     snapshot = ReportArtifactSnapshot(
         artifact_id=artifact_id,
         origin=normalized_origin,
         chart=chart,
         result=result,
+        presentation=presentation,
         provenance=provenance or {},
         created_at=datetime.now(timezone.utc).isoformat(),
         artifact_hash=_hash_artifact(chart, result, dataset_sha256),

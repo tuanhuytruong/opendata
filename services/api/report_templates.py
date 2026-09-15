@@ -89,5 +89,11 @@ def apply_template(document: dict[str, Any], template_id: str) -> dict[str, Any]
         page_id = pages[min(index // 4, len(pages) - 1)]["page_id"]
         x, y, w, h = geometry
         placements.append({"block_id": block["block_id"], "page_id": page_id, "x": x, "y": y, "w": w, "h": h})
-    result = {**document, "pages": pages, "blocks": blocks, "placements": placements}
+    result = {
+        **document,
+        "layout_blueprint": {"template": template_id},
+        "pages": pages,
+        "blocks": blocks,
+        "placements": placements,
+    }
     return result

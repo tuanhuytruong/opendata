@@ -1,5 +1,10 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const viewport = {
+  width: Number(process.env.E2E_VIEWPORT_WIDTH ?? 1440),
+  height: Number(process.env.E2E_VIEWPORT_HEIGHT ?? 900),
+};
+
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: false,
@@ -14,5 +19,5 @@ export default defineConfig({
     ...(process.env.E2E_BASIC_AUTH_USER && process.env.E2E_BASIC_AUTH_PASSWORD ? { httpCredentials: { username: process.env.E2E_BASIC_AUTH_USER, password: process.env.E2E_BASIC_AUTH_PASSWORD } } : {}),
     ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? { launchOptions: { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } } : {}),
   },
-  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } } }],
+  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'], viewport } }],
 });

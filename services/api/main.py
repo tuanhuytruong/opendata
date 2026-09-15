@@ -43,6 +43,7 @@ from report_models import ReportDocumentV2, validate_report_v2
 from report_service import add_artifact as add_v2_artifact, apply_template_cas, get_document as get_v2_document, mutate_document, remove_artifact as remove_v2_artifact
 from report_templates import template_list
 from report_exports import create_export
+from report_chart_presentation import build_report_chart_presentation
 
 MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 MAX_PROFILE_ROWS = 600_000
@@ -474,6 +475,8 @@ class ChartResult(BaseModel):
     scope_total_formatted_value: str | None = None
     insight_headline: str = ""
     evidence: list[str] = Field(default_factory=list)
+    # A normalized, JSON-safe visual contract consumed by report editor and export.
+    presentation: dict[str, object] | None = None
 
 
 class ExecutiveScorecard(BaseModel):
@@ -1218,7 +1221,8 @@ def _build_chart(
     # availability separately in warnings/result_count.
     title = presentation_title(request.metric, request.dimension, request.chart_type, language=language, limit=request.limit, secondary_dimension=request.secondary_dimension)
     scope_total = None if scope_total_value is None else float(scope_total_value)
-    return ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), secondary_metric=request.secondary_metric, secondary_metric_display_name=display_label(request.secondary_metric) if request.secondary_metric else "", value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), requested_limit=request.limit, scope_total_value=scope_total, scope_total_formatted_value=format_number(scope_total) if scope_total is not None else None, insight_headline=insight_headline, evidence=evidence)
+    result = ChartResult(request=request, dimension=request.dimension, metric=request.metric, aggregation=request.aggregation, chart_type=request.chart_type, title=title, metric_display_name=display_label(request.metric), secondary_metric=request.secondary_metric, secondary_metric_display_name=display_label(request.secondary_metric) if request.secondary_metric else "", value_format=value_format_descriptor(), secondary_dimension=request.secondary_dimension, filters=request.filters, rows=chart_rows, warnings=warnings, sort_mode="chronological" if chronological else "ranking", result_count=len(chart_rows), requested_limit=request.limit, scope_total_value=scope_total, scope_total_formatted_value=format_number(scope_total) if scope_total is not None else None, insight_headline=insight_headline, evidence=evidence)
+    return result.model_copy(update={"presentation": build_report_chart_presentation(result.model_dump(mode="json"), locale=language)})
 
 
 @app.post("/api/runs/{run_id}/chart", response_model=ChartResult)
@@ -1482,7 +1486,10 @@ def apply_custom_report_v2_template(run_id: str, template_id: str, request: Repo
 
 @app.post("/api/runs/{run_id}/custom-report/exports")
 def export_custom_report_v2(run_id: str, request: ReportV2ExportRequest) -> dict[str, object]:
-    export_id, manifest = create_export(RUN_STORE, run_id, request.revision, lambda payload: _report_chart_svg(ChartResult.model_validate(payload)))
+    # The v2 export consumes the immutable presentation contract persisted with
+    # each artifact. The legacy renderer remains isolated to the compatibility
+    # /report endpoint below.
+    export_id, manifest = create_export(RUN_STORE, run_id, request.revision)
     return {"export_id": export_id, "revision": request.revision, "format": request.format, "manifest": manifest}
 
 
