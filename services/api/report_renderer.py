@@ -105,7 +105,12 @@ def _display_label(row: dict[str, Any]) -> str:
 
 
 def _format_value(row: dict[str, Any]) -> str:
-    return str(row.get("formatted_value") if row.get("formatted_value") is not None else row.get("value", ""))
+    """Use canonical numeric formatting; exports must never reveal raw floats."""
+    from formatting import format_number
+    try:
+        return format_number(float(row.get("value")))
+    except (TypeError, ValueError):
+        return "—"
 
 
 def _render_table(result: dict[str, Any], title: str, visible_rows: int = 100) -> str:
@@ -140,10 +145,16 @@ def _render_kpis(block: Any, artifacts: dict[str, Any]) -> str:
         if not result:
             continue
         label = label_override or str(result.get("metric_display_name") or result.get("metric") or artifact_id)
-        value = result.get("scope_total_formatted_value") or result.get("scope_total_value")
-        if value is None and result.get("rows"):
+        raw_value = result.get("scope_total_value")
+        if isinstance(raw_value, (int, float)):
+            from formatting import compact_number, format_number
+            value, detail = compact_number(raw_value), format_number(raw_value)
+        elif result.get("rows"):
             value = _format_value(result["rows"][0])
-        rendered.append(f"<article class='report-kpi'><span>{_esc(label)}</span><strong>{_esc(value if value is not None else '—')}</strong></article>")
+            detail = value
+        else:
+            value = detail = "—"
+        rendered.append(f"<article class='report-kpi' title='{_esc(detail)}'><span>{_esc(label)}</span><strong>{_esc(value)}</strong></article>")
     return "<div class='report-kpis'>" + "".join(rendered) + "</div>" if rendered else "<p class='empty-block'>No validated KPI evidence is attached.</p>"
 
 

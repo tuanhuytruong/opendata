@@ -47,9 +47,17 @@ def test_presentation_uses_nice_ticks_and_preserves_existing_snapshot() -> None:
     assert build_report_chart_presentation({**_result(rows), "presentation": presentation}) is presentation
 
 
-def test_svg_escapes_labels_and_uses_formatted_values() -> None:
-    presentation = build_report_chart_presentation(_result([{"label": "<bad>", "display_label": "<bad>", "value": 12.5, "formatted_value": "12.50"}], requested_limit=1))
+def test_presentation_derives_detail_and_compact_values_from_canonical_numbers() -> None:
+    presentation = build_report_chart_presentation(_result([
+        {"label": "<bad>", "display_label": "<bad>", "value": 12_434_891.95, "formatted_value": "unsafe raw string"},
+        {"label": "negative", "value": -1_200},
+    ], requested_limit=2))
+    first, second = presentation["rows"]
+    assert first["formattedValue"] == "12,434,891.95"
+    assert first["compactFormattedValue"] == "12.4M"
+    assert second["formattedValue"] == "-1,200"
+    assert second["compactFormattedValue"] == "-1.2K"
     svg = render_report_chart_svg(presentation)
     assert "&lt;bad&gt;" in svg
-    assert "12.50" in svg
+    assert "unsafe raw string" not in svg
     assert "<bad>" not in svg

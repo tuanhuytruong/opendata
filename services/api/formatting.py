@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 
 DATE_FORMATS = ("%Y-%m-%d", "%Y/%m/%d", "%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")
 
@@ -29,6 +30,8 @@ def format_display_date(value: str) -> str:
 def format_number(value: float | int, precision: int = 2) -> str:
     """Grouped detail value with useful, bounded decimal precision."""
     number = float(value)
+    if not math.isfinite(number):
+        return "—"
     if number.is_integer():
         return f"{number:,.0f}"
     rendered = f"{number:,.{precision}f}".rstrip("0").rstrip(".")
@@ -36,10 +39,13 @@ def format_number(value: float | int, precision: int = 2) -> str:
 
 
 def compact_number(value: float | int) -> str:
+    """Space-efficient grouped number without artificial trailing decimals."""
     number = float(value)
+    if not math.isfinite(number):
+        return "—"
     for threshold, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
         if abs(number) >= threshold:
-            return f"{number / threshold:.1f}{suffix}"
+            return f"{number / threshold:.1f}".rstrip("0").rstrip(".") + suffix
     return format_number(number)
 
 

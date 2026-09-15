@@ -13,9 +13,10 @@ function fallbackPresentation(result: ChartResult): ReportChartPresentation {
     label: row.label,
     displayLabel: row.display_label ?? row.label,
     value: Number.isFinite(Number(row.value)) ? Number(row.value) : 0,
-    formattedValue: row.formatted_value ?? String(row.value),
+    formattedValue: formatChartValue(Number(row.value), 'en'),
+    compactFormattedValue: formatChartValue(Number(row.value), 'en'),
     ...(row.secondary_label ? { secondaryLabel: row.secondary_label } : {}),
-    ...(row.secondary_value != null ? { secondaryValue: Number(row.secondary_value), secondaryFormattedValue: row.secondary_formatted_value ?? String(row.secondary_value) } : {}),
+    ...(row.secondary_value != null ? { secondaryValue: Number(row.secondary_value), secondaryFormattedValue: formatChartValue(Number(row.secondary_value), 'en'), secondaryCompactFormattedValue: formatChartValue(Number(row.secondary_value), 'en') } : {}),
   }));
   const values = rows.map(row => row.value);
   const maximum = Math.max(1, ...values, 0);
@@ -63,7 +64,7 @@ export default function ReportChart({ result, language, className = '' }: Props)
     {tooltip}
     <Bar dataKey="value" fill={presentation.paletteMode === 'single-series' ? PALETTE[0] : undefined} radius={[0, 3, 3, 0]}>
       {rows.map((row, index) => <Cell key={`report-bar-${index}`} fill={presentation.paletteMode === 'single-series' ? PALETTE[0] : PALETTE[index % PALETTE.length]} />)}
-      <LabelList dataKey="formattedValue" position="right" fill="#334155" fontSize={10} />
+      <LabelList dataKey="compactFormattedValue" position="right" fill="#334155" fontSize={10} />
     </Bar>
   </BarChart> : isLine ? <LineChart data={rows} margin={{ top: 12, right: 20, left: 8, bottom: 48 }}>
     <CartesianGrid strokeDasharray="3 3" vertical={false} />

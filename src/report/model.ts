@@ -20,7 +20,7 @@ export type ReportChartPresentation = {
   orientation: 'horizontal' | 'vertical';
   metricLabel: string;
   dimensionLabel: string;
-  rows: Array<{ label: string; displayLabel?: string; value: number; formattedValue: string; secondaryLabel?: string; secondaryValue?: number; secondaryFormattedValue?: string }>;
+  rows: Array<{ label: string; displayLabel?: string; value: number; formattedValue: string; compactFormattedValue?: string; secondaryLabel?: string; secondaryValue?: number; secondaryFormattedValue?: string; secondaryCompactFormattedValue?: string }>;
   requestedLimit: number;
   returnedCount: number;
   domain: [number, number];

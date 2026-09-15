@@ -74,7 +74,10 @@ def build_report_chart_presentation(result: dict[str, Any], locale: str = "en") 
         row = {
             "label": str(raw.get("label") or ""),
             "value": value,
-            "formattedValue": str(raw.get("formatted_value") if raw.get("formatted_value") is not None else format_number(value)),
+            # Display strings are derived from server-owned canonical values.
+            # Never trust a stale/client raw-format string in an export snapshot.
+            "formattedValue": format_number(value),
+            "compactFormattedValue": compact_number(value),
         }
         display_label = raw.get("display_label")
         if display_label is not None:
@@ -82,8 +85,10 @@ def build_report_chart_presentation(result: dict[str, Any], locale: str = "en") 
         if raw.get("secondary_label") is not None:
             row["secondaryLabel"] = str(raw.get("secondary_label"))
         if secondary_value is not None:
-            row["secondaryValue"] = _number(secondary_value)
-            row["secondaryFormattedValue"] = str(raw.get("secondary_formatted_value") if raw.get("secondary_formatted_value") is not None else format_number(_number(secondary_value)))
+            normalized_secondary = _number(secondary_value)
+            row["secondaryValue"] = normalized_secondary
+            row["secondaryFormattedValue"] = format_number(normalized_secondary)
+            row["secondaryCompactFormattedValue"] = compact_number(normalized_secondary)
         if raw.get("x_value") is not None:
             row["xValue"] = _number(raw.get("x_value"))
         rows.append(row)
